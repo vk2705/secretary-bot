@@ -39,18 +39,50 @@ Credentials are stored in `env` (not tracked by git ideally). Required variables
 
 Everything lives in `bot.py`:
 
-- **State** — persisted to `state.json` as `{"users": {"<chat_id>": {tasks, history, context, checkin_enabled}}}`. Each user has isolated state. `get_user(chat_id)` initializes a new user on first contact.
-- **`chat(chat_id, message)`** — appends to that user's history, builds the system prompt (generic + optional user context), calls GPT-4o, appends reply, saves state.
-- **Scheduled jobs** — `morning_checkin` at 05:00 UTC and `evening_checkin` at 18:00 UTC (Israel time = UTC+3, so 08:00 and 21:00 local). Each job iterates over all users where `checkin_enabled=True` and sends each one a personalized check-in.
-- **Commands** — `/start`, `/tasks`, `/addtask`, `/removetask`, `/setcontext`, `/context`, `/subscribe`, `/unsubscribe`, `/checkin`, `/clear`. No chat ID guards — any Telegram user can register.
+- **State** — persisted to `state.json` as `{"users": {"<chat_id>": {...}}}`. `get_user(chat_id)` initializes a new user on first contact and forward-fills any keys added in newer versions.
+- **`chat(chat_id, message)`** — appends to that user's history, builds a per-user system prompt (includes context, recent tracker readings, task list), calls OpenAI, appends reply, saves state.
+- **Scheduling** — `schedule_user_checkins(app, chat_id)` creates per-user APScheduler daily jobs at 08:00 and 21:00 in the user's IANA timezone. `schedule_user_reminder` does the same for individual reminders. `restore_all_jobs(app)` recreates everything on startup.
+- **Custom tracker commands** — a catch-all `MessageHandler(filters.COMMAND, handle_custom_command)` registered after all named handlers intercepts `/weight`, `/mood`, etc. and routes to the matching user tracker.
+- **LLM per user** — `get_llm_client(user)` and `get_model(user)` use the user's stored key/model if set, falling back to `DEFAULT_API_KEY` / `DEFAULT_MODEL` (`gpt-4o-mini`).
+
+## State schema (per user)
+
+```json
+{
+  "tasks": [],
+  "history": [],
+  "context": "",
+  "checkin_enabled": false,
+  "timezone": "UTC",
+  "reminders": [{"id": "uuid4", "time": "HH:MM", "message": "..."}],
+  "trackers": {"weight": {"unit": "kg", "log": [{"ts": "ISO8601", "value": 85.5}]}},
+  "journal": [{"ts": "ISO8601", "entry": "..."}],
+  "llm": {"model": null, "api_key": null}
+}
+```
+
+## Commands reference
+
+| Command | Description |
+|---|---|
+| `/settimezone <IANA>` | Set timezone used for check-ins and reminders |
+| `/remind add HH:MM <msg>` | Schedule a daily reminder |
+| `/addtracker <name> [unit]` | Create a custom tracking command |
+| `/<name> <value>` | Log a tracker value |
+| `/<name> stats\|history` | View tracker stats or history |
+| `/setapikey <key>` | Use own OpenAI key (message auto-deleted) |
+| `/setmodel <model>` | Switch OpenAI model |
+| `/journal <text>` | Save journal entry + get AI reflection |
+| `/weekly` | AI weekly summary of tasks + tracker data |
+| `/export` | Download all data as JSON |
 
 ## State migration
 
-The old single-user `state.json` format (`{tasks, history}` at top level) is auto-migrated on startup to the new per-user format using the optional `MY_CHAT_ID` env var. After migration, `MY_CHAT_ID` is no longer required.
+The old single-user `state.json` format (`{tasks, history}` at top level) is auto-migrated on startup using the optional `MY_CHAT_ID` env var.
 
 ## Key constraints
 
-- The scheduled job prompts are inserted into history as user messages (not as system messages), so internal check-in prompts appear in conversation history and leak into future context. Known quirk.
-- `MAX_HISTORY = 20` per user — when exceeded, oldest messages are trimmed from the front.
-- Model is hardcoded to `gpt-4o`; `max_tokens=600`.
-- Check-ins fire at fixed UTC times for all users (no per-user timezone support).
+- Check-in prompts are inserted into history as user messages (not system messages), so they appear in conversation context. Known quirk.
+- `MAX_HISTORY = 20` per user; `MAX_LOG_ENTRIES = 500` per tracker; `MAX_JOURNAL_ENTRIES = 200`.
+- Default model is `gpt-4o-mini`; users with their own key can switch to `gpt-4o` or others.
+- APScheduler jobs are in-memory only — `restore_all_jobs()` recreates them from state on every restart.
