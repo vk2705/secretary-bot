@@ -47,7 +47,7 @@ RESERVED_COMMANDS = {
     "trackers", "removetracker", "checkin", "clear", "setmodel",
     "setapikey", "clearapikey", "journal", "weekly", "export",
     "streak", "adminstats", "habit", "mystats", "pomodoro",
-    "quiethours", "insights",
+    "quiethours", "insights", "setcheckin",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -65,6 +65,7 @@ def _new_user(**overrides) -> dict:
         "journal": [],
         "activity_days": [],
         "quiet_hours": {"start": None, "end": None},
+        "checkin_times": {"morning": "08:00", "evening": "21:00"},
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -342,19 +343,20 @@ def _parse_local_time(time_str: str, tz_str: str) -> dt_time:
 
 
 def schedule_user_checkins(app: Application, chat_id: int) -> None:
-    """Schedule (or reschedule) per-user 08:00 / 21:00 check-in jobs."""
+    """Schedule (or reschedule) per-user morning/evening check-in jobs."""
     user = get_user(chat_id)
     tz_str = user.get("timezone", "UTC")
     enabled = user.get("checkin_enabled", False)
+    times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
 
-    for label, hour in [("morning", 8), ("evening", 21)]:
+    for label in ["morning", "evening"]:
         job_name = f"checkin_{label}_{chat_id}"
         for job in app.job_queue.get_jobs_by_name(job_name):
             job.schedule_removal()
         if not enabled:
             continue
 
-        t = _parse_local_time(f"{hour:02d}:00", tz_str)
+        t = _parse_local_time(times.get(label, "08:00" if label == "morning" else "21:00"), tz_str)
         if label == "morning":
             prompt = (
                 "It's morning check-in time. Greet the user briefly, "
@@ -410,11 +412,91 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
     app.job_queue.run_daily(_job, time=t, name=job_name)
 
 
+def schedule_user_alerts(app: Application, chat_id: int) -> None:
+    """Schedule daily deadline alert (09:00) and habit reminder (20:00) jobs."""
+    user = get_user(chat_id)
+    tz_str = user.get("timezone", "UTC")
+    enabled = user.get("checkin_enabled", False)
+
+    for job_name in [f"deadline_alert_{chat_id}", f"habit_reminder_{chat_id}"]:
+        for job in app.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+
+    if not enabled:
+        return
+
+    # ── deadline alert at 09:00 ──
+    async def _deadline_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        u = get_user(_cid)
+        if _is_quiet_now(u):
+            return
+        today = date.today()
+        alerts = []
+        for task in u.get("tasks", []):
+            due = _task_due(task)
+            if not due:
+                continue
+            try:
+                due_date = date.fromisoformat(due)
+                days_left = (due_date - today).days
+                text = _task_text(task)
+                if days_left < 0:
+                    alerts.append(f"⚠️ Overdue {-days_left}d: {text}")
+                elif days_left == 0:
+                    alerts.append(f"🔴 Due TODAY: {text}")
+                elif days_left <= 3:
+                    alerts.append(f"🟡 Due in {days_left}d: {text}")
+            except ValueError:
+                pass
+        if alerts:
+            try:
+                await context.bot.send_message(
+                    chat_id=_cid,
+                    text="📅 Deadline alert:\n" + "\n".join(alerts)
+                )
+            except Exception as e:
+                logger.error("Deadline alert failed for %s: %s", _cid, e)
+
+    app.job_queue.run_daily(
+        _deadline_job,
+        time=_parse_local_time("09:00", tz_str),
+        name=f"deadline_alert_{chat_id}",
+    )
+
+    # ── habit reminder at 20:00 ──
+    async def _habit_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        u = get_user(_cid)
+        if _is_quiet_now(u):
+            return
+        habits = u.get("habits", {})
+        today_str = date.today().isoformat()
+        undone = [n for n, d in habits.items() if today_str not in d.get("completions", [])]
+        if undone:
+            try:
+                await context.bot.send_message(
+                    chat_id=_cid,
+                    text=(
+                        "🔔 Habit reminder — not yet done today:\n"
+                        + "\n".join(f"  • {n}" for n in undone)
+                        + "\nUse /habit done <name> to log them."
+                    )
+                )
+            except Exception as e:
+                logger.error("Habit reminder failed for %s: %s", _cid, e)
+
+    app.job_queue.run_daily(
+        _habit_job,
+        time=_parse_local_time("20:00", tz_str),
+        name=f"habit_reminder_{chat_id}",
+    )
+
+
 def restore_all_jobs(app: Application) -> None:
     """Recreate all scheduled jobs from persisted state on startup."""
     for cid_str, user in state["users"].items():
         cid = int(cid_str)
         schedule_user_checkins(app, cid)
+        schedule_user_alerts(app, cid)
         for reminder in user.get("reminders", []):
             schedule_user_reminder(app, cid, reminder)
 
@@ -462,6 +544,42 @@ def _tracker_history(name: str, data: dict, n: int = 10) -> str:
     for e in reversed(recent):
         lines.append(f"  {e['ts'][:16].replace('T', ' ')}  →  {e['value']}{unit}")
     return "\n".join(lines)
+
+
+_SPARK_BARS = "▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list) -> str:
+    """Return an ASCII sparkline string from a list of numbers."""
+    if not values:
+        return ""
+    mn, mx = min(values), max(values)
+    if mn == mx:
+        return _SPARK_BARS[3] * len(values)
+    return "".join(
+        _SPARK_BARS[round((v - mn) / (mx - mn) * 7)] for v in values
+    )
+
+
+def _tracker_chart(name: str, data: dict, n: int = 30) -> str:
+    log = data.get("log", [])
+    unit = data.get("unit", "")
+    if not log:
+        return f"No data for {name} yet."
+    recent = [e for e in log[-n:] if isinstance(e["value"], (int, float))]
+    if not recent:
+        return f"No numeric data for {name}."
+    values = [e["value"] for e in recent]
+    spark = _sparkline(values)
+    mn, mx = min(values), max(values)
+    first_date = recent[0]["ts"][:10]
+    last_date = recent[-1]["ts"][:10]
+    return (
+        f"📈 {name} chart (last {len(recent)} entries):\n"
+        f"{spark}\n"
+        f"Min: {mn}{unit}  Max: {mx}{unit}\n"
+        f"{first_date} → {last_date}"
+    )
 
 
 # ─────────────────────── handlers: core ───────────────────────
@@ -572,10 +690,13 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user["checkin_enabled"] = True
     save_state(state)
     tz = user.get("timezone", "UTC")
+    times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
     schedule_user_checkins(context.application, update.effective_chat.id)
+    schedule_user_alerts(context.application, update.effective_chat.id)
     await update.message.reply_text(
-        f"Daily check-ins enabled at 08:00 and 21:00 ({tz}).\n"
-        "Use /settimezone to change your timezone."
+        f"Daily check-ins enabled at {times['morning']} (morning) and {times['evening']} (evening) ({tz}).\n"
+        "Also: deadline alerts at 09:00 and habit reminders at 20:00.\n"
+        "Use /settimezone or /setcheckin to adjust."
     )
 
 
@@ -584,7 +705,8 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user["checkin_enabled"] = False
     save_state(state)
     schedule_user_checkins(context.application, update.effective_chat.id)
-    await update.message.reply_text("Daily check-ins disabled.")
+    schedule_user_alerts(context.application, update.effective_chat.id)
+    await update.message.reply_text("Daily check-ins, deadline alerts, and habit reminders disabled.")
 
 
 async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -604,7 +726,7 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user["timezone"] = tz_str
     save_state(state)
     schedule_user_checkins(context.application, update.effective_chat.id)
-    # Reschedule reminders with new timezone
+    schedule_user_alerts(context.application, update.effective_chat.id)
     for reminder in user.get("reminders", []):
         schedule_user_reminder(context.application, update.effective_chat.id, reminder)
     await update.message.reply_text(f"Timezone set to {tz_str}.")
@@ -834,13 +956,16 @@ async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TY
     elif sub == "history":
         n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
         await update.message.reply_text(_tracker_history(cmd, tracker, n))
+    elif sub == "chart":
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 30
+        await update.message.reply_text(_tracker_chart(cmd, tracker, n))
     else:
         try:
             raw = float(sub)
             value = int(raw) if raw == int(raw) else raw
         except ValueError:
             await update.message.reply_text(
-                f"Usage: /{cmd} <number> | stats | history"
+                f"Usage: /{cmd} <number> | stats | history | chart"
             )
             return
         entry = {"ts": datetime.utcnow().isoformat(), "value": value}
@@ -1227,6 +1352,48 @@ async def quiet_hours_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─────────────────────── handlers: custom check-in times ────────────────────
+
+async def set_checkin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    tz = user.get("timezone", "UTC")
+    times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
+
+    if not context.args:
+        await update.message.reply_text(
+            f"Current check-in times: {times['morning']} (morning) and {times['evening']} (evening) ({tz})\n"
+            "Usage: /setcheckin HH:MM HH:MM\n"
+            "Example: /setcheckin 07:30 22:00"
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /setcheckin <morning HH:MM> <evening HH:MM>")
+        return
+
+    def _valid(s):
+        try:
+            h, m = s.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+            return True
+        except (ValueError, AssertionError):
+            return False
+
+    morning_t, evening_t = context.args[0], context.args[1]
+    if not _valid(morning_t) or not _valid(evening_t):
+        await update.message.reply_text("Invalid time. Use HH:MM (24h format).")
+        return
+
+    user["checkin_times"] = {"morning": morning_t, "evening": evening_t}
+    save_state(state)
+    schedule_user_checkins(context.application, update.effective_chat.id)
+    await update.message.reply_text(
+        f"Check-in times updated:\n"
+        f"  Morning: {morning_t} ({tz})\n"
+        f"  Evening: {evening_t} ({tz})"
+    )
+
+
 # ─────────────────────── handlers: AI insights ───────────────────────
 
 async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1361,6 +1528,7 @@ def main():
     app.add_handler(CommandHandler("mystats", my_stats))
     app.add_handler(CommandHandler("pomodoro", pomodoro_cmd))
     app.add_handler(CommandHandler("quiethours", quiet_hours_cmd))
+    app.add_handler(CommandHandler("setcheckin", set_checkin_cmd))
     app.add_handler(CommandHandler("insights", insights_cmd))
     # Inline keyboard callback for check-in buttons
     app.add_handler(CallbackQueryHandler(handle_callback))
