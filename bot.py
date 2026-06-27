@@ -1550,6 +1550,7 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
                     ],
                 ])
                 await context.bot.send_message(chat_id=_cid, text=reply, reply_markup=keyboard)
+                db_log_job(str(_cid), f"checkin_{'morning' if _morning else 'evening'}")
             except Exception as e:
                 logger.error("Check-in failed for %s: %s", _cid, e)
 
@@ -3093,7 +3094,7 @@ async def weekly_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     if user["tasks"]:
-        lines.append(f"Tasks being tracked: {', '.join(user['tasks'])}")
+        lines.append(f"Tasks being tracked: {_tasks_for_prompt(user['tasks'])}")
 
     for name, data in user.get("trackers", {}).items():
         recent = [e for e in data.get("log", []) if e.get("ts", "") >= _days_ago_iso(7)]
@@ -3102,8 +3103,11 @@ async def weekly_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vals = ", ".join(str(e["value"]) + unit for e in recent)
             lines.append(f"{name} (last 7 days): {vals}")
 
-    journal = user.get("journal", [])
-    recent_journal = [e for e in journal if e.get("ts", "") >= _days_ago_iso(7)]
+    week_cutoff = _days_ago_iso(7)
+    recent_journal = [
+        r for r in db_get_journal(str(update.effective_chat.id))
+        if r["ts"] >= week_cutoff
+    ]
     if recent_journal:
         lines.append(f"Journal entries this week: {len(recent_journal)}")
 
@@ -3581,14 +3585,8 @@ async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     recent_journal = db_get_journal(str(update.effective_chat.id), limit=10)
     if recent_journal:
-        excerpts = " | ".join(r["entry"][:80] for r in recent_journal[-3:])
+        excerpts = " | ".join(r["entry"][:80] for r in recent_journal[:3])
         parts.append(f"Recent journal: {excerpts}")
-
-    journal = user.get("journal", [])
-    if journal:
-        recent_j = journal[-5:]
-        entries_text = " | ".join(e["entry"][:60] for e in recent_j)
-        parts.append(f"Recent journal entries: {entries_text}")
 
     if not parts:
         await update.message.reply_text("Not enough data for insights yet. Start tracking!")
