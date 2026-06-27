@@ -90,6 +90,21 @@ _db_tmp.close()
 bot._init_db()
 
 
+def _fresh_db():
+    """Point bot at a brand-new temp DB and initialise it."""
+    tmp = _tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    bot.DB_FILE = tmp.name
+    bot._init_db()
+
+
+# Autouse fixture: give every test its own DB file so tests never bleed into each other.
+@pytest.fixture(autouse=True)
+def isolate_db():
+    _fresh_db()
+    yield
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,7 +117,11 @@ def fresh_user(**overrides) -> dict:
 
 def run(coro):
     """Run an async function synchronously (for non-async test helpers)."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -677,3 +696,687 @@ class TestNaturalLanguageToolUse:
         assert "add_journal_entry" in tools_called, (
             f"Expected add_journal_entry, got: {tools_called}\nReply: {reply}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4: SQLite memory store
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSQLiteNotes:
+    """Tests for db_add_note / db_get_notes / db_remove_note / db_search_notes."""
+
+    def setup_method(self):
+        _fresh_db()
+
+    def test_add_and_get_note(self):
+        bot.db_add_note("1", "Buy milk")
+        rows = bot.db_get_notes("1")
+        assert len(rows) == 1
+        assert rows[0]["text"] == "Buy milk"
+
+    def test_notes_isolated_per_user(self):
+        bot.db_add_note("1", "User 1 note")
+        bot.db_add_note("2", "User 2 note")
+        assert len(bot.db_get_notes("1")) == 1
+        assert len(bot.db_get_notes("2")) == 1
+        assert bot.db_get_notes("1")[0]["text"] == "User 1 note"
+
+    def test_notes_ordered_by_insertion(self):
+        bot.db_add_note("1", "First")
+        bot.db_add_note("1", "Second")
+        bot.db_add_note("1", "Third")
+        texts = [r["text"] for r in bot.db_get_notes("1")]
+        assert texts == ["First", "Second", "Third"]
+
+    def test_remove_note(self):
+        bot.db_add_note("1", "To remove")
+        rows = bot.db_get_notes("1")
+        row_id = rows[0]["id"]
+        assert bot.db_remove_note("1", row_id) is True
+        assert len(bot.db_get_notes("1")) == 0
+
+    def test_remove_nonexistent_note_returns_false(self):
+        assert bot.db_remove_note("1", 999999) is False
+
+    def test_remove_other_users_note_not_allowed(self):
+        bot.db_add_note("1", "Private note")
+        row_id = bot.db_get_notes("1")[0]["id"]
+        # user "2" tries to delete user "1"'s note
+        assert bot.db_remove_note("2", row_id) is False
+        assert len(bot.db_get_notes("1")) == 1
+
+    def test_search_notes_case_insensitive(self):
+        bot.db_add_note("1", "Call the dentist tomorrow")
+        bot.db_add_note("1", "Buy groceries")
+        results = bot.db_search_notes("1", "DENTIST")
+        assert len(results) == 1
+        assert "dentist" in results[0]["text"].lower()
+
+    def test_search_notes_no_match(self):
+        bot.db_add_note("1", "Buy milk")
+        assert bot.db_search_notes("1", "xyz_nomatch") == []
+
+    def test_auto_flag_stored(self):
+        bot.db_add_note("1", "auto note", auto=True)
+        bot.db_add_note("1", "manual note", auto=False)
+        rows = bot.db_get_notes("1")
+        autos = [r["auto"] for r in rows]
+        assert 1 in autos
+        assert 0 in autos
+
+    def test_unlimited_notes(self):
+        """Should be able to store far more than the old 50-note limit."""
+        for i in range(200):
+            bot.db_add_note("1", f"Note {i}")
+        assert len(bot.db_get_notes("1")) == 200
+
+
+class TestSQLiteJournal:
+    """Tests for db_add_journal / db_get_journal / db_search_journal."""
+
+    def setup_method(self):
+        _fresh_db()
+
+    def test_add_and_get_journal(self):
+        bot.db_add_journal("1", "Had a great day")
+        rows = bot.db_get_journal("1")
+        assert len(rows) == 1
+        assert rows[0]["entry"] == "Had a great day"
+
+    def test_journal_isolated_per_user(self):
+        bot.db_add_journal("1", "User 1 entry")
+        bot.db_add_journal("2", "User 2 entry")
+        assert len(bot.db_get_journal("1")) == 1
+        assert len(bot.db_get_journal("2")) == 1
+
+    def test_journal_limit_param(self):
+        for i in range(10):
+            bot.db_add_journal("1", f"Entry {i}")
+        assert len(bot.db_get_journal("1", limit=3)) == 3
+
+    def test_journal_limit_returns_most_recent(self):
+        for i in range(5):
+            bot.db_add_journal("1", f"Entry {i}")
+        rows = bot.db_get_journal("1", limit=2)
+        texts = [r["entry"] for r in rows]
+        assert "Entry 4" in texts
+        assert "Entry 3" in texts
+
+    def test_journal_returned_in_chronological_order(self):
+        bot.db_add_journal("1", "First")
+        bot.db_add_journal("1", "Second")
+        rows = bot.db_get_journal("1")
+        assert rows[0]["entry"] == "First"
+        assert rows[1]["entry"] == "Second"
+
+    def test_search_journal(self):
+        bot.db_add_journal("1", "Went to the gym and felt great")
+        bot.db_add_journal("1", "Had pizza for dinner")
+        results = bot.db_search_journal("1", "gym")
+        assert len(results) == 1
+
+    def test_unlimited_journal(self):
+        """Should be able to store far more than the old 200-entry limit."""
+        for i in range(500):
+            bot.db_add_journal("1", f"Entry {i}")
+        assert len(bot.db_get_journal("1")) == 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5: New _execute_tool coverage
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNewExecuteTools:
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = None
+        _fresh_db()
+
+    # ── remove_task ──────────────────────────────────────────────────────────
+
+    def test_remove_task_success(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["tasks"] = ["Task A", "Task B", "Task C"]
+        result = run(bot._execute_tool(20, "remove_task", {"task_number": 2}))
+        assert result["success"] is True
+        assert result["removed"] == "Task B"
+        assert len(bot.state["users"]["20"]["tasks"]) == 2
+
+    def test_remove_task_out_of_range(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "remove_task", {"task_number": 1}))
+        assert "error" in result
+
+    # ── get_trackers ─────────────────────────────────────────────────────────
+
+    def test_get_trackers_empty(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "get_trackers", {}))
+        assert result["count"] == 0
+
+    def test_get_trackers_with_data(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["trackers"] = {
+            "weight": {"unit": "kg", "log": [{"ts": "2026-01-01", "value": 80.0}]},
+            "steps": {"unit": "", "log": []},
+        }
+        result = run(bot._execute_tool(20, "get_trackers", {}))
+        assert result["count"] == 2
+        names = [t["name"] for t in result["trackers"]]
+        assert "weight" in names and "steps" in names
+        weight = next(t for t in result["trackers"] if t["name"] == "weight")
+        assert weight["last_value"] == 80.0
+
+    # ── create_tracker ───────────────────────────────────────────────────────
+
+    def test_create_tracker_success(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "create_tracker", {"name": "steps", "unit": ""}))
+        assert result["success"] is True
+        assert "steps" in bot.state["users"]["20"]["trackers"]
+
+    def test_create_tracker_duplicate(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["trackers"] = {"steps": {"unit": "", "log": []}}
+        result = run(bot._execute_tool(20, "create_tracker", {"name": "steps"}))
+        assert result.get("already_exists") is True
+
+    def test_create_tracker_invalid_name(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "create_tracker", {"name": "my tracker"}))
+        assert "error" in result
+
+    def test_create_tracker_reserved_name(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "create_tracker", {"name": "start"}))
+        assert "error" in result
+
+    # ── get_habits ───────────────────────────────────────────────────────────
+
+    def test_get_habits_empty(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "get_habits", {}))
+        assert result["count"] == 0
+
+    def test_get_habits_with_data(self):
+        from datetime import date
+        bot.state["users"]["20"] = fresh_user()
+        today = date.today().isoformat()
+        bot.state["users"]["20"]["habits"] = {
+            "meditation": {"completions": [today], "created": "2026-01-01"},
+            "running": {"completions": [], "created": "2026-01-01"},
+        }
+        result = run(bot._execute_tool(20, "get_habits", {}))
+        assert result["count"] == 2
+        med = next(h for h in result["habits"] if h["name"] == "meditation")
+        assert med["done_today"] is True
+        run_ = next(h for h in result["habits"] if h["name"] == "running")
+        assert run_["done_today"] is False
+
+    # ── add_habit ────────────────────────────────────────────────────────────
+
+    def test_add_habit_success(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "add_habit", {"name": "meditation"}))
+        assert result["success"] is True
+        assert "meditation" in bot.state["users"]["20"]["habits"]
+
+    def test_add_habit_duplicate(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["habits"] = {"meditation": {"completions": []}}
+        result = run(bot._execute_tool(20, "add_habit", {"name": "meditation"}))
+        assert result.get("already_exists") is True
+
+    def test_add_habit_spaces_converted(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_habit", {"name": "morning run"}))
+        assert "morning_run" in bot.state["users"]["20"]["habits"]
+
+    # ── complete_habit ───────────────────────────────────────────────────────
+
+    def test_complete_habit_success(self):
+        from datetime import date
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["habits"] = {"meditation": {"completions": []}}
+        result = run(bot._execute_tool(20, "complete_habit", {"name": "meditation"}))
+        assert result["success"] is True
+        today = date.today().isoformat()
+        assert today in bot.state["users"]["20"]["habits"]["meditation"]["completions"]
+
+    def test_complete_habit_already_done(self):
+        from datetime import date
+        bot.state["users"]["20"] = fresh_user()
+        today = date.today().isoformat()
+        bot.state["users"]["20"]["habits"] = {"meditation": {"completions": [today]}}
+        result = run(bot._execute_tool(20, "complete_habit", {"name": "meditation"}))
+        assert result.get("already_done") is True
+
+    def test_complete_habit_not_found(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "complete_habit", {"name": "nonexistent"}))
+        assert "error" in result
+
+    # ── remove_habit ─────────────────────────────────────────────────────────
+
+    def test_remove_habit_success(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["habits"] = {"meditation": {"completions": []}}
+        result = run(bot._execute_tool(20, "remove_habit", {"name": "meditation"}))
+        assert result["success"] is True
+        assert "meditation" not in bot.state["users"]["20"]["habits"]
+
+    def test_remove_habit_not_found(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "remove_habit", {"name": "nonexistent"}))
+        assert "error" in result
+
+    # ── get_notes / add_note ─────────────────────────────────────────────────
+
+    def test_add_note_tool(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "add_note", {"text": "Buy milk"}))
+        assert result["success"] is True
+        rows = bot.db_get_notes("20")
+        assert any(r["text"] == "Buy milk" for r in rows)
+
+    def test_get_notes_tool(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.db_add_note("20", "Note A")
+        bot.db_add_note("20", "Note B")
+        result = run(bot._execute_tool(20, "get_notes", {}))
+        assert result["count"] == 2
+
+    def test_add_note_empty_text_errors(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "add_note", {"text": ""}))
+        assert "error" in result
+
+    # ── set_today_focus ──────────────────────────────────────────────────────
+
+    def test_set_today_focus(self):
+        from datetime import date
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "set_today_focus", {"text": "Finish the report"}))
+        assert result["success"] is True
+        focus = bot.state["users"]["20"]["today_focus"]
+        assert focus["text"] == "Finish the report"
+        assert focus["date"] == date.today().isoformat()
+
+    def test_set_today_focus_empty_errors(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "set_today_focus", {"text": ""}))
+        assert "error" in result
+
+    # ── search ───────────────────────────────────────────────────────────────
+
+    def test_search_finds_task(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["tasks"] = ["Call the dentist"]
+        result = run(bot._execute_tool(20, "search", {"query": "dentist"}))
+        assert result["total_matches"] >= 1
+        assert any("dentist" in t["text"].lower() for t in result["tasks"])
+
+    def test_search_finds_note(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.db_add_note("20", "dentist appointment next Monday")
+        result = run(bot._execute_tool(20, "search", {"query": "dentist"}))
+        assert len(result["notes"]) >= 1
+
+    def test_search_finds_journal(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.db_add_journal("20", "Went to see the dentist today")
+        result = run(bot._execute_tool(20, "search", {"query": "dentist"}))
+        assert len(result["journal"]) >= 1
+
+    def test_search_no_results(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "search", {"query": "xyz_no_match_abc"}))
+        assert result["total_matches"] == 0
+
+    def test_search_empty_query_errors(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "search", {"query": ""}))
+        assert "error" in result
+
+    # ── get_streak ───────────────────────────────────────────────────────────
+
+    def test_get_streak_zero(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "get_streak", {}))
+        assert result["current_streak"] == 0
+        assert result["total_active_days"] == 0
+
+    def test_get_streak_nonzero(self):
+        from datetime import date, timedelta
+        bot.state["users"]["20"] = fresh_user()
+        days = [(date.today() - timedelta(days=i)).isoformat() for i in range(3)]
+        bot.state["users"]["20"]["activity_days"] = days
+        result = run(bot._execute_tool(20, "get_streak", {}))
+        assert result["current_streak"] == 3
+
+    # ── save_memory ──────────────────────────────────────────────────────────
+
+    def test_save_memory_as_note(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "save_memory", {"text": "I prefer morning workouts", "type": "note"}))
+        assert result["success"] is True
+        assert result["saved_as"] == "note"
+        rows = bot.db_get_notes("20")
+        assert any("morning workouts" in r["text"] for r in rows)
+        # should be marked as auto-saved
+        auto_rows = [r for r in rows if r["auto"] == 1]
+        assert len(auto_rows) >= 1
+
+    def test_save_memory_as_journal(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "save_memory", {"text": "Had a tough day but pushed through", "type": "journal"}))
+        assert result["success"] is True
+        assert result["saved_as"] == "journal"
+        rows = bot.db_get_journal("20")
+        assert any("tough day" in r["entry"] for r in rows)
+
+    def test_save_memory_defaults_to_note(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "save_memory", {"text": "Team meeting every Monday"}))
+        assert result["saved_as"] == "note"
+
+    def test_save_memory_empty_text_errors(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "save_memory", {"text": ""}))
+        assert "error" in result
+
+    # ── get_journal ──────────────────────────────────────────────────────────
+
+    def test_get_journal_tool_empty(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "get_journal", {}))
+        assert result["count"] == 0
+
+    def test_get_journal_tool_with_entries(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.db_add_journal("20", "Entry A")
+        bot.db_add_journal("20", "Entry B")
+        result = run(bot._execute_tool(20, "get_journal", {"limit": 10}))
+        assert result["count"] == 2
+        texts = [e["text"] for e in result["entries"]]
+        assert "Entry A" in texts and "Entry B" in texts
+
+    def test_get_journal_tool_respects_limit(self):
+        bot.state["users"]["20"] = fresh_user()
+        for i in range(20):
+            bot.db_add_journal("20", f"Entry {i}")
+        result = run(bot._execute_tool(20, "get_journal", {"limit": 5}))
+        assert result["count"] == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6: Habit and mute helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHabitStreak:
+    def test_empty_completions(self):
+        assert bot._habit_streak([]) == 0
+
+    def test_only_today(self):
+        from datetime import date
+        assert bot._habit_streak([date.today().isoformat()]) == 1
+
+    def test_consecutive_streak(self):
+        from datetime import date, timedelta
+        days = [(date.today() - timedelta(days=i)).isoformat() for i in range(7)]
+        assert bot._habit_streak(days) == 7
+
+    def test_streak_survives_yesterday_only(self):
+        """If done yesterday but not today, streak should still count."""
+        from datetime import date, timedelta
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        assert bot._habit_streak([yesterday]) == 1
+
+    def test_streak_broken(self):
+        from datetime import date, timedelta
+        days = [
+            date.today().isoformat(),
+            (date.today() - timedelta(days=2)).isoformat(),  # gap
+        ]
+        assert bot._habit_streak(days) == 1
+
+
+class TestMuteLogic:
+    def test_not_muted_when_empty(self):
+        u = fresh_user()
+        assert bot._is_muted(u) is False
+
+    def test_muted_when_future_timestamp(self):
+        from datetime import datetime, timedelta
+        u = fresh_user()
+        u["muted_until"] = (datetime.utcnow() + timedelta(hours=4)).isoformat()
+        assert bot._is_muted(u) is True
+
+    def test_not_muted_when_expired(self):
+        from datetime import datetime, timedelta
+        u = fresh_user()
+        u["muted_until"] = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        assert bot._is_muted(u) is False
+
+    def test_not_muted_with_invalid_timestamp(self):
+        u = fresh_user()
+        u["muted_until"] = "not-a-date"
+        assert bot._is_muted(u) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7: Parse helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestParseOnceDelay:
+    def test_minutes_spec(self):
+        delay = bot._parse_once_delay("30m", "UTC")
+        assert delay == 30 * 60
+
+    def test_hours_spec(self):
+        delay = bot._parse_once_delay("2h", "UTC")
+        assert delay == 2 * 3600
+
+    def test_invalid_spec_returns_none(self):
+        assert bot._parse_once_delay("tomorrow", "UTC") is None
+
+    def test_hhmm_spec_returns_positive_seconds(self):
+        """HH:MM that is in the future (or tomorrow) should return > 0 seconds."""
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        # pick a time definitely in the future: now + 1h
+        future = datetime.now(ZoneInfo("UTC")) + timedelta(hours=1)
+        spec = future.strftime("%H:%M")
+        delay = bot._parse_once_delay(spec, "UTC")
+        assert delay is not None and delay > 0
+
+    def test_empty_spec_returns_none(self):
+        assert bot._parse_once_delay("", "UTC") is None
+
+
+class TestParseLocalTime:
+    def test_returns_timezone_aware_time(self):
+        from datetime import time as dt_time
+        from zoneinfo import ZoneInfo
+        t = bot._parse_local_time("09:30", "Europe/London")
+        assert t.tzinfo is not None
+        assert t.hour == 9 and t.minute == 30
+
+    def test_invalid_tz_falls_back_to_utc(self):
+        t = bot._parse_local_time("08:00", "Invalid/Zone")
+        from zoneinfo import ZoneInfo
+        assert str(t.tzinfo) == "UTC"
+
+
+class TestTasksForPrompt:
+    def test_empty_tasks(self):
+        assert bot._tasks_for_prompt([]) == "none set yet"
+
+    def test_string_tasks(self):
+        result = bot._tasks_for_prompt(["Buy milk", "Call dentist"])
+        assert "Buy milk" in result
+        assert "Call dentist" in result
+
+    def test_dict_task_with_due(self):
+        result = bot._tasks_for_prompt([{"text": "Report", "due": "2026-07-15"}])
+        assert "Report" in result
+        assert "2026-07-15" in result
+
+
+class TestHabitSummaryLines:
+    def test_empty_habits(self):
+        assert bot._habit_summary_lines({}) == []
+
+    def test_done_today_shows_checkmark(self):
+        from datetime import date
+        habits = {"meditation": {"completions": [date.today().isoformat()], "created": "2026-01-01"}}
+        lines = bot._habit_summary_lines(habits)
+        assert len(lines) == 1
+        assert "✓" in lines[0]
+
+    def test_not_done_shows_circle(self):
+        habits = {"meditation": {"completions": [], "created": "2026-01-01"}}
+        lines = bot._habit_summary_lines(habits)
+        assert "○" in lines[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8: System prompt includes SQLite data
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSystemPromptWithDB:
+    def setup_method(self):
+        bot.state = {"users": {}}
+        _fresh_db()
+
+    def test_notes_appear_in_prompt(self):
+        bot.state["users"]["30"] = fresh_user()
+        bot.db_add_note("30", "My secret goal is to write a book")
+        u = bot.state["users"]["30"]
+        prompt = bot.build_system_prompt(u, chat_id=30)
+        assert "secret goal" in prompt
+
+    def test_recent_journal_appears_in_prompt(self):
+        bot.state["users"]["30"] = fresh_user()
+        bot.db_add_journal("30", "Felt very productive today and shipped a feature")
+        u = bot.state["users"]["30"]
+        prompt = bot.build_system_prompt(u, chat_id=30)
+        assert "productive" in prompt
+
+    def test_empty_db_no_crash(self):
+        bot.state["users"]["30"] = fresh_user()
+        u = bot.state["users"]["30"]
+        prompt = bot.build_system_prompt(u, chat_id=30)
+        assert isinstance(prompt, str) and len(prompt) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9: New NL tool-use tests (real API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.nl
+class TestNaturalLanguageNewTools:
+    """NL tests for tools added since the first batch."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = None
+        _fresh_db()
+
+    # ── add a habit ───────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_add_habit_nl(self):
+        uid = 201
+        bot.state["users"][str(uid)] = fresh_user()
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(uid, "Add a daily habit: morning meditation")
+        tools_called = [name for name, _ in cap.calls]
+        assert "add_habit" in tools_called, (
+            f"Expected add_habit, got: {tools_called}\nReply: {reply}"
+        )
+
+    # ── mark habit done ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_complete_habit_nl(self):
+        uid = 202
+        bot.state["users"][str(uid)] = fresh_user()
+        bot.state["users"][str(uid)]["habits"] = {"meditation": {"completions": []}}
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(uid, "I did my meditation today")
+        tools_called = [name for name, _ in cap.calls]
+        assert "complete_habit" in tools_called, (
+            f"Expected complete_habit, got: {tools_called}\nReply: {reply}"
+        )
+
+    # ── create a tracker ──────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_create_tracker_nl(self):
+        uid = 203
+        bot.state["users"][str(uid)] = fresh_user()
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(uid, "Create a tracker called sleep to track hours of sleep")
+        tools_called = [name for name, _ in cap.calls]
+        assert "create_tracker" in tools_called, (
+            f"Expected create_tracker, got: {tools_called}\nReply: {reply}"
+        )
+
+    # ── set today's focus ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_set_focus_nl(self):
+        uid = 204
+        bot.state["users"][str(uid)] = fresh_user()
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(uid, "My focus for today is finishing the quarterly report")
+        tools_called = [name for name, _ in cap.calls]
+        assert "set_today_focus" in tools_called, (
+            f"Expected set_today_focus, got: {tools_called}\nReply: {reply}"
+        )
+
+    # ── auto save memory ─────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_auto_save_personal_fact(self):
+        """Sharing a personal fact should trigger save_memory silently."""
+        uid = 205
+        bot.state["users"][str(uid)] = fresh_user()
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(
+                uid,
+                "By the way, I'm allergic to peanuts and I work as a nurse."
+            )
+        tools_called = [name for name, _ in cap.calls]
+        assert "save_memory" in tools_called, (
+            f"Expected save_memory for personal fact, got: {tools_called}\nReply: {reply}"
+        )
+
+    # ── search ────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_search_nl(self):
+        uid = 206
+        bot.state["users"][str(uid)] = fresh_user()
+        bot.state["users"][str(uid)]["tasks"] = ["Call the dentist"]
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(uid, "Search for dentist in my data")
+        tools_called = [name for name, _ in cap.calls]
+        assert "search" in tools_called, (
+            f"Expected search, got: {tools_called}\nReply: {reply}"
+        )
+
+    # ── get streak ────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_get_streak_nl(self):
+        uid = 207
+        bot.state["users"][str(uid)] = fresh_user()
+        with ToolCallCapture(uid) as cap:
+            reply = await bot.chat(uid, "How long is my current streak?")
+        tools_called = [name for name, _ in cap.calls]
+        assert "get_streak" in tools_called, (
+            f"Expected get_streak, got: {tools_called}\nReply: {reply}"
+        )
+
