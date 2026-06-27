@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 8 complete
+## Status: Iteration 9 complete
 
 ---
 
@@ -166,6 +166,27 @@ Shows the user's current local time and day of week using their stored IANA time
 
 ### 40. Enhanced manual /checkin ✅ done (iteration 8)
 `/checkin` now prepends a mini-dashboard: today's focus (if set), active task count with first 3 names, and pending habits. The AI response follows immediately below. Makes check-in much more actionable.
+
+### 41. Achievement milestones ✅ done (iteration 9)
+`_check_milestones(chat_id, app)` fires after every message and after `/donetask`. Congratulates user on 7/14/30/60/100-day streaks and 5/10/25/50/100 completed tasks. Uses `milestones_sent` list to send each notification only once.
+
+### 42. `/suggest` ✅ done (iteration 9)
+AI reviews user's context, tasks, habits, and recent journal, then suggests 3 specific actionable tasks or habits with rationale. Completely personalized — no generic advice.
+
+### 43. `/reflect` ✅ done (iteration 9)
+Deeper personal reflection than `/weekly`: identifies patterns across habits/streaks/journal, names what's working, and suggests one focus area for next week.
+
+### 44. `/duedate <n> YYYY-MM-DD` ✅ done (iteration 9)
+Updates a task's due date in-place (or clears it with `none`). Converts plain-string tasks to dict form on first use. No need to delete and re-add.
+
+### 45. `/swap <n> <m>` ✅ done (iteration 9)
+Swaps two tasks' positions without deleting either. Useful for reordering the task list.
+
+### 46. Gratitude in evening check-in ✅ done (iteration 9)
+Evening check-in prompt now asks the user to share one thing they're grateful for today. Builds a positive close-of-day habit.
+
+### 47. Stale-tracker reminder in morning check-in ✅ done (iteration 9)
+Morning check-in dynamically detects trackers with no log in 2+ days and includes a nudge to log them, by name.
 
 ## Implementation order
 

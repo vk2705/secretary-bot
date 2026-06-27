@@ -52,7 +52,7 @@ RESERVED_COMMANDS = {
     "donetask", "archive", "reset", "help",
     "prioritize", "today", "note", "notes", "removenote", "search",
     "setlanguage", "clearlanguage", "compress", "broadcast", "feedback",
-    "time",
+    "time", "suggest", "duedate", "swap", "reflect",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -75,6 +75,7 @@ def _new_user(**overrides) -> dict:
         "notes": [],
         "today_focus": {"date": "", "text": ""},
         "language": "",
+        "milestones_sent": [],
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -158,6 +159,35 @@ def _get_streak(user: dict) -> int:
         streak += 1
         d -= timedelta(days=1)
     return streak
+
+
+async def _check_milestones(chat_id: int, app) -> None:
+    """Send congratulation messages for newly crossed milestones."""
+    user = get_user(chat_id)
+    sent = user.setdefault("milestones_sent", [])
+    msgs = []
+
+    streak = _get_streak(user)
+    for s in (7, 14, 30, 60, 100):
+        key = f"streak_{s}"
+        if streak >= s and key not in sent:
+            sent.append(key)
+            msgs.append(f"🏆 {s}-day streak! You've been active every day for {s} days in a row. Excellent consistency!")
+
+    n_done = len(user.get("archived_tasks", []))
+    for n in (5, 10, 25, 50, 100):
+        key = f"tasks_{n}"
+        if n_done >= n and key not in sent:
+            sent.append(key)
+            msgs.append(f"🎉 You've completed {n} tasks total! Every one of them counts.")
+
+    if msgs:
+        save_state(state)
+        for m in msgs:
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=m)
+            except Exception as e:
+                logger.error("Milestone message failed for %s: %s", chat_id, e)
 
 
 # ─────────────────────── habit helpers ───────────────────────
@@ -415,12 +445,40 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
                 "at least one small thing."
             )
 
-        async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _prompt=prompt):
+        is_morning = (label == "morning")
+
+        async def _job(
+            context: ContextTypes.DEFAULT_TYPE,
+            _cid=chat_id, _prompt=prompt, _morning=is_morning,
+        ):
             user_now = get_user(_cid)
             if _is_quiet_now(user_now):
                 return
             try:
-                reply = await chat(_cid, _prompt)
+                dynamic_prompt = _prompt
+                if _morning:
+                    # Append stale-tracker reminder if any tracker hasn't been logged in 2+ days
+                    stale = []
+                    for tname, tdata in user_now.get("trackers", {}).items():
+                        log = tdata.get("log", [])
+                        if log:
+                            last_ts = log[-1]["ts"][:10]
+                            try:
+                                if (date.today() - date.fromisoformat(last_ts)).days >= 2:
+                                    stale.append(tname)
+                            except ValueError:
+                                pass
+                    if stale:
+                        dynamic_prompt += (
+                            f" Also mention that these trackers haven't been updated in 2+ days "
+                            f"and nudge the user to log: {', '.join(stale)}."
+                        )
+                else:
+                    # Evening: ask for gratitude
+                    dynamic_prompt += (
+                        " At the end, ask them to share one thing they're grateful for today."
+                    )
+                reply = await chat(_cid, dynamic_prompt)
                 keyboard = InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton("✅ Going well", callback_data="ci:well"),
@@ -688,6 +746,8 @@ _HELP_TEXT = (
     "  /tasks  /addtask [due:YYYY-MM-DD]  /removetask <n>\n"
     "  /donetask <n>  — mark done & archive\n"
     "  /prioritize <n>  — move to top\n"
+    "  /duedate <n> YYYY-MM-DD  — update due date\n"
+    "  /swap <n> <m>  — swap two tasks\n"
     "  /archive  — view completed tasks\n\n"
     "Focus & Notes:\n"
     "  /today [<focus>]  — set/view today's intention\n"
@@ -714,7 +774,8 @@ _HELP_TEXT = (
     "  /<name> <value> | stats | history | chart\n"
     "  /trackers  /removetracker <name>\n\n"
     "AI & LLM:\n"
-    "  /journal <text>  /weekly  /insights\n"
+    "  /journal <text>  /weekly  /insights  /reflect\n"
+    "  /suggest  — AI suggests 3 personalised tasks/habits\n"
     "  /compress  — summarize & truncate history\n"
     "  /setapikey <key>  (sk-… OpenAI, gsk-… Groq/free)\n"
     "  /setmodel <model>  /clearapikey\n\n"
@@ -822,6 +883,7 @@ async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["archived_tasks"] = archived[-100:]
         save_state(state)
         await update.message.reply_text(f"✅ Done: {_task_text(completed)}")
+        await _check_milestones(update.effective_chat.id, context.application)
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /donetask <number>  (use /tasks to see numbers)")
 
@@ -972,6 +1034,119 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f'Search results for "{q}" ({len(results)} found):\n\n' + "\n".join(results[:20])
         )
+
+
+async def duedate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Update a task's due date: /duedate <n> YYYY-MM-DD  (or 'none' to clear)."""
+    user = get_user(update.effective_chat.id)
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /duedate <number> YYYY-MM-DD\nUse 'none' to clear the due date.")
+        return
+    try:
+        idx = int(context.args[0]) - 1
+        date_str = context.args[1].lower()
+        task = user["tasks"][idx]
+        if date_str == "none":
+            new_due = None
+        else:
+            date.fromisoformat(date_str)  # validate
+            new_due = date_str
+        if isinstance(task, str):
+            user["tasks"][idx] = {"text": task, "due": new_due}
+        else:
+            task["due"] = new_due
+        save_state(state)
+        text = _task_text(user["tasks"][idx])
+        if new_due:
+            await update.message.reply_text(f"📅 Due date updated: {text} → {new_due}")
+        else:
+            await update.message.reply_text(f"📅 Due date cleared: {text}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Invalid arguments. Use: /duedate <number> YYYY-MM-DD")
+
+
+async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Swap two tasks' positions: /swap <n> <m>."""
+    user = get_user(update.effective_chat.id)
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /swap <n> <m>  — swap positions of two tasks")
+        return
+    try:
+        i, j = int(context.args[0]) - 1, int(context.args[1]) - 1
+        tasks = user["tasks"]
+        tasks[i], tasks[j] = tasks[j], tasks[i]
+        save_state(state)
+        await update.message.reply_text(
+            f"🔀 Swapped:\n  {i+1}. {_task_text(tasks[i])}\n  {j+1}. {_task_text(tasks[j])}"
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text("Invalid numbers. Use /tasks to see task numbers.")
+
+
+async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask AI to suggest new tasks or habits based on user profile."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if is_rate_limited(chat_id):
+        await update.message.reply_text("Rate limit reached. Try again later.")
+        return
+    ctx = user.get("context", "")
+    tasks_str = _tasks_for_prompt(user["tasks"])
+    habits = ", ".join(user.get("habits", {}).keys()) or "none"
+    journal_recent = " | ".join(
+        e["entry"][:60] for e in user.get("journal", [])[-3:]
+    ) or "no journal entries"
+    prompt = (
+        f"The user's profile: {ctx or 'not set'}\n"
+        f"Current tasks: {tasks_str}\n"
+        f"Current habits: {habits}\n"
+        f"Recent journal: {journal_recent}\n\n"
+        "Suggest exactly 3 specific, actionable new tasks or habits that would help this person "
+        "make progress on their goals. For each, give one sentence of rationale. "
+        "Format: numbered list. Be concrete — no generic advice."
+    )
+    await update.message.reply_text("Thinking of suggestions for you…")
+    reply = await chat(
+        chat_id, prompt,
+        system="You are a life coach. Give specific, personalised suggestions based on the user's data."
+    )
+    await update.message.reply_text("💡 Suggestions:\n\n" + reply)
+
+
+async def reflect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deep personal reflection: patterns, what's working, what isn't."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if is_rate_limited(chat_id):
+        await update.message.reply_text("Rate limit reached. Try again later.")
+        return
+    streak = _get_streak(user)
+    habits = user.get("habits", {})
+    habit_lines = []
+    for name, h in habits.items():
+        s = _habit_streak(h.get("completions", []))
+        habit_lines.append(f"{name}: {s}-day streak")
+    journal_entries = [e["entry"][:100] for e in user.get("journal", [])[-5:]]
+    n_done = len(user.get("archived_tasks", []))
+    prompt = (
+        f"User data for reflection:\n"
+        f"Activity streak: {streak} days\n"
+        f"Tasks completed total: {n_done}\n"
+        f"Active tasks: {_tasks_for_prompt(user['tasks'])}\n"
+        f"Habits: {'; '.join(habit_lines) or 'none'}\n"
+        f"Recent journal (last 5): {' | '.join(journal_entries) or 'none'}\n\n"
+        "Write a short personal reflection (3-5 sentences) covering: "
+        "1) What patterns do you see? "
+        "2) What's clearly working? "
+        "3) What's the one thing to focus on next week? "
+        "Be honest, warm, and specific. Don't be generic."
+    )
+    await update.message.reply_text("Reflecting on your progress…")
+    reply = await chat(
+        chat_id, prompt,
+        system="You are a thoughtful personal coach writing a sincere reflection."
+    )
+    await update.message.reply_text("🪞 Reflection:\n\n" + reply)
 
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2012,6 +2187,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reply = await chat(chat_id, update.message.text)
     await update.message.reply_text(reply)
+    await _check_milestones(chat_id, context.application)
 
 
 # ─────────────────────── main ───────────────────────
@@ -2039,6 +2215,10 @@ def main():
     app.add_handler(CommandHandler("time", time_cmd))
     app.add_handler(CommandHandler("feedback", feedback_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("duedate", duedate_cmd))
+    app.add_handler(CommandHandler("swap", swap_cmd))
+    app.add_handler(CommandHandler("suggest", suggest_cmd))
+    app.add_handler(CommandHandler("reflect", reflect_cmd))
     app.add_handler(CommandHandler("setcontext", set_context))
     app.add_handler(CommandHandler("context", show_context))
     app.add_handler(CommandHandler("subscribe", subscribe))
