@@ -1,5 +1,7 @@
 env
 state.json
+bot_memory.db
+bot_memory.db-*
 nohup.out
 .claude/*.local.md
 __pycache__/
