@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 5 complete
+## Status: Iteration 6 complete
 
 ---
 
@@ -106,6 +106,30 @@ Used in weekly summaries.
 ```
 
 ---
+
+### 21. Task completion and archiving ✅ done (iteration 6)
+`/donetask <n>` — marks a task done, removes from active list, appends to `archived_tasks` with UTC timestamp. `/archive` shows last 20 completed tasks. `/mystats` now shows total completed count.
+
+### 22. Idle-user nudge ✅ done (iteration 6)
+Daily job at 11:00 local for each subscribed user. Fires only if user has been inactive for 3+ consecutive days (checks `activity_days`). Sends a gentle check-in message referencing their goals. Quiet-hours-aware.
+
+### 23. Error handling in chat() ✅ done (iteration 6)
+All LLM calls wrapped in try/except. Distinguishes auth failures (401), rate limits (429), model-not-found, and generic errors. Pops the user message from history on failure to prevent orphaned turns.
+
+### 24. Onboarding flow ✅ done (iteration 6)
+`/start` for a user with no context and no tasks shows a guided 4-step setup (setcontext → settimezone → addtask → subscribe) instead of a wall of commands.
+
+### 25. `/help` command ✅ done (iteration 6)
+`/help` — comprehensive command reference always accessible. `/start` for existing users now redirects to `/help`.
+
+### 26. `requirements.txt` ✅ done (iteration 6)
+Added `python-telegram-bot[job-queue]>=21.6`, `openai>=1.0.0`, `tzdata`.
+
+### 27. `/reset` command ✅ done (iteration 6)
+`/reset` — clears all user data (tasks, habits, trackers, journal, reminders, history) while keeping timezone and LLM settings. Cancels scheduled jobs and resets to onboarding state.
+
+### 28. CLAUDE.md rewrite ✅ done (iteration 6)
+Full rewrite with current architecture, state schema, scheduling table, handler order, LLM routing, and complete command reference.
 
 ## Implementation order
 

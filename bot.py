@@ -48,6 +48,7 @@ RESERVED_COMMANDS = {
     "setapikey", "clearapikey", "journal", "weekly", "export",
     "streak", "adminstats", "habit", "mystats", "pomodoro",
     "quiethours", "insights", "setcheckin",
+    "donetask", "archive", "reset", "help",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -66,6 +67,7 @@ def _new_user(**overrides) -> dict:
         "activity_days": [],
         "quiet_hours": {"start": None, "end": None},
         "checkin_times": {"morning": "08:00", "evening": "21:00"},
+        "archived_tasks": [],
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -318,13 +320,26 @@ async def chat(chat_id: int, user_message: str, system: str = None) -> str:
     if len(user["history"]) > MAX_HISTORY:
         user["history"] = user["history"][-MAX_HISTORY:]
 
-    response = await get_llm_client(user).chat.completions.create(
-        model=get_model(user),
-        messages=[{"role": "system", "content": system}] + user["history"],
-        max_tokens=600,
-        temperature=0.7,
-    )
-    reply = response.choices[0].message.content.strip()
+    try:
+        response = await get_llm_client(user).chat.completions.create(
+            model=get_model(user),
+            messages=[{"role": "system", "content": system}] + user["history"],
+            max_tokens=600,
+            temperature=0.7,
+        )
+        reply = response.choices[0].message.content.strip()
+    except Exception as e:
+        user["history"].pop()  # don't keep the message without a reply
+        logger.error("LLM call failed for %s (%s): %s", chat_id, type(e).__name__, e)
+        err = str(e).lower()
+        if "auth" in err or "401" in err or "incorrect api key" in err:
+            return "⚠️ API key rejected. Use /clearapikey to revert to the default model."
+        if "rate" in err or "429" in err:
+            return "⚠️ API rate limit hit. Try again in a moment."
+        if "model" in err and "not found" in err:
+            return f"⚠️ Model not found. Use /setmodel to pick a valid model."
+        return "⚠️ AI service temporarily unavailable. Please try again."
+
     user["history"].append({"role": "assistant", "content": reply})
     save_state(state)
     return reply
@@ -490,6 +505,40 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
         name=f"habit_reminder_{chat_id}",
     )
 
+    # ── idle nudge at 11:00 — fires only if user has been inactive 3+ days ──
+    for job in app.job_queue.get_jobs_by_name(f"idle_nudge_{chat_id}"):
+        job.schedule_removal()
+
+    async def _idle_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        u = get_user(_cid)
+        if _is_quiet_now(u):
+            return
+        if not u.get("tasks") and not u.get("habits"):
+            return
+        days = sorted(u.get("activity_days", []))
+        if not days:
+            return
+        last_active = date.fromisoformat(days[-1])
+        if (date.today() - last_active).days < 3:
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=_cid,
+                text=(
+                    "👋 I haven't heard from you in a few days — just checking in!\n"
+                    "How are things going with your goals? "
+                    "Use /checkin to start a conversation, or just say hi."
+                )
+            )
+        except Exception as e:
+            logger.error("Idle nudge failed for %s: %s", _cid, e)
+
+    app.job_queue.run_daily(
+        _idle_job,
+        time=_parse_local_time("11:00", tz_str),
+        name=f"idle_nudge_{chat_id}",
+    )
+
 
 def restore_all_jobs(app: Application) -> None:
     """Recreate all scheduled jobs from persisted state on startup."""
@@ -584,37 +633,66 @@ def _tracker_chart(name: str, data: dict, n: int = 30) -> str:
 
 # ─────────────────────── handlers: core ───────────────────────
 
+_HELP_TEXT = (
+    "Secretary Bot — commands:\n\n"
+    "Tasks:\n"
+    "  /tasks  /addtask [due:YYYY-MM-DD]  /removetask <n>\n"
+    "  /donetask <n>  — mark done & archive\n"
+    "  /archive  — view completed tasks\n\n"
+    "Profile:\n"
+    "  /setcontext <about you>  /context\n"
+    "  /settimezone <IANA>  — e.g. Asia/Jerusalem\n"
+    "  /mystats  /streak\n\n"
+    "Check-ins:\n"
+    "  /subscribe  /unsubscribe\n"
+    "  /setcheckin HH:MM HH:MM  — custom times\n"
+    "  /quiethours HH:MM HH:MM  — silence window\n"
+    "  /checkin  — manual check-in\n\n"
+    "Reminders:\n"
+    "  /remind add HH:MM <msg>  — daily\n"
+    "  /remind once 30m|2h|HH:MM <msg>\n"
+    "  /remind list  /remind remove <n>\n\n"
+    "Habits:\n"
+    "  /habit add|done|list|remove <name>\n\n"
+    "Trackers:\n"
+    "  /addtracker <name> [unit]\n"
+    "  /<name> <value> | stats | history | chart\n"
+    "  /trackers  /removetracker <name>\n\n"
+    "AI & LLM:\n"
+    "  /journal <text>  /weekly  /insights\n"
+    "  /setapikey <key>  (sk-… OpenAI, gsk-… Groq/free)\n"
+    "  /setmodel <model>  /clearapikey\n\n"
+    "Tools:\n"
+    "  /pomodoro [min]  /export  /clear\n"
+    "  /reset  — wipe all data\n"
+    "  (Send export JSON to import)\n"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    get_user(update.effective_chat.id)
+    user = get_user(update.effective_chat.id)
     save_state(state)
-    await update.message.reply_text(
-        "Secretary bot is active.\n\n"
-        "Core:\n"
-        "  /tasks  /addtask  /removetask\n"
-        "  /setcontext  /context\n"
-        "  /subscribe  /unsubscribe\n"
-        "  /settimezone <IANA>  — e.g. Asia/Jerusalem\n"
-        "  /checkin  /clear\n\n"
-        "Reminders:\n"
-        "  /remind add HH:MM <message>\n"
-        "  /remind list\n"
-        "  /remind remove <n>\n\n"
-        "Trackers:\n"
-        "  /addtracker <name> [unit]\n"
-        "  /<name> <value> | stats | history\n"
-        "  /trackers  /removetracker <name>\n\n"
-        "LLM:\n"
-        "  /setapikey <key>   /clearapikey\n"
-        "  /setmodel <model>  — e.g. gpt-4o\n"
-        "  (Groq keys start with gsk_ and use Llama for free)\n\n"
-        "More:\n"
-        "  /journal <text>  /weekly  /insights  /export  /streak  /mystats\n"
-        "  /pomodoro [min]  — focus timer\n"
-        "  /habit add|done|list|remove <name>  — daily habits\n"
-        "  /quiethours HH:MM HH:MM  — silence at night\n"
-        "  /addtask <text> [due:YYYY-MM-DD]  — tasks with deadlines\n"
-        "  (Send your export JSON to import data)"
-    )
+    is_new = not user["context"] and not user["tasks"] and len(user.get("activity_days", [])) <= 1
+    if is_new:
+        await update.message.reply_text(
+            "👋 Welcome to Secretary Bot!\n\n"
+            "I'm your personal accountability coach. Let's get set up:\n\n"
+            "1️⃣ Tell me about yourself:\n"
+            "   /setcontext I'm a developer working on fitness and learning Spanish\n\n"
+            "2️⃣ Set your timezone:\n"
+            "   /settimezone Asia/Jerusalem\n\n"
+            "3️⃣ Add your first goal:\n"
+            "   /addtask Exercise 3× per week\n\n"
+            "4️⃣ Enable daily check-ins:\n"
+            "   /subscribe\n\n"
+            "Or just start chatting! Use /help to see all commands."
+        )
+    else:
+        await update.message.reply_text("Secretary bot is active. Use /help for commands.")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_HELP_TEXT)
 
 
 async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -664,6 +742,72 @@ async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Removed: {_task_text(removed)}")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /removetask <number>")
+
+
+async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("Usage: /donetask <number>  (use /tasks to see numbers)")
+        return
+    try:
+        idx = int(context.args[0]) - 1
+        completed = user["tasks"].pop(idx)
+        archived = user.setdefault("archived_tasks", [])
+        archived.append({
+            "text": _task_text(completed),
+            "due": _task_due(completed),
+            "completed_at": datetime.utcnow().isoformat(),
+        })
+        if len(archived) > 100:
+            user["archived_tasks"] = archived[-100:]
+        save_state(state)
+        await update.message.reply_text(f"✅ Done: {_task_text(completed)}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /donetask <number>  (use /tasks to see numbers)")
+
+
+async def show_archive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    archived = user.get("archived_tasks", [])
+    if not archived:
+        await update.message.reply_text("No completed tasks yet. Use /donetask <n> to mark one done.")
+        return
+    recent = archived[-20:]
+    lines = []
+    for entry in reversed(recent):
+        ts = entry.get("completed_at", "")[:10]
+        lines.append(f"✅ {entry['text']}  ({ts})")
+    await update.message.reply_text(
+        f"Completed tasks (last {len(recent)}):\n" + "\n".join(lines)
+    )
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wipe all user data and start fresh."""
+    user = get_user(update.effective_chat.id)
+    # Keep LLM settings and timezone; wipe everything else
+    user.update({
+        "tasks": [],
+        "history": [],
+        "context": "",
+        "checkin_enabled": False,
+        "reminders": [],
+        "trackers": {},
+        "habits": {},
+        "journal": [],
+        "activity_days": [],
+        "archived_tasks": [],
+        "quiet_hours": {"start": None, "end": None},
+    })
+    # Cancel all scheduled jobs
+    schedule_user_checkins(context.application, update.effective_chat.id)
+    schedule_user_alerts(context.application, update.effective_chat.id)
+    save_state(state)
+    await update.message.reply_text(
+        "♻️ Account reset. All tasks, habits, trackers, and history cleared.\n"
+        "Your timezone and API settings were kept.\n"
+        "Use /start to set up again."
+    )
 
 
 async def set_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1216,6 +1360,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Tasks: {len(user['tasks'])}",
         f"📋 Trackers: {', '.join(user.get('trackers', {}).keys()) or 'none'}",
         f"📓 Journal: {len(user.get('journal', []))} entries",
+        f"✅ Completed tasks: {len(user.get('archived_tasks', []))}",
         f"⏰ Reminders: {len(user.get('reminders', []))}",
         f"🤖 Model: {model_info}",
     ]
@@ -1502,9 +1647,13 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("tasks", show_tasks))
     app.add_handler(CommandHandler("addtask", add_task))
     app.add_handler(CommandHandler("removetask", remove_task))
+    app.add_handler(CommandHandler("donetask", done_task))
+    app.add_handler(CommandHandler("archive", show_archive))
+    app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("setcontext", set_context))
     app.add_handler(CommandHandler("context", show_context))
     app.add_handler(CommandHandler("subscribe", subscribe))
