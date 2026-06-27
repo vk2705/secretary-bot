@@ -332,6 +332,136 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_task",
+            "description": "Permanently delete a task from the list without archiving it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_number": {"type": "integer", "description": "1-based task number."},
+                },
+                "required": ["task_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_trackers",
+            "description": "List all the user's custom trackers with their latest logged value.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_habits",
+            "description": "List all the user's habits with today's completion status and current streak.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_habit",
+            "description": "Create a new daily habit to track.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Habit name, lowercase, no spaces (e.g. 'meditation', 'running')."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_habit",
+            "description": "Mark a habit as done for today.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Habit name."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_habit",
+            "description": "Delete a habit permanently.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Habit name to delete."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_notes",
+            "description": "List all the user's quick notes.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_note",
+            "description": "Save a quick note to the user's scratchpad.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The note text."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_today_focus",
+            "description": "Set the user's main focus or intention for today.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Today's focus text."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "Search across the user's tasks, notes, and journal entries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search term (case-insensitive)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_streak",
+            "description": "Get the user's current activity streak and total active days.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
 ]
 
 
@@ -519,6 +649,125 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             user["journal"] = journal[-MAX_JOURNAL_ENTRIES:]
         save_state(state)
         return {"success": True}
+
+    if name == "remove_task":
+        n = int(args.get("task_number", 0))
+        tasks = user.get("tasks", [])
+        if n < 1 or n > len(tasks):
+            return {"error": f"Task {n} not found. There are {len(tasks)} tasks."}
+        removed = _task_text(tasks.pop(n - 1))
+        save_state(state)
+        return {"success": True, "removed": removed}
+
+    if name == "get_trackers":
+        trackers = user.get("trackers", {})
+        result = []
+        for tname, data in trackers.items():
+            log = data.get("log", [])
+            unit = data.get("unit", "")
+            result.append({
+                "name": tname,
+                "unit": unit,
+                "last_value": log[-1]["value"] if log else None,
+                "last_date": log[-1]["ts"][:10] if log else None,
+                "total_entries": len(log),
+            })
+        return {"trackers": result, "count": len(result)}
+
+    if name == "get_habits":
+        habits = user.get("habits", {})
+        today = date.today().isoformat()
+        result = []
+        for hname, data in habits.items():
+            completions = data.get("completions", [])
+            result.append({
+                "name": hname,
+                "done_today": today in completions,
+                "streak": _habit_streak(completions),
+                "total_completions": len(completions),
+            })
+        return {"habits": result, "count": len(result)}
+
+    if name == "add_habit":
+        hname = (args.get("name") or "").lower().strip().replace(" ", "_")
+        if not hname:
+            return {"error": "Habit name is required."}
+        habits = user.setdefault("habits", {})
+        if hname in habits:
+            return {"already_exists": True, "name": hname}
+        habits[hname] = {"completions": [], "created": date.today().isoformat()}
+        save_state(state)
+        return {"success": True, "name": hname}
+
+    if name == "complete_habit":
+        hname = (args.get("name") or "").lower().strip()
+        habits = user.get("habits", {})
+        if hname not in habits:
+            available = list(habits.keys())
+            return {"error": f"Habit '{hname}' not found.", "available": available}
+        today = date.today().isoformat()
+        completions = habits[hname].setdefault("completions", [])
+        if today in completions:
+            return {"already_done": True, "name": hname, "streak": _habit_streak(completions)}
+        completions.append(today)
+        if len(completions) > 365:
+            habits[hname]["completions"] = completions[-365:]
+        save_state(state)
+        return {"success": True, "name": hname, "streak": _habit_streak(completions)}
+
+    if name == "remove_habit":
+        hname = (args.get("name") or "").lower().strip()
+        habits = user.get("habits", {})
+        if hname not in habits:
+            return {"error": f"Habit '{hname}' not found.", "available": list(habits.keys())}
+        del habits[hname]
+        save_state(state)
+        return {"success": True, "removed": hname}
+
+    if name == "get_notes":
+        notes = user.get("notes", [])
+        return {"notes": [{"number": i + 1, "text": n} for i, n in enumerate(notes)], "count": len(notes)}
+
+    if name == "add_note":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {"error": "Note text is required."}
+        notes = user.setdefault("notes", [])
+        notes.append(text)
+        if len(notes) > 50:
+            user["notes"] = notes[-50:]
+        save_state(state)
+        return {"success": True, "note": text, "total_notes": len(user["notes"])}
+
+    if name == "set_today_focus":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {"error": "Focus text is required."}
+        user["today_focus"] = {"date": date.today().isoformat(), "text": text}
+        save_state(state)
+        return {"success": True, "focus": text}
+
+    if name == "search":
+        q = (args.get("query") or "").lower().strip()
+        if not q:
+            return {"error": "Query is required."}
+        results = {"tasks": [], "notes": [], "journal": []}
+        for i, t in enumerate(user.get("tasks", []), 1):
+            if q in _task_text(t).lower():
+                results["tasks"].append({"number": i, "text": _task_text(t)})
+        for i, n in enumerate(user.get("notes", []), 1):
+            if q in n.lower():
+                results["notes"].append({"number": i, "text": n})
+        for entry in user.get("journal", []):
+            if q in entry.get("entry", "").lower():
+                results["journal"].append({"date": entry["ts"][:10], "excerpt": entry["entry"][:100]})
+        total = sum(len(v) for v in results.values())
+        return {"query": q, "total_matches": total, **results}
+
+    if name == "get_streak":
+        streak = _get_streak(user)
+        total = len(user.get("activity_days", []))
+        return {"current_streak": streak, "total_active_days": total}
 
     return {"error": f"Unknown tool: {name}"}
 
