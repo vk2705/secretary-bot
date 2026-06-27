@@ -1,5 +1,6 @@
 env
 state.json
 nohup.out
+.claude/*.local.md
 __pycache__/
 *.pyc
