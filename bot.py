@@ -9,7 +9,7 @@ from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from openai import AsyncOpenAI
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
@@ -53,7 +53,7 @@ RESERVED_COMMANDS = {
     "donetask", "archive", "reset", "help",
     "prioritize", "today", "note", "notes", "removenote", "search",
     "setlanguage", "clearlanguage", "compress", "broadcast", "feedback",
-    "time", "suggest", "duedate", "swap", "reflect",
+    "time", "suggest", "duedate", "extend", "swap", "reflect", "focus",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -910,6 +910,53 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
         name=f"idle_nudge_{chat_id}",
     )
 
+    # ── Weekly digest every Sunday at 10:00 ──
+    for job in app.job_queue.get_jobs_by_name(f"weekly_digest_{chat_id}"):
+        job.schedule_removal()
+
+    async def _weekly_digest_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        u = get_user(_cid)
+        if _is_quiet_now(u):
+            return
+        today = date.today()
+        # Only fire on Sunday (weekday 6)
+        if today.weekday() != 6:
+            return
+        try:
+            tasks_str = _tasks_for_prompt(u["tasks"])
+            habits_str = "; ".join(
+                f"{n}: {_habit_streak(h.get('completions',[]))}-day streak"
+                for n, h in u.get("habits", {}).items()
+            ) or "none"
+            n_done = len(u.get("archived_tasks", []))
+            journal_count = len([
+                e for e in u.get("journal", [])
+                if e["ts"][:10] >= (today - timedelta(days=7)).isoformat()
+            ])
+            prompt = (
+                f"Weekly digest for this user:\n"
+                f"Tasks: {tasks_str}\n"
+                f"Habits: {habits_str}\n"
+                f"Tasks completed this week: {n_done} total\n"
+                f"Journal entries this week: {journal_count}\n\n"
+                "Write a brief, warm weekly digest (3-4 sentences): "
+                "acknowledge their progress, highlight one strength, "
+                "suggest one priority for the coming week. Be specific, not generic."
+            )
+            reply = await chat(_cid, prompt, system="You are a supportive weekly accountability coach.")
+            await context.bot.send_message(
+                chat_id=_cid,
+                text=f"📅 Weekly digest:\n\n{reply}"
+            )
+        except Exception as e:
+            logger.error("Weekly digest failed for %s: %s", _cid, e)
+
+    app.job_queue.run_daily(
+        _weekly_digest_job,
+        time=_parse_local_time("10:00", tz_str),
+        name=f"weekly_digest_{chat_id}",
+    )
+
 
 def restore_all_jobs(app: Application) -> None:
     """Recreate all scheduled jobs from persisted state on startup."""
@@ -1011,6 +1058,7 @@ _HELP_TEXT = (
     "  /donetask <n>  — mark done & archive\n"
     "  /prioritize <n>  — move to top\n"
     "  /duedate <n> YYYY-MM-DD  — update due date\n"
+    "  /extend <n> <days>  — extend due date by N days\n"
     "  /swap <n> <m>  — swap two tasks\n"
     "  /archive  — view completed tasks\n\n"
     "Focus & Notes:\n"
@@ -1032,7 +1080,7 @@ _HELP_TEXT = (
     "  /remind once 30m|2h|HH:MM <msg>\n"
     "  /remind list  /remind remove <n>\n\n"
     "Habits:\n"
-    "  /habit add|done|list|remove <name>\n\n"
+    "  /habit add|done|list|remove|stats <name>\n\n"
     "Trackers:\n"
     "  /addtracker <name> [unit]\n"
     "  /<name> <value> | stats | history | chart\n"
@@ -1047,6 +1095,7 @@ _HELP_TEXT = (
     "  /setlanguage <name>  — e.g. Hebrew, Spanish\n"
     "  /clearlanguage  /time  — show local time\n\n"
     "Tools:\n"
+    "  /focus [task_n] [min]  — pomodoro linked to a task\n"
     "  /pomodoro [min]  /export  /clear\n"
     "  /reset  — wipe all data\n"
     "  /feedback <text>  — send feedback to bot admin\n"
@@ -1327,6 +1376,36 @@ async def duedate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📅 Due date cleared: {text}")
     except (IndexError, ValueError):
         await update.message.reply_text("Invalid arguments. Use: /duedate <number> YYYY-MM-DD")
+
+
+async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/extend <n> <days> — extend a task's due date by N days."""
+    user = get_user(update.effective_chat.id)
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /extend <task number> <days>\nExample: /extend 2 7")
+        return
+    try:
+        idx = int(context.args[0]) - 1
+        days_n = int(context.args[1])
+        task = user["tasks"][idx]
+        current_due = _task_due(task)
+        if current_due:
+            base = date.fromisoformat(current_due)
+        else:
+            base = date.today()
+        new_due = (base + timedelta(days=days_n)).isoformat()
+        if isinstance(task, str):
+            user["tasks"][idx] = {"text": task, "due": new_due}
+        else:
+            task["due"] = new_due
+        save_state(state)
+        text = _task_text(user["tasks"][idx])
+        await update.message.reply_text(
+            f"📅 Extended: {text}\n"
+            f"{'Was: ' + current_due + '  →  ' if current_due else ''}Due: {new_due}"
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /extend <task number> <days>")
 
 
 async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2124,8 +2203,51 @@ async def habit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(state)
         await update.message.reply_text(f"Habit '{name}' removed.")
 
+    elif sub == "stats":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /habit stats <name>")
+            return
+        name = args[1].lower()
+        if name not in habits:
+            await update.message.reply_text(f"No habit named '{name}'. Use /habit list.")
+            return
+        completions = sorted(habits[name].get("completions", []))
+        today = date.today()
+        last_7 = [(today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
+        dots = "".join("✅" if d in completions else "❌" for d in last_7)
+        current = _habit_streak(completions)
+        # Longest streak
+        longest = 0
+        run = 0
+        prev = None
+        for d in completions:
+            if prev and (date.fromisoformat(d) - date.fromisoformat(prev)).days == 1:
+                run += 1
+            else:
+                run = 1
+            longest = max(longest, run)
+            prev = d
+        # 30-day rate
+        cutoff = (today - timedelta(days=29)).isoformat()
+        done_30 = sum(1 for d in completions if d >= cutoff)
+        rate = round(done_30 / 30 * 100)
+        last_missed = next(
+            (d for d in reversed(last_7) if d not in completions), None
+        )
+        created = habits[name].get("created", "?")
+        await update.message.reply_text(
+            f"📊 Habit: {name}\n"
+            f"Created: {created}\n"
+            f"Last 7 days: {dots}\n"
+            f"Current streak: {current} day{'s' if current != 1 else ''}\n"
+            f"Longest streak: {longest} day{'s' if longest != 1 else ''}\n"
+            f"30-day completion: {rate}% ({done_30}/30)\n"
+            f"Total completions: {len(completions)}"
+            + (f"\nLast missed: {last_missed}" if last_missed else "")
+        )
+
     else:
-        await update.message.reply_text("Usage: /habit add|done|list|remove <name>")
+        await update.message.reply_text("Usage: /habit add|done|list|remove|stats <name>")
 
 
 # ─────────────────────── handlers: mystats & pomodoro ───────────────────────
@@ -2179,6 +2301,50 @@ async def pomodoro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.application.job_queue.run_once(_done, when=minutes * 60)
     await update.message.reply_text(f"🍅 Pomodoro started: {minutes} min. I'll ping you when it's done!")
+
+
+async def focus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/focus [task_number] [minutes] — pomodoro linked to a specific task."""
+    user = get_user(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    task_label = None
+    minutes = 25
+
+    for arg in context.args:
+        try:
+            n = int(arg)
+            if 1 <= n <= 120:
+                # ambiguous: treat as task index first if tasks exist at that index
+                if n <= len(user.get("tasks", [])):
+                    task_label = _task_text(user["tasks"][n - 1])
+                else:
+                    minutes = n
+            else:
+                minutes = max(1, min(120, n))
+        except ValueError:
+            pass
+
+    # Second arg (if both given) overrides minutes
+    if len(context.args) == 2:
+        try:
+            minutes = max(1, min(120, int(context.args[1])))
+        except ValueError:
+            pass
+
+    async def _done(ctx, _cid=chat_id, _min=minutes, _task=task_label):
+        if _task:
+            msg = f"🍅 {_min} min focus done! How did it go with '{_task}'?"
+        else:
+            msg = f"🍅 {_min} min focus session complete. Take a break!"
+        await ctx.bot.send_message(chat_id=_cid, text=msg)
+
+    context.application.job_queue.run_once(_done, when=minutes * 60)
+    if task_label:
+        await update.message.reply_text(
+            f"🎯 Focusing on: {task_label}\n🍅 {minutes} min session started. Good luck!"
+        )
+    else:
+        await update.message.reply_text(f"🍅 Focus session started: {minutes} min.")
 
 
 # ─────────────────────── handlers: import ───────────────────────
@@ -2456,8 +2622,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────── main ───────────────────────
 
+async def _post_init(app) -> None:
+    """Register commands with BotFather so users see the list in the Telegram UI."""
+    commands = [
+        BotCommand("start", "Welcome / onboarding"),
+        BotCommand("help", "All commands"),
+        BotCommand("tasks", "Show active tasks"),
+        BotCommand("addtask", "Add a task (due:YYYY-MM-DD optional)"),
+        BotCommand("donetask", "Mark task done & archive"),
+        BotCommand("prioritize", "Move task to top"),
+        BotCommand("extend", "Extend task due date by N days"),
+        BotCommand("today", "Set/show today's focus"),
+        BotCommand("checkin", "Manual check-in with dashboard"),
+        BotCommand("subscribe", "Enable daily check-ins"),
+        BotCommand("remind", "Manage reminders (add/list/remove)"),
+        BotCommand("habit", "Track daily habits"),
+        BotCommand("journal", "Add journal entry"),
+        BotCommand("weekly", "7-day AI summary"),
+        BotCommand("reflect", "Personal reflection"),
+        BotCommand("suggest", "AI task suggestions"),
+        BotCommand("mystats", "Your stats dashboard"),
+        BotCommand("focus", "Pomodoro linked to a task"),
+        BotCommand("note", "Save a quick note"),
+        BotCommand("search", "Search tasks, notes, journal"),
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+        logger.info("BotFather commands registered (%d).", len(commands))
+    except Exception as e:
+        logger.warning("Could not register commands: %s", e)
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -2480,7 +2677,9 @@ def main():
     app.add_handler(CommandHandler("feedback", feedback_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("duedate", duedate_cmd))
+    app.add_handler(CommandHandler("extend", extend_cmd))
     app.add_handler(CommandHandler("swap", swap_cmd))
+    app.add_handler(CommandHandler("focus", focus_cmd))
     app.add_handler(CommandHandler("suggest", suggest_cmd))
     app.add_handler(CommandHandler("reflect", reflect_cmd))
     app.add_handler(CommandHandler("setcontext", set_context))

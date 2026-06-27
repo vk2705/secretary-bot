@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 10 complete
+## Status: Iteration 11 complete
 
 ---
 
@@ -199,6 +199,21 @@ The AI can now take direct actions mid-conversation using OpenAI-compatible func
 - `log_tracker(tracker_name, value)` — log a numeric value ("I weighed 74kg this morning")
 - `add_reminder(time, message)` — schedule a daily reminder and register the job immediately
 - `add_journal_entry(text)` — save a journal entry when the user describes their day
+
+### 49. BotFather command registration ✅ done (iteration 11)
+`_post_init(app)` async hook registered via `ApplicationBuilder().post_init(...)`. On every startup, registers 20 commands with BotFather so users see a tappable command list in the Telegram UI.
+
+### 50. Scheduled weekly digest ✅ done (iteration 11)
+Every Sunday at 10:00 local time, subscribed users get an AI-generated weekly digest: progress acknowledgement, one strength callout, and one priority suggestion for the week. Job uses `days=(6,)` via a weekday check inside the daily job.
+
+### 51. `/extend <n> <days>` ✅ done (iteration 11)
+Extends a task's due date by N calendar days. If the task has no due date, bases from today. Converts plain-string tasks to dict form. Companion to `/duedate`.
+
+### 52. `/focus [task_n] [minutes]` ✅ done (iteration 11)
+Pomodoro timer linked to a specific task. Start message shows the task name; end message asks how it went with that task. Falls back to plain pomodoro if no task number given.
+
+### 53. `/habit stats <name>` ✅ done (iteration 11)
+Detailed per-habit report: last 7 days as ✅/❌ grid, current streak, longest streak, 30-day completion rate, total completions, and last missed day.
 
 ## Implementation order
 
