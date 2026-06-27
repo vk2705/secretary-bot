@@ -1,8 +1,11 @@
 import os
+import re
 import json
+import time
 import logging
 import uuid
-from datetime import datetime, time as dt_time
+from collections import defaultdict
+from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from openai import AsyncOpenAI
@@ -17,10 +20,14 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 DEFAULT_API_KEY = os.environ["OPENAI_API_KEY"]
+# Groq API key — if set, users without their own key use Groq (free tier)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
 # Optional: used only once to migrate old single-user state.json to new format
 MY_CHAT_ID = os.environ.get("MY_CHAT_ID")
 
-# Default model for users without their own API key (cheap, bot-funded)
+# Fallback model when no Groq key and using bot owner's OpenAI key
 DEFAULT_MODEL = "gpt-4o-mini"
 
 STATE_FILE = "state.json"
@@ -28,12 +35,18 @@ MAX_HISTORY = 20
 MAX_LOG_ENTRIES = 500
 MAX_JOURNAL_ENTRIES = 200
 
+# Rate limiting: max AI calls per hour per user
+RATE_LIMIT = 30
+RATE_WINDOW = 3600
+_rate_log: dict[str, list] = defaultdict(list)
+
 # Reserved command names that cannot be used as tracker names
 RESERVED_COMMANDS = {
     "start", "tasks", "addtask", "removetask", "setcontext", "context",
     "subscribe", "unsubscribe", "settimezone", "remind", "addtracker",
     "trackers", "removetracker", "checkin", "clear", "setmodel",
     "setapikey", "clearapikey", "journal", "weekly", "export",
+    "streak", "adminstats",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -48,6 +61,7 @@ def _new_user(**overrides) -> dict:
         "reminders": [],
         "trackers": {},
         "journal": [],
+        "activity_days": [],
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -88,21 +102,75 @@ def get_user(chat_id: int) -> dict:
     if key not in state["users"]:
         state["users"][key] = _new_user()
     u = state["users"][key]
-    # Forward-fill keys added in newer versions
+    # Forward-fill top-level keys added in newer versions
     for k, v in _new_user().items():
         u.setdefault(k, v)
+    # Forward-fill nested llm dict
+    for k, v in _new_user()["llm"].items():
+        u["llm"].setdefault(k, v)
     return u
+
+
+# ─────────────────────── rate limiting ───────────────────────
+
+def is_rate_limited(chat_id: int) -> bool:
+    """Return True if user has exceeded RATE_LIMIT AI calls in the last hour."""
+    key = str(chat_id)
+    now = time.monotonic()
+    _rate_log[key] = [t for t in _rate_log[key] if now - t < RATE_WINDOW]
+    if len(_rate_log[key]) >= RATE_LIMIT:
+        return True
+    _rate_log[key].append(now)
+    return False
+
+
+# ─────────────────────── activity / streak ───────────────────────
+
+def _touch_activity(user: dict) -> None:
+    today = datetime.utcnow().date().isoformat()
+    days = user.setdefault("activity_days", [])
+    if today not in days:
+        days.append(today)
+        if len(days) > 400:
+            user["activity_days"] = days[-365:]
+
+
+def _get_streak(user: dict) -> int:
+    days = set(user.get("activity_days", []))
+    if not days:
+        return 0
+    streak = 0
+    d = date.today()
+    while d.isoformat() in days:
+        streak += 1
+        d -= timedelta(days=1)
+    return streak
 
 
 # ─────────────────────── LLM helpers ───────────────────────
 
 def get_llm_client(user: dict) -> AsyncOpenAI:
-    api_key = user["llm"].get("api_key") or DEFAULT_API_KEY
-    return AsyncOpenAI(api_key=api_key)
+    user_key = user["llm"].get("api_key")
+    if user_key:
+        # Groq keys start with gsk_
+        if user_key.startswith("gsk_"):
+            return AsyncOpenAI(api_key=user_key, base_url=GROQ_BASE_URL)
+        return AsyncOpenAI(api_key=user_key)
+    if GROQ_API_KEY:
+        return AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+    return AsyncOpenAI(api_key=DEFAULT_API_KEY)
 
 
 def get_model(user: dict) -> str:
-    return user["llm"].get("model") or DEFAULT_MODEL
+    user_key = user["llm"].get("api_key")
+    user_model = user["llm"].get("model")
+    if user_key:
+        if user_key.startswith("gsk_") and not user_model:
+            return GROQ_DEFAULT_MODEL
+        return user_model or DEFAULT_MODEL
+    if GROQ_API_KEY:
+        return user_model or GROQ_DEFAULT_MODEL
+    return user_model or DEFAULT_MODEL
 
 
 def build_system_prompt(user: dict) -> str:
@@ -140,6 +208,7 @@ def build_system_prompt(user: dict) -> str:
 
 async def chat(chat_id: int, user_message: str, system: str = None) -> str:
     user = get_user(chat_id)
+    _touch_activity(user)
     system = system or build_system_prompt(user)
     user["history"].append({"role": "user", "content": user_message})
     if len(user["history"]) > MAX_HISTORY:
@@ -300,9 +369,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /trackers  /removetracker <name>\n\n"
         "LLM:\n"
         "  /setapikey <key>   /clearapikey\n"
-        "  /setmodel <model>  — e.g. gpt-4o\n\n"
+        "  /setmodel <model>  — e.g. gpt-4o\n"
+        "  (Groq keys start with gsk_ and use Llama for free)\n\n"
         "More:\n"
-        "  /journal <text>  /weekly  /export"
+        "  /journal <text>  /weekly  /export  /streak"
     )
 
 
@@ -414,13 +484,39 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────── handlers: reminders ───────────────────────
 
+def _parse_once_delay(spec: str, tz_str: str) -> float | None:
+    """Parse a one-time reminder time spec. Return seconds from now, or None if invalid."""
+    # "30m" or "2h"
+    m = re.fullmatch(r"(\d+)(m|h)", spec)
+    if m:
+        val = int(m.group(1))
+        return val * 60 if m.group(2) == "m" else val * 3600
+    # "HH:MM" — today (or tomorrow if time already passed) in user's timezone
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", spec)
+    if m:
+        try:
+            tz = ZoneInfo(tz_str)
+        except (ZoneInfoNotFoundError, KeyError):
+            tz = ZoneInfo("UTC")
+        h, mn = int(m.group(1)), int(m.group(2))
+        now_local = datetime.now(tz)
+        target = now_local.replace(hour=h, minute=mn, second=0, microsecond=0)
+        if target <= now_local:
+            target += timedelta(days=1)
+        return (target - now_local).total_seconds()
+    return None
+
+
 async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     args = context.args
     if not args:
         await update.message.reply_text(
             "Usage:\n"
-            "  /remind add HH:MM <message>\n"
+            "  /remind add HH:MM <message>       — daily recurring\n"
+            "  /remind once 30m <message>         — once in 30 minutes\n"
+            "  /remind once 2h <message>          — once in 2 hours\n"
+            "  /remind once HH:MM <message>       — once at that time today\n"
             "  /remind list\n"
             "  /remind remove <number>"
         )
@@ -431,10 +527,13 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sub == "list":
         reminders = user.get("reminders", [])
         if not reminders:
-            await update.message.reply_text("No reminders. Add one with /remind add HH:MM <message>")
+            await update.message.reply_text("No reminders. Add one with /remind add or /remind once.")
             return
         tz = user.get("timezone", "UTC")
-        lines = [f"{i+1}. {r['time']} {tz} — {r['message']}" for i, r in enumerate(reminders)]
+        lines = []
+        for i, r in enumerate(reminders):
+            kind = "once" if r.get("once") else "daily"
+            lines.append(f"{i+1}. [{kind}] {r['time']} {tz} — {r['message']}")
         await update.message.reply_text("Your reminders:\n" + "\n".join(lines))
 
     elif sub == "add":
@@ -449,12 +548,39 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid time. Use HH:MM (e.g. 09:30)")
             return
         message = " ".join(args[2:])
-        reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message}
+        reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False}
         user.setdefault("reminders", []).append(reminder)
         save_state(state)
         schedule_user_reminder(context.application, update.effective_chat.id, reminder)
         tz = user.get("timezone", "UTC")
-        await update.message.reply_text(f"Reminder set: {time_str} ({tz}) — {message}")
+        await update.message.reply_text(f"Daily reminder set: {time_str} ({tz}) — {message}")
+
+    elif sub == "once":
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /remind once <30m|2h|HH:MM> <message>")
+            return
+        spec = args[1]
+        message = " ".join(args[2:])
+        delay = _parse_once_delay(spec, user.get("timezone", "UTC"))
+        if delay is None or delay <= 0:
+            await update.message.reply_text("Invalid time spec. Use: 30m, 2h, or HH:MM")
+            return
+
+        reminder_id = str(uuid.uuid4())
+        job_name = f"once_{update.effective_chat.id}_{reminder_id}"
+        chat_id = update.effective_chat.id
+
+        async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
+            try:
+                await ctx.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
+            except Exception as e:
+                logger.error("One-time reminder failed: %s", e)
+
+        context.application.job_queue.run_once(_once_job, when=delay, name=job_name)
+        mins = int(delay // 60)
+        await update.message.reply_text(
+            f"⏰ One-time reminder set in {mins} min: {message}"
+        )
 
     elif sub == "remove":
         if len(args) < 2:
@@ -472,7 +598,7 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid number. Use /remind list to see numbers.")
 
     else:
-        await update.message.reply_text("Unknown subcommand. Use add, list, or remove.")
+        await update.message.reply_text("Unknown subcommand. Use add, once, list, or remove.")
 
 
 # ─────────────────────── handlers: trackers ───────────────────────
@@ -603,7 +729,12 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = " ".join(context.args).strip()
     if not key:
-        await update.message.reply_text("Usage: /setapikey <your-openai-api-key>")
+        await update.message.reply_text(
+            "Usage: /setapikey <key>\n"
+            "OpenAI key (sk-...): uses OpenAI models\n"
+            "Groq key (gsk-...): uses Llama 3 for free\n"
+            "Get a free Groq key at console.groq.com"
+        )
         return
     user = get_user(update.effective_chat.id)
     user["llm"]["api_key"] = key
@@ -696,8 +827,48 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def streak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    streak = _get_streak(user)
+    total = len(user.get("activity_days", []))
+    if streak == 0:
+        await update.message.reply_text("No streak yet. Send me a message every day to build one!")
+    else:
+        await update.message.reply_text(
+            f"🔥 Current streak: {streak} day{'s' if streak != 1 else ''}\n"
+            f"Total active days: {total}"
+        )
+
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != MY_CHAT_ID:
+        return
+    total = len(state["users"])
+    subscribed = sum(1 for u in state["users"].values() if u.get("checkin_enabled"))
+    with_key = sum(1 for u in state["users"].values() if u.get("llm", {}).get("api_key"))
+    with_trackers = sum(1 for u in state["users"].values() if u.get("trackers"))
+    with_reminders = sum(1 for u in state["users"].values() if u.get("reminders"))
+    groq_mode = "Groq (free tier)" if GROQ_API_KEY else "OpenAI gpt-4o-mini (bot-funded)"
+    await update.message.reply_text(
+        f"📊 Bot stats:\n"
+        f"Total users: {total}\n"
+        f"Subscribed to check-ins: {subscribed}\n"
+        f"Using custom API key: {with_key}\n"
+        f"Have trackers: {with_trackers}\n"
+        f"Have reminders: {with_reminders}\n"
+        f"Default model: {GROQ_DEFAULT_MODEL if GROQ_API_KEY else DEFAULT_MODEL}\n"
+        f"Free tier: {groq_mode}"
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply = await chat(update.effective_chat.id, update.message.text)
+    chat_id = update.effective_chat.id
+    if is_rate_limited(chat_id):
+        await update.message.reply_text(
+            "You've reached the hourly limit (30 messages). Please wait a bit before sending more."
+        )
+        return
+    reply = await chat(chat_id, update.message.text)
     await update.message.reply_text(reply)
 
 
@@ -727,6 +898,8 @@ def main():
     app.add_handler(CommandHandler("journal", journal_cmd))
     app.add_handler(CommandHandler("weekly", weekly_summary))
     app.add_handler(CommandHandler("export", export_data))
+    app.add_handler(CommandHandler("streak", streak_cmd))
+    app.add_handler(CommandHandler("adminstats", admin_stats))
     # Catch-all for user-defined tracker commands (must be last)
     app.add_handler(MessageHandler(filters.COMMAND, handle_custom_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

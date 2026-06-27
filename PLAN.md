@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Implementation in progress
+## Status: Iteration 2 complete
 
 ---
 
@@ -24,11 +24,27 @@ Stored in user state; recreated on bot restart.
 
 Implemented as a catch-all MessageHandler for COMMAND after all defined handlers.
 
-### 4. Custom LLM API keys and models ✅ planned
+### 4. Custom LLM API keys and models ✅ done
 - Default: bot owner's `OPENAI_API_KEY` with `gpt-4o-mini` (cheap, bot-funded tier).
-- `/setapikey <key>` — store user's own OpenAI key; message deleted for security.
-- `/setmodel <model>` — choose model (gpt-4o, gpt-4o-mini, etc.).
+- If `GROQ_API_KEY` is set in env, users without their own key use Groq Llama 3 (free).
+- `/setapikey <key>` — store OpenAI (sk-) or Groq (gsk-) key; auto-detected by prefix. Message auto-deleted.
+- `/setmodel <model>` — choose model.
 - `/clearapikey` — revert to default.
+
+### 8. Groq free tier ✅ done
+Bot owner sets `GROQ_API_KEY` in env. Users without their own API key get routed to Groq's Llama 3 automatically. Users with a `gsk_` prefixed key also get Groq routing.
+
+### 9. Rate limiting ✅ done
+30 AI calls per user per hour (in-memory rolling window). Prevents abuse.
+
+### 10. One-time reminders ✅ done
+`/remind once 30m <msg>` / `/remind once 2h <msg>` / `/remind once HH:MM <msg>` — fires once, not stored.
+
+### 11. Streak tracking ✅ done
+`/streak` — shows consecutive days the user was active. Activity recorded on every message.
+
+### 12. Admin stats ✅ done
+`/adminstats` — bot-owner only. Shows total users, subscribed count, custom key count, etc.
 
 ### 5. Journal entries ✅ planned
 `/journal <text>` — saves entry with timestamp, AI reflects briefly.
