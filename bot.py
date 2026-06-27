@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from cryptography.fernet import Fernet, InvalidToken
 from timezonefinder import TimezoneFinder
 _tf = TimezoneFinder()
 from openai import AsyncOpenAI
@@ -37,10 +38,35 @@ STATE_FILE = "state.json"
 DB_FILE = "bot_memory.db"
 MAX_HISTORY = 20
 
-# Rate limiting: max AI calls per hour per user
+# Encryption master key — generate once with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Then add MASTER_KEY=<value> to your env file.
+MASTER_KEY = os.environ.get("MASTER_KEY", "")
+_fernet: Fernet | None = None
+
+
+def _get_fernet() -> Fernet:
+    global _fernet, MASTER_KEY
+    if _fernet:
+        return _fernet
+    if not MASTER_KEY:
+        # Auto-generate for single-node dev; loudly warn that it won't survive restart
+        generated = Fernet.generate_key().decode()
+        logger.warning(
+            "MASTER_KEY not set in env — generated a temporary key. "
+            "API keys will be unreadable after restart. "
+            "Add to env file: MASTER_KEY=%s", generated
+        )
+        MASTER_KEY = generated
+    try:
+        _fernet = Fernet(MASTER_KEY.encode() if isinstance(MASTER_KEY, str) else MASTER_KEY)
+    except Exception as e:
+        raise RuntimeError(f"Invalid MASTER_KEY: {e}") from e
+    return _fernet
+
+
+# Rate limiting: max AI calls per hour per user (backed by SQLite)
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
-_rate_log: dict[str, list] = defaultdict(list)
 _snooze_cache: dict[str, str] = {}  # token → reminder message
 _app = None  # set in main(); used by tool executor to schedule reminders
 
@@ -73,8 +99,44 @@ def _init_db() -> None:
                 ts      TEXT    NOT NULL,
                 auto    INTEGER DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_notes_chat   ON notes(chat_id);
-            CREATE INDEX IF NOT EXISTS idx_journal_chat ON journal(chat_id);
+            -- Encrypted user API keys
+            CREATE TABLE IF NOT EXISTS api_keys (
+                chat_id      TEXT PRIMARY KEY,
+                encrypted_key TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+            -- Persistent rate limiting (survives restarts)
+            CREATE TABLE IF NOT EXISTS rate_log (
+                chat_id TEXT NOT NULL,
+                ts      REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rate_log ON rate_log(chat_id, ts);
+            -- Profile memory: permanent facts about the user
+            CREATE TABLE IF NOT EXISTS profile_memory (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT    NOT NULL,
+                fact    TEXT    NOT NULL,
+                ts      TEXT    NOT NULL
+            );
+            -- Episodic memory: recent events/observations with TTL
+            CREATE TABLE IF NOT EXISTS episodic_memory (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    TEXT    NOT NULL,
+                event      TEXT    NOT NULL,
+                ts         TEXT    NOT NULL,
+                expires_at TEXT    NOT NULL
+            );
+            -- Job fire log: detect missed jobs after restarts
+            CREATE TABLE IF NOT EXISTS job_log (
+                chat_id  TEXT NOT NULL,
+                job_type TEXT NOT NULL,
+                fired_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, job_type, fired_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_chat        ON notes(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_journal_chat      ON journal(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_profile_chat      ON profile_memory(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_episodic_chat     ON episodic_memory(chat_id);
         """)
     # one-time migration of notes/journal still living in state.json
     if os.path.exists(STATE_FILE):
@@ -101,6 +163,24 @@ def _init_db() -> None:
                     json.dump(s, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning("DB migration failed: %s", e)
+    # Migrate plaintext API keys from state.json to encrypted DB
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            migrated_keys = False
+            for cid, u in s.get("users", {}).items():
+                plain = u.get("llm", {}).get("api_key")
+                if plain:
+                    db_store_key(cid, plain)
+                    u["llm"]["api_key"] = None
+                    migrated_keys = True
+                    logger.info("Migrated API key for user %s to encrypted DB", cid)
+            if migrated_keys:
+                with open(STATE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(s, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Key migration failed: %s", e)
 
 
 # ── notes helpers ──
@@ -167,6 +247,104 @@ def db_search_journal(chat_id: str, q: str) -> list[sqlite3.Row]:
             "SELECT id,entry,ts FROM journal WHERE chat_id=? AND lower(entry) LIKE ?",
             (str(chat_id), f"%{q.lower()}%")
         ).fetchall()
+
+
+# ── encrypted API key store ──
+
+def db_store_key(chat_id: str, plaintext_key: str) -> None:
+    """Encrypt and persist a user's API key."""
+    encrypted = _get_fernet().encrypt(plaintext_key.encode()).decode()
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO api_keys(chat_id, encrypted_key, updated_at) VALUES(?,?,?)",
+            (str(chat_id), encrypted, datetime.utcnow().isoformat())
+        )
+
+
+def db_get_key(chat_id: str) -> str | None:
+    """Decrypt and return a user's API key, or None if not stored."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT encrypted_key FROM api_keys WHERE chat_id=?", (str(chat_id),)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return _get_fernet().decrypt(row[0].encode()).decode()
+    except (InvalidToken, Exception):
+        logger.warning("Failed to decrypt key for %s — possibly wrong MASTER_KEY", chat_id)
+        return None
+
+
+def db_delete_key(chat_id: str) -> None:
+    with _db() as con:
+        con.execute("DELETE FROM api_keys WHERE chat_id=?", (str(chat_id),))
+
+
+# ── profile & episodic memory ──
+
+def db_add_profile_memory(chat_id: str, fact: str) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT INTO profile_memory(chat_id,fact,ts) VALUES(?,?,?)",
+            (str(chat_id), fact, datetime.utcnow().isoformat())
+        )
+
+
+def db_get_profile_memory(chat_id: str) -> list[sqlite3.Row]:
+    with _db() as con:
+        return con.execute(
+            "SELECT id,fact,ts FROM profile_memory WHERE chat_id=? ORDER BY id",
+            (str(chat_id),)
+        ).fetchall()
+
+
+def db_add_episodic_memory(chat_id: str, event: str, ttl_days: int = 30) -> None:
+    expires = (datetime.utcnow() + timedelta(days=ttl_days)).isoformat()
+    with _db() as con:
+        con.execute(
+            "INSERT INTO episodic_memory(chat_id,event,ts,expires_at) VALUES(?,?,?,?)",
+            (str(chat_id), event, datetime.utcnow().isoformat(), expires)
+        )
+
+
+def db_get_episodic_memory(chat_id: str, limit: int = 20) -> list[sqlite3.Row]:
+    now = datetime.utcnow().isoformat()
+    with _db() as con:
+        return con.execute(
+            "SELECT id,event,ts FROM episodic_memory "
+            "WHERE chat_id=? AND expires_at > ? ORDER BY id DESC LIMIT ?",
+            (str(chat_id), now, limit)
+        ).fetchall()
+
+
+def db_expire_episodic(chat_id: str) -> None:
+    """Delete expired episodic memories."""
+    now = datetime.utcnow().isoformat()
+    with _db() as con:
+        con.execute(
+            "DELETE FROM episodic_memory WHERE chat_id=? AND expires_at <= ?",
+            (str(chat_id), now)
+        )
+
+
+# ── job log (missed-job detection) ──
+
+def db_log_job(chat_id: str, job_type: str) -> None:
+    with _db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO job_log(chat_id,job_type,fired_at) VALUES(?,?,?)",
+            (str(chat_id), job_type, datetime.utcnow().isoformat())
+        )
+
+
+def db_last_job_fired(chat_id: str, job_type: str) -> str | None:
+    with _db() as con:
+        row = con.execute(
+            "SELECT MAX(fired_at) FROM job_log WHERE chat_id=? AND job_type=?",
+            (str(chat_id), job_type)
+        ).fetchone()
+    return row[0] if row else None
 
 # Reserved command names that cannot be used as tracker names
 RESERVED_COMMANDS = {
@@ -257,13 +435,19 @@ def get_user(chat_id: int) -> dict:
 # ─────────────────────── rate limiting ───────────────────────
 
 def is_rate_limited(chat_id: int) -> bool:
-    """Return True if user has exceeded RATE_LIMIT AI calls in the last hour."""
+    """Return True if user exceeded RATE_LIMIT calls in RATE_WINDOW seconds. Persistent across restarts."""
     key = str(chat_id)
-    now = time.monotonic()
-    _rate_log[key] = [t for t in _rate_log[key] if now - t < RATE_WINDOW]
-    if len(_rate_log[key]) >= RATE_LIMIT:
-        return True
-    _rate_log[key].append(now)
+    now = time.time()
+    cutoff = now - RATE_WINDOW
+    with _db() as con:
+        # prune old entries for this user
+        con.execute("DELETE FROM rate_log WHERE chat_id=? AND ts < ?", (key, cutoff))
+        count = con.execute(
+            "SELECT count(*) FROM rate_log WHERE chat_id=?", (key,)
+        ).fetchone()[0]
+        if count >= RATE_LIMIT:
+            return True
+        con.execute("INSERT INTO rate_log(chat_id,ts) VALUES(?,?)", (key, now))
     return False
 
 
@@ -818,7 +1002,11 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         kind = (args.get("type") or "note").lower()
         if kind == "journal":
             db_add_journal(chat_id, text, auto=True)
-        else:
+        elif kind == "profile":
+            db_add_profile_memory(chat_id, text)
+        elif kind == "episodic":
+            db_add_episodic_memory(chat_id, text, ttl_days=30)
+        else:  # "note" or unknown
             db_add_note(chat_id, text, auto=True)
         return {"success": True, "saved_as": kind}
 
@@ -1056,9 +1244,9 @@ def _tasks_for_prompt(tasks: list) -> str:
 # ─────────────────────── LLM helpers ───────────────────────
 
 def get_llm_client(user: dict) -> AsyncOpenAI:
-    user_key = user["llm"].get("api_key")
+    chat_id = str(next((k for k, v in state["users"].items() if v is user), "0"))
+    user_key = db_get_key(chat_id) or user["llm"].get("api_key")  # DB first, state fallback
     if user_key:
-        # Groq keys start with gsk_
         if user_key.startswith("gsk_"):
             return AsyncOpenAI(api_key=user_key, base_url=GROQ_BASE_URL)
         return AsyncOpenAI(api_key=user_key)
@@ -1068,7 +1256,8 @@ def get_llm_client(user: dict) -> AsyncOpenAI:
 
 
 def get_model(user: dict) -> str:
-    user_key = user["llm"].get("api_key")
+    chat_id = str(next((k for k, v in state["users"].items() if v is user), "0"))
+    user_key = db_get_key(chat_id) or user["llm"].get("api_key")
     user_model = user["llm"].get("model")
     if user_key:
         if user_key.startswith("gsk_") and not user_model:
@@ -1115,6 +1304,20 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         if notes else ""
     )
 
+    # Profile memory: permanent facts always in context
+    profile = db_get_profile_memory(str(chat_id))
+    profile_section = (
+        "\nPermanent user facts:\n" + "\n".join(f"  • {r['fact']}" for r in profile) + "\n"
+        if profile else ""
+    )
+
+    # Episodic memory: recent (non-expired) observations
+    episodic = db_get_episodic_memory(str(chat_id), limit=10)
+    episodic_section = (
+        "\nRecent observations (last 30 days):\n" + "\n".join(f"  – {r['event']}" for r in episodic) + "\n"
+        if episodic else ""
+    )
+
     # Include last few journal entries for context
     recent_journal = db_get_journal(str(chat_id), limit=3)
     journal_section = (
@@ -1148,9 +1351,12 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "reminders, habits, journal, check-ins, and that the user can speak naturally.\n"
         "11. Silently call save_memory whenever the user shares a personal fact, decision, plan, "
         "or reflection that is worth remembering for future conversations. "
+        "Choose the right type: 'profile' for permanent facts about the user (name, job, allergies, preferences), "
+        "'episodic' for recent events or observations that are relevant for ~30 days, "
+        "'journal' for reflections or day summaries, 'note' for short reminders or plans. "
         "Do NOT tell the user you are saving it — just save it in the background.\n"
         f"{lang_instruction}"
-        f"{context_section}{tracker_section}{habit_section}{focus_section}{notes_section}{journal_section}"
+        f"{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
 
@@ -1532,7 +1738,12 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
 
 
 def restore_all_jobs(app: Application) -> None:
-    """Recreate all scheduled jobs from persisted state on startup."""
+    """Recreate all scheduled jobs from persisted state on startup.
+    Also detect and catch-up any check-ins missed while bot was down (within 2h window).
+    """
+    now_utc = datetime.utcnow()
+    catchup_window = timedelta(hours=2)
+
     for cid_str, user in state["users"].items():
         cid = int(cid_str)
         schedule_user_checkins(app, cid)
@@ -1540,6 +1751,38 @@ def restore_all_jobs(app: Application) -> None:
         for reminder in user.get("reminders", []):
             schedule_user_reminder(app, cid, reminder)
 
+        # Missed check-in catch-up
+        if not user.get("checkin_enabled"):
+            continue
+        tz_str = user.get("timezone", "UTC")
+        times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
+        for label in ("morning", "evening"):
+            job_type = f"checkin_{label}"
+            last_fired = db_last_job_fired(cid_str, job_type)
+            try:
+                tz = ZoneInfo(tz_str)
+            except Exception:
+                tz = ZoneInfo("UTC")
+            t_str = times.get(label, "08:00" if label == "morning" else "21:00")
+            h, m = (int(x) for x in t_str.split(":"))
+            scheduled_today = datetime.now(tz).replace(hour=h, minute=m, second=0, microsecond=0)
+            scheduled_utc = scheduled_today.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+            if scheduled_utc < now_utc and (now_utc - scheduled_utc) < catchup_window:
+                if not last_fired or last_fired[:16] < scheduled_utc.isoformat()[:16]:
+                    # Schedule a one-shot catch-up in 10 seconds
+                    async def _catchup(ctx, _cid=cid, _label=label):
+                        u = get_user(_cid)
+                        if _is_quiet_now(u) or _is_muted(u):
+                            return
+                        prompt = (
+                            "Missed morning check-in catch-up: greet the user and ask about their plans."
+                            if _label == "morning" else
+                            "Missed evening check-in catch-up: ask briefly how their day went."
+                        )
+                        reply = await chat(_cid, prompt)
+                        await ctx.bot.send_message(chat_id=_cid, text=reply)
+                        db_log_job(str(_cid), f"checkin_{_label}")
+                    app.job_queue.run_once(_catchup, when=10)
 
 # ─────────────────────── tracker helpers ───────────────────────
 
@@ -2790,8 +3033,11 @@ async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Get a free Groq key at console.groq.com"
         )
         return
+    chat_id = str(update.effective_chat.id)
+    db_store_key(chat_id, key)
+    # Clear plaintext from state.json if it was stored there before
     user = get_user(update.effective_chat.id)
-    user["llm"]["api_key"] = key
+    user["llm"]["api_key"] = None
     save_state(state)
     try:
         await update.message.delete()
@@ -2799,11 +3045,12 @@ async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="✓ API key saved. (Original message deleted for security.)"
+        text="✓ API key saved (encrypted). (Original message deleted for security.)"
     )
 
 
 async def clear_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db_delete_key(str(update.effective_chat.id))
     user = get_user(update.effective_chat.id)
     user["llm"]["api_key"] = None
     save_state(state)
@@ -2897,7 +3144,10 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     total = len(state["users"])
     subscribed = sum(1 for u in state["users"].values() if u.get("checkin_enabled"))
-    with_key = sum(1 for u in state["users"].values() if u.get("llm", {}).get("api_key"))
+    with_key = sum(
+        1 for cid in state["users"]
+        if db_get_key(cid) or state["users"][cid].get("llm", {}).get("api_key")
+    )
     with_trackers = sum(1 for u in state["users"].values() if u.get("trackers"))
     with_reminders = sum(1 for u in state["users"].values() if u.get("reminders"))
     groq_mode = "Groq (free tier)" if GROQ_API_KEY else "OpenAI gpt-4o-mini (bot-funded)"

@@ -3,3 +3,4 @@ openai>=1.0.0
 tzdata
 mcp>=1.0.0
 timezonefinder>=6.0.0
+cryptography>=42.0.0

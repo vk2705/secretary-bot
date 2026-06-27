@@ -299,7 +299,9 @@ class TestBuildSystemPrompt:
 
 class TestRateLimit:
     def setup_method(self):
-        bot._rate_log.clear()
+        # Clear rate_log table so each test starts fresh
+        with bot._db() as con:
+            con.execute("DELETE FROM rate_log")
 
     def test_within_limit_not_blocked(self):
         for _ in range(bot.RATE_LIMIT - 1):
@@ -485,7 +487,8 @@ class TestQuietHours:
 
 class TestIsRateLimit:
     def setup_method(self):
-        bot._rate_log.clear()
+        with bot._db() as con:
+            con.execute("DELETE FROM rate_log")
 
     def test_first_call_not_limited(self):
         assert bot.is_rate_limited(1) is False
