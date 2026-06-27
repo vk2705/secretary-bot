@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 3 complete — all planned features shipped
+## Status: Iteration 4 complete
 
 ---
 
@@ -60,6 +60,19 @@ One-shot summary: streak, active days, task count, trackers, journal count, remi
 `/pomodoro [minutes]` — fires a one-time job after N min (default 25) with a completion message.
 
 ### 16. /import from export ✅ done (iteration 3)
+Send the JSON file from /export back to the bot to restore tasks, trackers, habits, journal, reminders, timezone, and context. Schedules restored reminders immediately.
+
+### 17. Quiet hours ✅ done (iteration 4)
+`/quiethours 23:00 07:00` — suppress all check-ins and reminders during a local-time window (handles midnight-spanning ranges). `/quiethours off` disables. Applies to both check-ins and user-defined daily reminders.
+
+### 18. Task deadlines ✅ done (iteration 4)
+`/addtask Submit report due:2026-07-15` — tasks stored as `{text, due}` objects. `/tasks` shows badges: ⚠️ overdue, 🔴 due today, 🟡 due in ≤3d. Due dates included in AI system prompt. Backward compatible with plain-string tasks.
+
+### 19. Interactive check-in buttons ✅ done (iteration 4)
+Check-in messages now include an inline keyboard: [✅ Going well] [🔄 Partially] [❌ Not today] [💬 Let's talk]. Tapping a button dismisses the keyboard and triggers a contextual AI follow-up response.
+
+### 20. AI Insights ✅ done (iteration 4)
+`/insights` — aggregates last 30 tracker entries, habit streaks, recent journal excerpts, and task list, then asks the AI for 2-3 specific observations and one actionable recommendation. More comprehensive than `/weekly`.
 Send the JSON file from /export back to the bot to restore tasks, trackers, habits, journal, reminders, timezone, and context. Schedules restored reminders immediately.
 
 ### 5. Journal entries ✅ planned

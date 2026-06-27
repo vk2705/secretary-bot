@@ -9,9 +9,9 @@ from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from openai import AsyncOpenAI
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
 
@@ -47,6 +47,7 @@ RESERVED_COMMANDS = {
     "trackers", "removetracker", "checkin", "clear", "setmodel",
     "setapikey", "clearapikey", "journal", "weekly", "export",
     "streak", "adminstats", "habit", "mystats", "pomodoro",
+    "quiethours", "insights",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -63,6 +64,7 @@ def _new_user(**overrides) -> dict:
         "habits": {},
         "journal": [],
         "activity_days": [],
+        "quiet_hours": {"start": None, "end": None},
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -176,6 +178,72 @@ def _habit_summary_lines(habits: dict) -> list[str]:
     return lines
 
 
+# ─────────────────────── quiet hours ───────────────────────
+
+def _is_quiet_now(user: dict) -> bool:
+    """Return True if current local time falls within the user's quiet window."""
+    qh = user.get("quiet_hours", {})
+    start_str = qh.get("start")
+    end_str = qh.get("end")
+    if not start_str or not end_str:
+        return False
+    try:
+        tz = ZoneInfo(user.get("timezone", "UTC"))
+    except (ZoneInfoNotFoundError, KeyError):
+        tz = ZoneInfo("UTC")
+    now = datetime.now(tz).time().replace(tzinfo=None)
+    sh, sm = (int(x) for x in start_str.split(":"))
+    eh, em = (int(x) for x in end_str.split(":"))
+    start_t = dt_time(sh, sm)
+    end_t = dt_time(eh, em)
+    if start_t <= end_t:
+        return start_t <= now < end_t
+    # Spans midnight
+    return now >= start_t or now < end_t
+
+
+# ─────────────────────── task helpers ───────────────────────
+
+def _task_text(task) -> str:
+    return task["text"] if isinstance(task, dict) else str(task)
+
+
+def _task_due(task) -> str | None:
+    return task.get("due") if isinstance(task, dict) else None
+
+
+def _format_task_line(task, idx: int) -> str:
+    text = _task_text(task)
+    due = _task_due(task)
+    if not due:
+        return f"{idx}. {text}"
+    try:
+        due_date = date.fromisoformat(due)
+        days_left = (due_date - date.today()).days
+        if days_left < 0:
+            badge = f" ⚠️ overdue {-days_left}d"
+        elif days_left == 0:
+            badge = " 🔴 DUE TODAY"
+        elif days_left <= 3:
+            badge = f" 🟡 due in {days_left}d"
+        else:
+            badge = f" (due {due})"
+    except ValueError:
+        badge = f" (due {due})"
+    return f"{idx}. {text}{badge}"
+
+
+def _tasks_for_prompt(tasks: list) -> str:
+    if not tasks:
+        return "none set yet"
+    parts = []
+    for t in tasks:
+        text = _task_text(t)
+        due = _task_due(t)
+        parts.append(f"{text} [due {due}]" if due else text)
+    return ", ".join(parts)
+
+
 # ─────────────────────── LLM helpers ───────────────────────
 
 def get_llm_client(user: dict) -> AsyncOpenAI:
@@ -223,7 +291,7 @@ def build_system_prompt(user: dict) -> str:
         if habit_lines else ""
     )
 
-    tasks_str = ", ".join(user["tasks"]) if user["tasks"] else "none set yet"
+    tasks_str = _tasks_for_prompt(user["tasks"])
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
@@ -302,9 +370,22 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
             )
 
         async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _prompt=prompt):
+            user_now = get_user(_cid)
+            if _is_quiet_now(user_now):
+                return
             try:
                 reply = await chat(_cid, _prompt)
-                await context.bot.send_message(chat_id=_cid, text=reply)
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Going well", callback_data="ci:well"),
+                        InlineKeyboardButton("🔄 Partially", callback_data="ci:partial"),
+                    ],
+                    [
+                        InlineKeyboardButton("❌ Not today", callback_data="ci:skip"),
+                        InlineKeyboardButton("💬 Let's talk", callback_data="ci:chat"),
+                    ],
+                ])
+                await context.bot.send_message(chat_id=_cid, text=reply, reply_markup=keyboard)
             except Exception as e:
                 logger.error("Check-in failed for %s: %s", _cid, e)
 
@@ -319,6 +400,8 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
 
     async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=reminder["message"]):
+        if _is_quiet_now(get_user(_cid)):
+            return
         try:
             await context.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
         except Exception as e:
@@ -407,9 +490,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /setmodel <model>  — e.g. gpt-4o\n"
         "  (Groq keys start with gsk_ and use Llama for free)\n\n"
         "More:\n"
-        "  /journal <text>  /weekly  /export  /streak  /mystats\n"
+        "  /journal <text>  /weekly  /insights  /export  /streak  /mystats\n"
         "  /pomodoro [min]  — focus timer\n"
         "  /habit add|done|list|remove <name>  — daily habits\n"
+        "  /quiethours HH:MM HH:MM  — silence at night\n"
+        "  /addtask <text> [due:YYYY-MM-DD]  — tasks with deadlines\n"
         "  (Send your export JSON to import data)"
     )
 
@@ -419,19 +504,37 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user["tasks"]:
         await update.message.reply_text("No tasks set. Use /addtask to add one.")
         return
-    text = "Your tasks:\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(user["tasks"]))
-    await update.message.reply_text(text)
+    lines = [_format_task_line(t, i + 1) for i, t in enumerate(user["tasks"])]
+    await update.message.reply_text("Your tasks:\n" + "\n".join(lines))
 
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = " ".join(context.args).strip()
-    if not task:
-        await update.message.reply_text("Usage: /addtask <task description>")
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.message.reply_text(
+            "Usage: /addtask <description> [due:YYYY-MM-DD]\n"
+            "Example: /addtask Submit report due:2026-07-15"
+        )
         return
+    # Parse optional due date
+    due_match = re.search(r"\bdue:(\d{4}-\d{2}-\d{2})\b", raw)
+    if due_match:
+        due = due_match.group(1)
+        try:
+            date.fromisoformat(due)
+        except ValueError:
+            await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
+            return
+        task_text = raw[:due_match.start()].strip()
+        task = {"text": task_text, "due": due}
+        confirm = f"Added: {task_text} (due {due})"
+    else:
+        task = raw
+        confirm = f"Added: {raw}"
     user = get_user(update.effective_chat.id)
     user["tasks"].append(task)
     save_state(state)
-    await update.message.reply_text(f"Added: {task}")
+    await update.message.reply_text(confirm)
 
 
 async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -440,7 +543,7 @@ async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(context.args[0]) - 1
         removed = user["tasks"].pop(idx)
         save_state(state)
-        await update.message.reply_text(f"Removed: {removed}")
+        await update.message.reply_text(f"Removed: {_task_text(removed)}")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /removetask <number>")
 
@@ -1074,6 +1177,147 @@ async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✓ Import successful!\n{summary}")
 
 
+# ─────────────────────── handlers: quiet hours ───────────────────────
+
+async def quiet_hours_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    args = context.args
+
+    if not args or args[0].lower() == "off":
+        user["quiet_hours"] = {"start": None, "end": None}
+        save_state(state)
+        await update.message.reply_text("Quiet hours disabled. Check-ins and reminders will fire at their scheduled times.")
+        return
+
+    if len(args) < 2:
+        tz = user.get("timezone", "UTC")
+        qh = user.get("quiet_hours", {})
+        if qh.get("start"):
+            await update.message.reply_text(
+                f"Quiet hours: {qh['start']}–{qh['end']} ({tz})\n"
+                "Use /quiethours off to disable."
+            )
+        else:
+            await update.message.reply_text(
+                "Usage: /quiethours HH:MM HH:MM\n"
+                "Example: /quiethours 23:00 07:00  (no messages at night)\n"
+                "Use /quiethours off to disable."
+            )
+        return
+
+    def _valid_time(s):
+        try:
+            h, m = s.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+            return True
+        except (ValueError, AssertionError):
+            return False
+
+    start_str, end_str = args[0], args[1]
+    if not _valid_time(start_str) or not _valid_time(end_str):
+        await update.message.reply_text("Invalid time. Use HH:MM format.")
+        return
+
+    user["quiet_hours"] = {"start": start_str, "end": end_str}
+    save_state(state)
+    tz = user.get("timezone", "UTC")
+    await update.message.reply_text(
+        f"Quiet hours set: {start_str}–{end_str} ({tz})\n"
+        "Check-ins and reminders will be silenced during this window."
+    )
+
+
+# ─────────────────────── handlers: AI insights ───────────────────────
+
+async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    parts = []
+
+    if user["tasks"]:
+        parts.append("Tasks: " + _tasks_for_prompt(user["tasks"]))
+
+    for name, data in user.get("trackers", {}).items():
+        log = data.get("log", [])
+        if log:
+            unit = data.get("unit", "")
+            recent = log[-30:]
+            vals = [str(e["value"]) + unit for e in recent]
+            parts.append(f"{name} (last {len(recent)} entries): {', '.join(vals)}")
+
+    for name, data in user.get("habits", {}).items():
+        completions = data.get("completions", [])
+        streak = _habit_streak(completions)
+        total = len(completions)
+        parts.append(f"Habit '{name}': {total} completions total, current streak {streak}d")
+
+    journal = user.get("journal", [])
+    if journal:
+        recent_j = journal[-5:]
+        entries_text = " | ".join(e["entry"][:60] for e in recent_j)
+        parts.append(f"Recent journal entries: {entries_text}")
+
+    if not parts:
+        await update.message.reply_text("Not enough data for insights yet. Start tracking!")
+        return
+
+    data_str = "\n".join(parts)
+    prompt = (
+        f"Analyze this user's data and provide personalized insights:\n\n{data_str}\n\n"
+        "Identify 2-3 key observations: trends (positive or concerning), patterns, "
+        "and one specific actionable recommendation. Be direct and specific, not generic. "
+        "Keep it to 8-10 lines."
+    )
+    await update.message.reply_text("Analyzing your data…")
+    reply = await chat(update.effective_chat.id, prompt)
+    await update.message.reply_text(f"🔍 Insights:\n\n{reply}")
+
+
+# ─────────────────────── handlers: callback query (inline buttons) ───────────────────────
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.from_user.id
+
+    if not query.data.startswith("ci:"):
+        return
+
+    mood = query.data.split(":")[1]
+    prompts = {
+        "well": (
+            "The user tapped 'Going well' after a check-in message. "
+            "Acknowledge briefly and ask what specific task they're tackling next."
+        ),
+        "partial": (
+            "The user tapped 'Partially done' after a check-in. "
+            "Acknowledge the progress warmly, then ask what got in the way and "
+            "encourage one concrete next step."
+        ),
+        "skip": (
+            "The user tapped 'Not today' after a check-in. "
+            "Be understanding — don't lecture — but ask what got in the way "
+            "and suggest the smallest possible step they could still do."
+        ),
+        "chat": (
+            "The user wants to talk after a check-in. "
+            "Open the conversation warmly — ask what's on their mind."
+        ),
+    }
+    prompt = prompts.get(mood, "User responded to a check-in.")
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if is_rate_limited(chat_id):
+        await context.bot.send_message(chat_id=chat_id, text="Hourly limit reached. Talk to me later!")
+        return
+
+    reply = await chat(chat_id, prompt)
+    await context.bot.send_message(chat_id=chat_id, text=reply)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if is_rate_limited(chat_id):
@@ -1116,6 +1360,10 @@ def main():
     app.add_handler(CommandHandler("habit", habit_cmd))
     app.add_handler(CommandHandler("mystats", my_stats))
     app.add_handler(CommandHandler("pomodoro", pomodoro_cmd))
+    app.add_handler(CommandHandler("quiethours", quiet_hours_cmd))
+    app.add_handler(CommandHandler("insights", insights_cmd))
+    # Inline keyboard callback for check-in buttons
+    app.add_handler(CallbackQueryHandler(handle_callback))
     # Catch-all for user-defined tracker commands (must be last command handler)
     app.add_handler(MessageHandler(filters.COMMAND, handle_custom_command))
     # Document handler for /import (JSON file upload)
