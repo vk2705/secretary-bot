@@ -51,6 +51,8 @@ RESERVED_COMMANDS = {
     "quiethours", "insights", "setcheckin",
     "donetask", "archive", "reset", "help",
     "prioritize", "today", "note", "notes", "removenote", "search",
+    "setlanguage", "clearlanguage", "compress", "broadcast", "feedback",
+    "time",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -72,6 +74,7 @@ def _new_user(**overrides) -> dict:
         "archived_tasks": [],
         "notes": [],
         "today_focus": {"date": "", "text": ""},
+        "language": "",
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -313,6 +316,13 @@ def build_system_prompt(user: dict) -> str:
         if notes else ""
     )
 
+    lang = user.get("language", "").strip()
+    lang_instruction = (
+        f"8. Always respond exclusively in {lang}. "
+        "Do not switch to English even if the user writes in English.\n"
+        if lang else ""
+    )
+
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
@@ -322,7 +332,8 @@ def build_system_prompt(user: dict) -> str:
         "4. Be warm but firm. Don't accept vague excuses without gentle pushback.\n"
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
-        "7. Correct English mistakes naturally and briefly when they occur.\n"
+        "7. Correct mistakes naturally and briefly when they occur.\n"
+        f"{lang_instruction}"
         f"{context_section}{tracker_section}{habit_section}{focus_section}{notes_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
@@ -497,6 +508,18 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
                 )
             except Exception as e:
                 logger.error("Deadline alert failed for %s: %s", _cid, e)
+
+        # Fire annual reminders whose MM-DD matches today
+        today_mmdd = today.strftime("%m-%d")
+        for r in u.get("reminders", []):
+            if r.get("annual") and r.get("date") == today_mmdd:
+                try:
+                    await context.bot.send_message(
+                        chat_id=_cid,
+                        text=f"📅 Annual reminder: {r['message']}"
+                    )
+                except Exception as e:
+                    logger.error("Annual reminder failed for %s: %s", _cid, e)
 
     app.job_queue.run_daily(
         _deadline_job,
@@ -692,11 +715,16 @@ _HELP_TEXT = (
     "  /trackers  /removetracker <name>\n\n"
     "AI & LLM:\n"
     "  /journal <text>  /weekly  /insights\n"
+    "  /compress  — summarize & truncate history\n"
     "  /setapikey <key>  (sk-… OpenAI, gsk-… Groq/free)\n"
     "  /setmodel <model>  /clearapikey\n\n"
+    "Language & Locale:\n"
+    "  /setlanguage <name>  — e.g. Hebrew, Spanish\n"
+    "  /clearlanguage  /time  — show local time\n\n"
     "Tools:\n"
     "  /pomodoro [min]  /export  /clear\n"
     "  /reset  — wipe all data\n"
+    "  /feedback <text>  — send feedback to bot admin\n"
     "  (Send export JSON to import)\n"
 )
 
@@ -946,6 +974,118 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        lang = user.get("language", "")
+        if lang:
+            await update.message.reply_text(f"🌐 Current language: {lang}. Use /clearlanguage to reset.")
+        else:
+            await update.message.reply_text(
+                "Usage: /setlanguage <language>\nExample: /setlanguage Hebrew\n"
+                "I'll always respond in that language."
+            )
+        return
+    lang = " ".join(context.args).strip()
+    user["language"] = lang
+    save_state(state)
+    await update.message.reply_text(f"🌐 Language set to {lang}. I'll respond in {lang} from now on.")
+
+
+async def clear_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    user["language"] = ""
+    save_state(state)
+    await update.message.reply_text("🌐 Language preference cleared. I'll follow your message language.")
+
+
+async def compress_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Summarize conversation history and replace it with a compact version."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if len(user["history"]) < 4:
+        await update.message.reply_text("Not enough history to compress yet.")
+        return
+    await update.message.reply_text("Compressing history…")
+    history_text = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:200]}" for m in user["history"]
+    )
+    summary_prompt = (
+        "Summarize the following conversation in 3-5 sentences. "
+        "Focus on: tasks discussed, commitments made, progress reported, key topics. "
+        "Be factual and concise.\n\n" + history_text
+    )
+    try:
+        summary = await chat(chat_id, summary_prompt, system="You are a concise summarizer.")
+    except Exception:
+        await update.message.reply_text("⚠️ Compression failed. Try again.")
+        return
+    user["history"] = [
+        {"role": "user", "content": f"[Conversation summary] {summary}"},
+        {"role": "assistant", "content": "Understood. I'll use this as context going forward."},
+    ]
+    save_state(state)
+    await update.message.reply_text(
+        f"✅ History compressed to 2 messages.\n\n📄 Summary:\n{summary}"
+    )
+
+
+async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    tz_str = user.get("timezone", "UTC")
+    try:
+        tz = ZoneInfo(tz_str)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    now = datetime.now(tz)
+    await update.message.reply_text(
+        f"🕐 Your local time: {now.strftime('%H:%M')} on {now.strftime('%A, %d %b %Y')}\n"
+        f"Timezone: {tz_str}"
+    )
+
+
+async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /feedback <your message>")
+        return
+    if not MY_CHAT_ID:
+        await update.message.reply_text("Feedback is not configured for this bot.")
+        return
+    text = " ".join(context.args)
+    sender = update.effective_chat.id
+    try:
+        await context.bot.send_message(
+            chat_id=int(MY_CHAT_ID),
+            text=f"📬 Feedback from {sender}:\n\n{text}"
+        )
+        await update.message.reply_text("✉️ Feedback sent. Thank you!")
+    except Exception as e:
+        logger.error("Feedback send failed: %s", e)
+        await update.message.reply_text("⚠️ Could not deliver feedback right now.")
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not MY_CHAT_ID or str(chat_id) != MY_CHAT_ID:
+        await update.message.reply_text("Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+    msg = " ".join(context.args)
+    recipients = [uid for uid, u in state["users"].items() if u.get("checkin_enabled")]
+    sent, failed = 0, 0
+    for uid in recipients:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=f"📢 {msg}")
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(
+        f"Broadcast done. Sent: {sent}, Failed: {failed} (of {len(recipients)} subscribed users)."
+    )
+
+
 async def set_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip()
     if not text:
@@ -1013,9 +1153,42 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def manual_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = "The user requested a manual check-in. Ask what's on their mind and how their tasks are going."
-    reply = await chat(update.effective_chat.id, prompt)
-    await update.message.reply_text(reply)
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+
+    # Build a mini-dashboard header
+    today_str = date.today().isoformat()
+    lines = []
+
+    focus = user.get("today_focus", {})
+    if focus.get("date") == today_str and focus.get("text"):
+        lines.append(f"🎯 Focus: {focus['text']}")
+
+    tasks = user.get("tasks", [])
+    if tasks:
+        lines.append(f"📋 Tasks ({len(tasks)}): " + " · ".join(_task_text(t) for t in tasks[:3])
+                     + ("…" if len(tasks) > 3 else ""))
+
+    habits = user.get("habits", {})
+    if habits:
+        done_today = [n for n, h in habits.items() if today_str in h.get("completions", [])]
+        pending = [n for n in habits if n not in done_today]
+        if pending:
+            lines.append(f"🔲 Habits pending: {', '.join(pending)}")
+        elif done_today:
+            lines.append(f"✅ All habits done today!")
+
+    dashboard = "\n".join(lines)
+    prompt = (
+        "The user requested a manual check-in. "
+        "Ask what's on their mind and how their tasks are going. "
+        "Be warm and specific — pick one task or habit to ask about."
+    )
+    reply = await chat(chat_id, prompt)
+    if dashboard:
+        await update.message.reply_text(dashboard + "\n\n" + reply)
+    else:
+        await update.message.reply_text(reply)
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1075,7 +1248,12 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = user.get("timezone", "UTC")
         lines = []
         for i, r in enumerate(reminders):
-            kind = "once" if r.get("once") else "daily"
+            if r.get("annual"):
+                kind = f"annual {r.get('date','??')}"
+            elif r.get("once"):
+                kind = "once"
+            else:
+                kind = "daily"
             lines.append(f"{i+1}. [{kind}] {r['time']} {tz} — {r['message']}")
         await update.message.reply_text("Your reminders:\n" + "\n".join(lines))
 
@@ -1140,8 +1318,42 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (IndexError, ValueError):
             await update.message.reply_text("Invalid number. Use /remind list to see numbers.")
 
+    elif sub == "annual":
+        # /remind annual MM-DD HH:MM <message>
+        if len(args) < 4:
+            await update.message.reply_text(
+                "Usage: /remind annual MM-DD HH:MM <message>\n"
+                "Example: /remind annual 12-25 09:00 Merry Christmas!"
+            )
+            return
+        date_str = args[1]
+        time_str = args[2]
+        try:
+            mo, dy = (int(x) for x in date_str.split("-"))
+            assert 1 <= mo <= 12 and 1 <= dy <= 31
+            h, mi = (int(x) for x in time_str.split(":"))
+            assert 0 <= h <= 23 and 0 <= mi <= 59
+        except (ValueError, AssertionError):
+            await update.message.reply_text("Invalid format. Use MM-DD HH:MM (e.g. 12-25 09:00)")
+            return
+        message = " ".join(args[3:])
+        reminder = {
+            "id": str(uuid.uuid4()),
+            "time": time_str,
+            "date": date_str,
+            "message": message,
+            "once": False,
+            "annual": True,
+        }
+        user.setdefault("reminders", []).append(reminder)
+        save_state(state)
+        tz = user.get("timezone", "UTC")
+        await update.message.reply_text(
+            f"📅 Annual reminder set: every {date_str} at {time_str} ({tz}) — {message}"
+        )
+
     else:
-        await update.message.reply_text("Unknown subcommand. Use add, once, list, or remove.")
+        await update.message.reply_text("Unknown subcommand. Use add, annual, once, list, or remove.")
 
 
 # ─────────────────────── handlers: trackers ───────────────────────
@@ -1821,6 +2033,12 @@ def main():
     app.add_handler(CommandHandler("notes", notes_cmd))
     app.add_handler(CommandHandler("removenote", removenote_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("setlanguage", set_language))
+    app.add_handler(CommandHandler("clearlanguage", clear_language))
+    app.add_handler(CommandHandler("compress", compress_history))
+    app.add_handler(CommandHandler("time", time_cmd))
+    app.add_handler(CommandHandler("feedback", feedback_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("setcontext", set_context))
     app.add_handler(CommandHandler("context", show_context))
     app.add_handler(CommandHandler("subscribe", subscribe))

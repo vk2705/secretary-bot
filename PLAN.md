@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 7 complete
+## Status: Iteration 8 complete
 
 ---
 
@@ -145,6 +145,27 @@ Daily reminders now include a `🔁 Snooze 30 min` inline button. Tapping schedu
 
 ### 33. Cross-data search ✅ done (iteration 7)
 `/search <query>` — case-insensitive substring search across active tasks, archived tasks, notes, and journal entries. Returns grouped results (up to 20).
+
+### 34. Language preference ✅ done (iteration 8)
+`/setlanguage Hebrew` — stores preferred response language; injected as an exclusive-language instruction into the system prompt. `/clearlanguage` resets. Works for any language the underlying LLM supports.
+
+### 35. History compression ✅ done (iteration 8)
+`/compress` — asks the AI to summarize the full conversation history in 3-5 sentences (tasks discussed, commitments, progress), then replaces history with that 2-message compact form. Reduces token usage for long-running conversations.
+
+### 36. Admin broadcast ✅ done (iteration 8)
+`/broadcast <message>` — admin-only (MY_CHAT_ID required). Sends a `📢 <message>` to all subscribed users. Reports sent/failed counts.
+
+### 37. User feedback ✅ done (iteration 8)
+`/feedback <text>` — forwards a message to the bot admin's chat_id with the sender's ID. Simple one-way channel for bug reports and feature requests.
+
+### 38. Annual reminders ✅ done (iteration 8)
+`/remind annual MM-DD HH:MM <message>` — e.g. `12-25 09:00 Merry Christmas!`. Stored with `"annual": true` and `"date": "MM-DD"`. Fires via the daily deadline alert job which checks if today's `%m-%d` matches any annual reminder.
+
+### 39. `/time` command ✅ done (iteration 8)
+Shows the user's current local time and day of week using their stored IANA timezone.
+
+### 40. Enhanced manual /checkin ✅ done (iteration 8)
+`/checkin` now prepends a mini-dashboard: today's focus (if set), active task count with first 3 names, and pending habits. The AI response follows immediately below. Makes check-in much more actionable.
 
 ## Implementation order
 
