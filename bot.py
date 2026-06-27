@@ -8,6 +8,8 @@ from collections import defaultdict
 from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from timezonefinder import TimezoneFinder
+_tf = TimezoneFinder()
 from openai import AsyncOpenAI
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from telegram.ext import (
@@ -1210,8 +1212,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "I'm your personal accountability coach. Let's get set up:\n\n"
             "1️⃣ Tell me about yourself:\n"
             "   /setcontext I'm a developer working on fitness and learning Spanish\n\n"
-            "2️⃣ Set your timezone:\n"
-            "   /settimezone Asia/Jerusalem\n\n"
+            "2️⃣ Set your timezone — easiest way: 📍 share your location\n"
+            "   (tap the 📎 attachment icon → Location)\n"
+            "   Or: /settimezone Asia/Jerusalem\n\n"
             "3️⃣ Add your first goal:\n"
             "   /addtask Exercise 3× per week\n\n"
             "4️⃣ Enable daily check-ins:\n"
@@ -1899,6 +1902,27 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Daily check-ins, deadline alerts, and habit reminders disabled.")
 
 
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-set timezone from a shared location."""
+    loc = update.message.location
+    tz_str = _tf.timezone_at(lat=loc.latitude, lng=loc.longitude)
+    if not tz_str:
+        await update.message.reply_text(
+            "Couldn't determine timezone from that location. "
+            "Please set it manually: /settimezone Europe/London"
+        )
+        return
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    user["timezone"] = tz_str
+    save_state(state)
+    schedule_user_checkins(context.application, chat_id)
+    schedule_user_alerts(context.application, chat_id)
+    for reminder in user.get("reminders", []):
+        schedule_user_reminder(context.application, chat_id, reminder)
+    await update.message.reply_text(f"📍 Timezone set to {tz_str} from your location.")
+
+
 def _normalize_tz(tz_str: str) -> str:
     """Convert UTC±N offsets to valid IANA Etc/GMT∓N names (POSIX sign is inverted)."""
     import re as _re
@@ -1926,7 +1950,8 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ZoneInfoNotFoundError, KeyError):
         await update.message.reply_text(
             f"Unknown timezone: {tz_str}\n"
-            "Use IANA names (e.g. Europe/London, Asia/Tokyo) or UTC offsets (UTC+3, UTC-5)."
+            "Use IANA names (e.g. Europe/London, Asia/Tokyo) or UTC offsets (UTC+3, UTC-5).\n"
+            "Tip: share your 📍 location and I'll detect it automatically."
         )
         return
     user = get_user(update.effective_chat.id)
@@ -2998,6 +3023,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Catch-all for user-defined tracker commands (must be last command handler)
     app.add_handler(MessageHandler(filters.COMMAND, handle_custom_command))
+    # Location sharing → auto-detect timezone
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     # Document handler for /import (JSON file upload)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_import))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
