@@ -54,6 +54,7 @@ RESERVED_COMMANDS = {
     "prioritize", "today", "note", "notes", "removenote", "search",
     "setlanguage", "clearlanguage", "compress", "broadcast", "feedback",
     "time", "suggest", "duedate", "extend", "swap", "reflect", "focus",
+    "mute", "unmute", "limit",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -77,6 +78,7 @@ def _new_user(**overrides) -> dict:
         "today_focus": {"date": "", "text": ""},
         "language": "",
         "milestones_sent": [],
+        "muted_until": "",
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -329,33 +331,62 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         text = (args.get("text") or "").strip()
         if not text:
             return {"error": "Task text is required"}
-        due = args.get("due_date")
-        if due:
+        raw_due = args.get("due_date")
+        due = None
+        due_error = None
+        if raw_due:
             try:
-                date.fromisoformat(due)
+                date.fromisoformat(raw_due)
+                due = raw_due
             except ValueError:
-                due = None
+                due_error = f"due_date '{raw_due}' is invalid (use YYYY-MM-DD); task added without due date."
         task = {"text": text, "due": due} if due else text
         user["tasks"].append(task)
         save_state(state)
-        return {"success": True, "task": text, "due": due}
+        result = {"success": True, "task": text, "due": due}
+        if due_error:
+            result["warning"] = due_error
+        return result
 
     if name == "complete_task":
         n = int(args.get("task_number", 0))
         tasks = user.get("tasks", [])
         if n < 1 or n > len(tasks):
             return {"error": f"Task {n} not found. There are {len(tasks)} tasks."}
-        completed = tasks.pop(n - 1)
+        task = tasks[n - 1]
+        recur = task.get("recur") if isinstance(task, dict) else None
         archived = user.setdefault("archived_tasks", [])
         archived.append({
-            "text": _task_text(completed),
-            "due": _task_due(completed),
+            "text": _task_text(task),
+            "due": _task_due(task),
             "completed_at": datetime.utcnow().isoformat(),
         })
         if len(archived) > 100:
             user["archived_tasks"] = archived[-100:]
-        save_state(state)
-        return {"success": True, "completed": _task_text(completed)}
+        if recur:
+            current_due = _task_due(task) or date.today().isoformat()
+            try:
+                base = date.fromisoformat(current_due)
+            except ValueError:
+                base = date.today()
+            if recur == "daily":
+                next_due = base + timedelta(days=1)
+            elif recur == "weekly":
+                next_due = base + timedelta(weeks=1)
+            else:
+                import calendar
+                m = base.month % 12 + 1
+                y = base.year + (1 if base.month == 12 else 0)
+                d = min(base.day, calendar.monthrange(y, m)[1])
+                next_due = date(y, m, d)
+            tasks[n - 1] = {"text": _task_text(task), "due": next_due.isoformat(), "recur": recur}
+            save_state(state)
+            return {"success": True, "completed": _task_text(task), "next_due": next_due.isoformat(), "recurs": recur}
+        else:
+            tasks.pop(n - 1)
+            save_state(state)
+            await _check_milestones(chat_id, _app)
+            return {"success": True, "completed": _task_text(task)}
 
     if name == "log_tracker":
         tname = (args.get("tracker_name") or "").lower().strip()
@@ -435,6 +466,17 @@ def _habit_summary_lines(habits: dict) -> list[str]:
 
 # ─────────────────────── quiet hours ───────────────────────
 
+def _is_muted(user: dict) -> bool:
+    """Return True if the user has an active /mute in effect."""
+    until = user.get("muted_until", "")
+    if not until:
+        return False
+    try:
+        return datetime.utcnow() < datetime.fromisoformat(until)
+    except ValueError:
+        return False
+
+
 def _is_quiet_now(user: dict) -> bool:
     """Return True if current local time falls within the user's quiet window."""
     qh = user.get("quiet_hours", {})
@@ -465,6 +507,10 @@ def _task_text(task) -> str:
 
 def _task_due(task) -> str | None:
     return task.get("due") if isinstance(task, dict) else None
+
+
+def _task_tags(task) -> list:
+    return re.findall(r"#(\w+)", _task_text(task).lower())
 
 
 def _format_task_line(task, idx: int) -> str:
@@ -716,7 +762,7 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
             _cid=chat_id, _prompt=prompt, _morning=is_morning,
         ):
             user_now = get_user(_cid)
-            if _is_quiet_now(user_now):
+            if _is_quiet_now(user_now) or _is_muted(user_now):
                 return
             try:
                 dynamic_prompt = _prompt
@@ -768,7 +814,7 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
 
     async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=reminder["message"]):
-        if _is_quiet_now(get_user(_cid)):
+        if _is_quiet_now(get_user(_cid)) or _is_muted(get_user(_cid)):
             return
         try:
             import time as _time
@@ -792,7 +838,10 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     tz_str = user.get("timezone", "UTC")
     enabled = user.get("checkin_enabled", False)
 
-    for job_name in [f"deadline_alert_{chat_id}", f"habit_reminder_{chat_id}"]:
+    for job_name in [
+        f"deadline_alert_{chat_id}", f"habit_reminder_{chat_id}",
+        f"idle_nudge_{chat_id}", f"weekly_digest_{chat_id}",
+    ]:
         for job in app.job_queue.get_jobs_by_name(job_name):
             job.schedule_removal()
 
@@ -802,7 +851,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     # ── deadline alert at 09:00 ──
     async def _deadline_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         u = get_user(_cid)
-        if _is_quiet_now(u):
+        if _is_quiet_now(u) or _is_muted(u):
             return
         today = date.today()
         alerts = []
@@ -852,7 +901,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     # ── habit reminder at 20:00 ──
     async def _habit_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         u = get_user(_cid)
-        if _is_quiet_now(u):
+        if _is_quiet_now(u) or _is_muted(u):
             return
         habits = u.get("habits", {})
         today_str = date.today().isoformat()
@@ -877,12 +926,9 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     )
 
     # ── idle nudge at 11:00 — fires only if user has been inactive 3+ days ──
-    for job in app.job_queue.get_jobs_by_name(f"idle_nudge_{chat_id}"):
-        job.schedule_removal()
-
     async def _idle_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         u = get_user(_cid)
-        if _is_quiet_now(u):
+        if _is_quiet_now(u) or _is_muted(u):
             return
         if not u.get("tasks") and not u.get("habits"):
             return
@@ -911,15 +957,13 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     )
 
     # ── Weekly digest every Sunday at 10:00 ──
-    for job in app.job_queue.get_jobs_by_name(f"weekly_digest_{chat_id}"):
-        job.schedule_removal()
-
     async def _weekly_digest_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         u = get_user(_cid)
-        if _is_quiet_now(u):
+        if _is_quiet_now(u) or _is_muted(u):
             return
-        today = date.today()
-        # Only fire on Sunday (weekday 6)
+        # Use user's local date for the Sunday check
+        tz = ZoneInfo(u.get("timezone", "UTC"))
+        today = datetime.now(tz).date()
         if today.weekday() != 6:
             return
         try:
@@ -928,10 +972,14 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
                 f"{n}: {_habit_streak(h.get('completions',[]))}-day streak"
                 for n, h in u.get("habits", {}).items()
             ) or "none"
-            n_done = len(u.get("archived_tasks", []))
+            week_cutoff = (today - timedelta(days=7)).isoformat()
+            n_done = sum(
+                1 for t in u.get("archived_tasks", [])
+                if (t.get("completed_at") or "")[:10] >= week_cutoff
+            )
             journal_count = len([
                 e for e in u.get("journal", [])
-                if e["ts"][:10] >= (today - timedelta(days=7)).isoformat()
+                if e["ts"][:10] >= week_cutoff
             ])
             prompt = (
                 f"Weekly digest for this user:\n"
@@ -1131,40 +1179,89 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
-    if not user["tasks"]:
-        await update.message.reply_text("No tasks set. Use /addtask to add one.")
+    tasks = user["tasks"]
+    if not tasks:
+        await update.message.reply_text("No tasks. Use /addtask to add one.")
         return
-    lines = [_format_task_line(t, i + 1) for i, t in enumerate(user["tasks"])]
-    await update.message.reply_text("Your tasks:\n" + "\n".join(lines))
+
+    # Optional tag filter: /tasks #work
+    tag_filter = None
+    if context.args and context.args[0].startswith("#"):
+        tag_filter = context.args[0][1:].lower()
+        filtered = [(i, t) for i, t in enumerate(tasks) if tag_filter in _task_tags(t)]
+        if not filtered:
+            await update.message.reply_text(f"No tasks tagged #{tag_filter}.")
+            return
+        lines = [
+            _format_task_line(t, orig_i + 1) + (f"  ♻️ {t['recur']}" if isinstance(t, dict) and t.get("recur") else "")
+            for orig_i, t in filtered
+        ]
+        header = f"Tasks tagged #{tag_filter}:"
+    else:
+        lines = [
+            _format_task_line(t, i + 1) + (f"  ♻️ {t['recur']}" if isinstance(t, dict) and t.get("recur") else "")
+            for i, t in enumerate(tasks)
+        ]
+        header = "Your tasks:"
+
+    await update.message.reply_text(header + "\n" + "\n".join(lines))
 
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args).strip()
     if not raw:
         await update.message.reply_text(
-            "Usage: /addtask <description> [due:YYYY-MM-DD]\n"
+            "Usage: /addtask <description> [due:YYYY-MM-DD] [every:daily|weekly|monthly]\n"
+            "Example: /addtask Morning run every:daily\n"
             "Example: /addtask Submit report due:2026-07-15"
         )
         return
+
     # Parse optional due date
+    due = None
     due_match = re.search(r"\bdue:(\d{4}-\d{2}-\d{2})\b", raw)
     if due_match:
-        due = due_match.group(1)
         try:
-            date.fromisoformat(due)
+            date.fromisoformat(due_match.group(1))
+            due = due_match.group(1)
+            raw = raw[:due_match.start()] + raw[due_match.end():]
         except ValueError:
             await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
             return
-        task_text = raw[:due_match.start()].strip()
-        task = {"text": task_text, "due": due}
-        confirm = f"Added: {task_text} (due {due})"
+
+    # Parse optional recurrence
+    recur = None
+    recur_match = re.search(r"\bevery:(daily|weekly|monthly)\b", raw, re.IGNORECASE)
+    if recur_match:
+        recur = recur_match.group(1).lower()
+        raw = raw[:recur_match.start()] + raw[recur_match.end():]
+
+    task_text = raw.strip()
+    if not task_text:
+        await update.message.reply_text("Task text cannot be empty.")
+        return
+
+    if due or recur:
+        task = {"text": task_text}
+        if due:
+            task["due"] = due
+        elif recur:
+            task["due"] = date.today().isoformat()  # first occurrence = today
+        if recur:
+            task["recur"] = recur
     else:
-        task = raw
-        confirm = f"Added: {raw}"
+        task = task_text
+
     user = get_user(update.effective_chat.id)
     user["tasks"].append(task)
     save_state(state)
-    await update.message.reply_text(confirm)
+
+    parts = [f"Added: {task_text}"]
+    if due:
+        parts.append(f"due {due}")
+    if recur:
+        parts.append(f"repeats {recur}")
+    await update.message.reply_text(" · ".join(parts) + ("  ♻️" if recur else ""))
 
 
 async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1185,17 +1282,51 @@ async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         idx = int(context.args[0]) - 1
-        completed = user["tasks"].pop(idx)
+        task = user["tasks"][idx]
+        recur = task.get("recur") if isinstance(task, dict) else None
+
+        # Always archive a completion record
         archived = user.setdefault("archived_tasks", [])
         archived.append({
-            "text": _task_text(completed),
-            "due": _task_due(completed),
+            "text": _task_text(task),
+            "due": _task_due(task),
             "completed_at": datetime.utcnow().isoformat(),
         })
         if len(archived) > 100:
             user["archived_tasks"] = archived[-100:]
-        save_state(state)
-        await update.message.reply_text(f"✅ Done: {_task_text(completed)}")
+
+        if recur:
+            # Roll the due date forward instead of removing the task
+            current_due = _task_due(task) or date.today().isoformat()
+            try:
+                base = date.fromisoformat(current_due)
+            except ValueError:
+                base = date.today()
+            if recur == "daily":
+                next_due = base + timedelta(days=1)
+            elif recur == "weekly":
+                next_due = base + timedelta(weeks=1)
+            else:  # monthly
+                # Same day next month (clamp to last day of month)
+                m = base.month % 12 + 1
+                y = base.year + (1 if base.month == 12 else 0)
+                import calendar
+                d = min(base.day, calendar.monthrange(y, m)[1])
+                next_due = date(y, m, d)
+            user["tasks"][idx] = {
+                "text": _task_text(task),
+                "due": next_due.isoformat(),
+                "recur": recur,
+            }
+            save_state(state)
+            await update.message.reply_text(
+                f"✅ Done: {_task_text(task)}\n♻️ Repeats {recur} — next due {next_due.isoformat()}"
+            )
+        else:
+            user["tasks"].pop(idx)
+            save_state(state)
+            await update.message.reply_text(f"✅ Done: {_task_text(task)}")
+
         await _check_milestones(update.effective_chat.id, context.application)
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /donetask <number>  (use /tasks to see numbers)")
@@ -1601,6 +1732,59 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
     await update.message.reply_text(
         f"Broadcast done. Sent: {sent}, Failed: {failed} (of {len(recipients)} subscribed users)."
+    )
+
+
+async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mute <Nh|Nd> — suppress all check-ins and reminders for N hours or days."""
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        if _is_muted(user):
+            until = user.get("muted_until", "")[:16].replace("T", " ")
+            await update.message.reply_text(f"🔕 Muted until {until} UTC. Use /unmute to cancel.")
+        else:
+            await update.message.reply_text(
+                "Usage: /mute <duration>\n"
+                "Examples: /mute 4h  /mute 2d\n"
+                "Suppresses all check-ins and reminders for that period."
+            )
+        return
+    spec = context.args[0].lower()
+    try:
+        if spec.endswith("h"):
+            delta = timedelta(hours=int(spec[:-1]))
+        elif spec.endswith("d"):
+            delta = timedelta(days=int(spec[:-1]))
+        else:
+            raise ValueError
+        until = datetime.utcnow() + delta
+        user["muted_until"] = until.isoformat()
+        save_state(state)
+        until_str = until.strftime("%Y-%m-%d %H:%M UTC")
+        await update.message.reply_text(f"🔕 Muted until {until_str}. Use /unmute to cancel early.")
+    except (ValueError, IndexError):
+        await update.message.reply_text("Usage: /mute <Nh|Nd>  e.g. /mute 4h or /mute 2d")
+
+
+async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    user["muted_until"] = ""
+    save_state(state)
+    await update.message.reply_text("🔔 Unmuted. Check-ins and reminders are active again.")
+
+
+async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current rate limit status."""
+    key = str(update.effective_chat.id)
+    now = time.monotonic()
+    recent = [t for t in _rate_log[key] if now - t < RATE_WINDOW]
+    used = len(recent)
+    remaining = max(0, RATE_LIMIT - used)
+    bar = "█" * min(used, RATE_LIMIT) + "░" * max(0, RATE_LIMIT - used)
+    await update.message.reply_text(
+        f"📊 Rate limit: {used}/{RATE_LIMIT} used this hour\n"
+        f"[{bar}]\n"
+        f"{remaining} messages remaining (resets rolling)"
     )
 
 
@@ -2263,16 +2447,30 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_own_key = bool(user["llm"].get("api_key"))
     model_info = f"{model} (your key)" if has_own_key else f"{model} (default)"
 
+    # Last-7-day activity chart
+    days_set = set(user.get("activity_days", []))
+    week_chart = "".join(
+        "█" if (date.today() - timedelta(days=i)).isoformat() in days_set else "░"
+        for i in range(6, -1, -1)
+    )
+
+    mute_status = ""
+    if _is_muted(user):
+        until = user.get("muted_until", "")[:16].replace("T", " ")
+        mute_status = f"🔕 Muted until {until} UTC"
+
     lines = [
         f"🔥 Streak: {streak} day{'s' if streak != 1 else ''}",
+        f"📅 Last 7 days: {week_chart}",
         f"🗓 Active: {total_days} days (first: {first_seen})",
-        f"✅ Tasks: {len(user['tasks'])}",
+        f"✅ Tasks: {len(user['tasks'])} active  ·  {len(user.get('archived_tasks', []))} done",
         f"📋 Trackers: {', '.join(user.get('trackers', {}).keys()) or 'none'}",
         f"📓 Journal: {len(user.get('journal', []))} entries",
-        f"✅ Completed tasks: {len(user.get('archived_tasks', []))}",
         f"⏰ Reminders: {len(user.get('reminders', []))}",
         f"🤖 Model: {model_info}",
     ]
+    if mute_status:
+        lines.append(mute_status)
     habit_lines = _habit_summary_lines(user.get("habits", {}))
     if habit_lines:
         lines.append("\nHabits today:")
@@ -2310,26 +2508,27 @@ async def focus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_label = None
     minutes = 25
 
+    # /focus [task_n] [minutes] — first numeric arg is task index, second is duration
+    args_ints = []
     for arg in context.args:
         try:
-            n = int(arg)
-            if 1 <= n <= 120:
-                # ambiguous: treat as task index first if tasks exist at that index
-                if n <= len(user.get("tasks", [])):
-                    task_label = _task_text(user["tasks"][n - 1])
-                else:
-                    minutes = n
-            else:
-                minutes = max(1, min(120, n))
+            args_ints.append(int(arg))
         except ValueError:
             pass
 
-    # Second arg (if both given) overrides minutes
-    if len(context.args) == 2:
-        try:
-            minutes = max(1, min(120, int(context.args[1])))
-        except ValueError:
-            pass
+    tasks_list = user.get("tasks", [])
+    if len(args_ints) >= 2:
+        # Both supplied: first = task index, second = minutes
+        idx = args_ints[0] - 1
+        if 0 <= idx < len(tasks_list):
+            task_label = _task_text(tasks_list[idx])
+        minutes = max(1, min(120, args_ints[1]))
+    elif len(args_ints) == 1:
+        n = args_ints[0]
+        if 1 <= n <= len(tasks_list):
+            task_label = _task_text(tasks_list[n - 1])
+        else:
+            minutes = max(1, min(120, n))
 
     async def _done(ctx, _cid=chat_id, _min=minutes, _task=task_label):
         if _task:
@@ -2680,6 +2879,9 @@ def main():
     app.add_handler(CommandHandler("extend", extend_cmd))
     app.add_handler(CommandHandler("swap", swap_cmd))
     app.add_handler(CommandHandler("focus", focus_cmd))
+    app.add_handler(CommandHandler("mute", mute_cmd))
+    app.add_handler(CommandHandler("unmute", unmute_cmd))
+    app.add_handler(CommandHandler("limit", limit_cmd))
     app.add_handler(CommandHandler("suggest", suggest_cmd))
     app.add_handler(CommandHandler("reflect", reflect_cmd))
     app.add_handler(CommandHandler("setcontext", set_context))

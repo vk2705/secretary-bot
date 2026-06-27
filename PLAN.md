@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 11 complete
+## Status: Iteration 12 complete
 
 ---
 
@@ -214,6 +214,32 @@ Pomodoro timer linked to a specific task. Start message shows the task name; end
 
 ### 53. `/habit stats <name>` ✅ done (iteration 11)
 Detailed per-habit report: last 7 days as ✅/❌ grid, current streak, longest streak, 30-day completion rate, total completions, and last missed day.
+
+### 54. Recurring tasks ✅ done (iteration 12)
+`/addtask <text> every:daily|weekly|monthly` — creates a recurring task with an auto-set first due date. `/donetask` archives a completion record and rolls the due date forward (daily +1d, weekly +7d, monthly same-day next month). Tasks display `♻️ daily/weekly/monthly` badge in `/tasks`. Tag filter also shows recurrence badge.
+
+### 55. Task tags ✅ done (iteration 12)
+Add `#tag` anywhere in task text. `/tasks #work` filters to matching tasks. Tags are case-insensitive and extracted by regex; no schema change needed.
+
+### 56. /mute and /unmute ✅ done (iteration 12)
+`/mute 4h` or `/mute 2d` — suppresses all check-ins, reminders, alerts, and nudges for the specified period (stored as UTC ISO timestamp in `muted_until`). `/unmute` cancels early. `/mute` with no args shows current status. `/mystats` displays mute status.
+
+### 57. /limit ✅ done (iteration 12)
+Shows real-time rate limit status: messages used this hour, messages remaining, visual `█░` bar.
+
+### 58. 7-day activity chart in /mystats ✅ done (iteration 12)
+`/mystats` now includes a `█░` bar for the last 7 days of activity, and the completed-task count is shown inline with the active count.
+
+### Bug fixes (iteration 12) ✅
+- `_execute_tool complete_task` now mirrors `/donetask`: rolls recurring tasks forward instead of deleting them
+- `idle_nudge` and `weekly_digest` jobs now correctly cancelled on unsubscribe (moved removal before early return)
+- `focus_cmd` arg parsing rewritten to be unambiguous: first int = task index, second int = minutes
+- Weekly digest weekday check now uses user's local timezone date, not server date
+- Weekly digest `n_done` now counts completions in the past 7 days, not all-time
+- `_execute_tool complete_task` now calls `_check_milestones` for non-recurring completions
+- Tag-filtered task display now shows ♻️ recurring indicator
+- `_execute_tool add_task` returns a warning (not silent success) when `due_date` is invalid
+- `mute_status` in `/mystats` no longer has a spurious leading newline
 
 ## Implementation order
 
