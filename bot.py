@@ -311,6 +311,27 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_tracker",
+            "description": "Create a new custom tracker for the user (e.g. steps, weight, mood, sleep). Use this when the user asks to track something new that doesn't exist yet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tracker name, letters only, lowercase (e.g. 'steps', 'weight', 'mood').",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "Optional unit label (e.g. 'kg', 'km', 'hours'). Leave empty if not applicable.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -472,6 +493,21 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         if _app:
             schedule_user_reminder(_app, chat_id, reminder)
         return {"success": True, "daily_at": time_str, "message": message}
+
+    if name == "create_tracker":
+        tname = (args.get("name") or "").lower().strip()
+        unit = (args.get("unit") or "").strip()
+        if not tname or not tname.isalpha():
+            return {"error": "Tracker name must be letters only (e.g. steps, weight, mood)."}
+        if tname in RESERVED_COMMANDS:
+            return {"error": f"'{tname}' is a reserved command name. Choose a different name."}
+        trackers = user.setdefault("trackers", {})
+        if tname in trackers:
+            return {"already_exists": True, "name": tname, "unit": trackers[tname].get("unit", "")}
+        trackers[tname] = {"unit": unit, "log": []}
+        save_state(state)
+        return {"success": True, "name": tname, "unit": unit,
+                "tip": f"Tracker created. Now use log_tracker('{tname}', value) to log values."}
 
     if name == "add_journal_entry":
         text = (args.get("text") or "").strip()
@@ -677,7 +713,11 @@ def build_system_prompt(user: dict) -> str:
         "7. Correct mistakes naturally and briefly when they occur.\n"
         "8. Use your tools proactively. When a user says they want to do something, "
         "need a reminder, or mentions a goal, call the relevant tool immediately "
-        "(add_task, add_reminder, log_tracker, etc.) without asking for confirmation first.\n"
+        "(add_task, add_reminder, log_tracker, create_tracker, etc.) without asking for confirmation first.\n"
+        "9. If a user asks to track something new (steps, sleep, mood, etc.) and it doesn't exist yet, "
+        "call create_tracker first, then log_tracker to log the initial value if provided.\n"
+        "10. When asked what you can do or how to use you, explain concisely: tasks, trackers, "
+        "reminders, habits, journal, check-ins, and that the user can speak naturally.\n"
         f"{lang_instruction}"
         f"{context_section}{tracker_section}{habit_section}{focus_section}{notes_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
@@ -1212,20 +1252,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_new:
         await update.message.reply_text(
             "👋 Welcome to Secretary Bot!\n\n"
-            "I'm your personal accountability coach. Let's get set up:\n\n"
+            "I'm your AI-powered personal secretary and accountability coach. "
+            "You can talk to me in plain language — I'll understand and act.\n\n"
+            "🧠 What I can do:\n"
+            "  • Tasks — add, complete, set deadlines, tag with #hashtags\n"
+            "  • Trackers — create and log anything: weight, steps, mood, sleep…\n"
+            "  • Reminders — daily or one-time, in any language\n"
+            "  • Habits — track daily habits with streaks\n"
+            "  • Journal — save reflections, get AI insights\n"
+            "  • Check-ins — morning/evening accountability messages\n"
+            "  • …and more — just ask!\n\n"
+            "Let's get set up in 4 steps:\n\n"
             "1️⃣ Tell me about yourself:\n"
             "   /setcontext I'm a developer working on fitness and learning Spanish\n\n"
-            "2️⃣ Set your timezone — easiest way: 📍 share your location\n"
+            "2️⃣ Set your timezone — easiest: 📍 share your location\n"
             "   (tap the 📎 attachment icon → Location)\n"
             "   Or: /settimezone Asia/Jerusalem\n\n"
             "3️⃣ Add your first goal:\n"
             "   /addtask Exercise 3× per week\n\n"
             "4️⃣ Enable daily check-ins:\n"
             "   /subscribe\n\n"
-            "Or just start chatting! Use /help to see all commands."
+            "Or just start chatting — say something like:\n"
+            "  \"Add a tracker for my daily steps\"\n"
+            "  \"Remind me to drink water every day at 10:00\"\n"
+            "  \"What time is it?\""
         )
     else:
-        await update.message.reply_text("Secretary bot is active. Use /help for commands.")
+        await update.message.reply_text(
+            "👋 Secretary Bot is active.\n\n"
+            "You can talk to me naturally or use commands.\n"
+            "Try: \"What can you do?\" or /help for the full command list."
+        )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
