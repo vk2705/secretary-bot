@@ -269,17 +269,29 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "add_reminder",
-            "description": "Add a daily recurring reminder at a specific local time.",
+            "description": (
+                "Schedule a reminder. For relative time ('in 5 minutes', 'in 2 hours') use "
+                "delay_minutes. For a one-time reminder at a specific clock time use time + once=true. "
+                "For a recurring daily reminder use time only (once defaults to false)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "message": {"type": "string", "description": "The reminder message."},
+                    "delay_minutes": {
+                        "type": "integer",
+                        "description": "Fire once after this many minutes from now. Use for relative requests like 'in 5 minutes'. When set, time and once are ignored.",
+                    },
                     "time": {
                         "type": "string",
-                        "description": "Time in HH:MM (24h) local time, e.g. '09:30'.",
+                        "description": "Time in HH:MM (24h) local time, e.g. '09:30'. Required when delay_minutes is not set.",
                     },
-                    "message": {"type": "string", "description": "The reminder message."},
+                    "once": {
+                        "type": "boolean",
+                        "description": "If true, fire only once (not daily). Default false (daily recurring).",
+                    },
                 },
-                "required": ["time", "message"],
+                "required": ["message"],
             },
         },
     },
@@ -406,21 +418,58 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         return {"success": True, "logged": f"{value}{unit}", "tracker": tname}
 
     if name == "add_reminder":
-        time_str = (args.get("time") or "").strip()
         message = (args.get("message") or "").strip()
+        if not message:
+            return {"error": "Reminder message is required"}
+        delay_minutes = args.get("delay_minutes")
+        once = bool(args.get("once", False))
+        # ── relative: fire once after N minutes ──
+        if delay_minutes is not None:
+            try:
+                delay_minutes = int(delay_minutes)
+                assert delay_minutes > 0
+            except (ValueError, TypeError, AssertionError):
+                return {"error": "delay_minutes must be a positive integer"}
+            if not _app:
+                return {"error": "Scheduler not available"}
+            async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
+                try:
+                    await ctx.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
+                except Exception as e:
+                    logger.error("One-time reminder failed: %s", e)
+            _app.job_queue.run_once(_once_job, when=delay_minutes * 60,
+                                    name=f"once_{chat_id}_{uuid.uuid4()}")
+            return {"success": True, "once_in_minutes": delay_minutes, "message": message}
+        # ── absolute time ──
+        time_str = (args.get("time") or "").strip()
         try:
             h, m = time_str.split(":")
             assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
         except (ValueError, AssertionError):
-            return {"error": "Invalid time. Use HH:MM (e.g. 09:30)"}
-        if not message:
-            return {"error": "Reminder message is required"}
+            return {"error": "time is required (HH:MM) when delay_minutes is not set"}
+        if once:
+            # one-shot at a specific clock time
+            if not _app:
+                return {"error": "Scheduler not available"}
+            user_tz = user.get("timezone", "UTC")
+            delay = _parse_once_delay(time_str, user_tz)
+            if delay is None or delay <= 0:
+                return {"error": f"Time {time_str} is in the past or invalid"}
+            async def _once_time_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
+                try:
+                    await ctx.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
+                except Exception as e:
+                    logger.error("One-time reminder failed: %s", e)
+            _app.job_queue.run_once(_once_time_job, when=delay,
+                                    name=f"once_{chat_id}_{uuid.uuid4()}")
+            return {"success": True, "once_at": time_str, "message": message}
+        # ── daily recurring ──
         reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False}
         user.setdefault("reminders", []).append(reminder)
         save_state(state)
         if _app:
             schedule_user_reminder(_app, chat_id, reminder)
-        return {"success": True, "time": time_str, "message": message}
+        return {"success": True, "daily_at": time_str, "message": message}
 
     if name == "add_journal_entry":
         text = (args.get("text") or "").strip()
@@ -1809,9 +1858,28 @@ async def show_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
+    tz = user.get("timezone", "UTC")
+
+    # Optional: /subscribe HH:MM HH:MM sets check-in times in one step
+    if len(context.args) >= 2:
+        def _valid(s):
+            try:
+                h, m = s.split(":")
+                assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+                return True
+            except (ValueError, AssertionError):
+                return False
+        morning_t, evening_t = context.args[0], context.args[1]
+        if not _valid(morning_t) or not _valid(evening_t):
+            await update.message.reply_text(
+                "Invalid time format. Use: /subscribe HH:MM HH:MM (24h)\n"
+                "Example: /subscribe 09:00 22:00"
+            )
+            return
+        user["checkin_times"] = {"morning": morning_t, "evening": evening_t}
+
     user["checkin_enabled"] = True
     save_state(state)
-    tz = user.get("timezone", "UTC")
     times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
@@ -1831,18 +1899,35 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Daily check-ins, deadline alerts, and habit reminders disabled.")
 
 
+def _normalize_tz(tz_str: str) -> str:
+    """Convert UTC±N offsets to valid IANA Etc/GMT∓N names (POSIX sign is inverted)."""
+    import re as _re
+    m = _re.fullmatch(r"UTC([+-])(\d{1,2})", tz_str.strip(), _re.IGNORECASE)
+    if m:
+        sign, hours = m.group(1), int(m.group(2))
+        if hours == 0:
+            return "UTC"
+        # POSIX Etc/GMT sign is opposite to UTC offset
+        posix_sign = "-" if sign == "+" else "+"
+        return f"Etc/GMT{posix_sign}{hours}"
+    return tz_str
+
+
 async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz_str = " ".join(context.args).strip()
+    tz_str = _normalize_tz(" ".join(context.args).strip())
     if not tz_str:
         await update.message.reply_text(
             "Usage: /settimezone <IANA timezone>\n"
-            "Examples: UTC  Europe/London  America/New_York  Asia/Jerusalem"
+            "Examples: UTC  UTC+3  UTC-5  Europe/London  America/New_York  Asia/Jerusalem"
         )
         return
     try:
         ZoneInfo(tz_str)
     except (ZoneInfoNotFoundError, KeyError):
-        await update.message.reply_text(f"Unknown timezone: {tz_str}")
+        await update.message.reply_text(
+            f"Unknown timezone: {tz_str}\n"
+            "Use IANA names (e.g. Europe/London, Asia/Tokyo) or UTC offsets (UTC+3, UTC-5)."
+        )
         return
     user = get_user(update.effective_chat.id)
     user["timezone"] = tz_str
