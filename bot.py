@@ -40,6 +40,7 @@ RATE_LIMIT = 30
 RATE_WINDOW = 3600
 _rate_log: dict[str, list] = defaultdict(list)
 _snooze_cache: dict[str, str] = {}  # token → reminder message
+_app = None  # set in main(); used by tool executor to schedule reminders
 
 # Reserved command names that cannot be used as tracker names
 RESERVED_COMMANDS = {
@@ -188,6 +189,220 @@ async def _check_milestones(chat_id: int, app) -> None:
                 await app.bot.send_message(chat_id=chat_id, text=m)
             except Exception as e:
                 logger.error("Milestone message failed for %s: %s", chat_id, e)
+
+
+# ─────────────────────── LLM tool definitions ───────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the user's current local time and date.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tasks",
+            "description": "Get the user's current task list with their numbers.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_task",
+            "description": "Add a new task to the user's task list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The task description."},
+                    "due_date": {
+                        "type": "string",
+                        "description": "Optional due date in YYYY-MM-DD format.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Mark a task as done and archive it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_number": {
+                        "type": "integer",
+                        "description": "1-based task number from the task list.",
+                    }
+                },
+                "required": ["task_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_tracker",
+            "description": "Log a numeric value to one of the user's custom trackers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tracker_name": {
+                        "type": "string",
+                        "description": "Name of the tracker (e.g. 'weight', 'steps').",
+                    },
+                    "value": {"type": "number", "description": "The numeric value to log."},
+                },
+                "required": ["tracker_name", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_reminder",
+            "description": "Add a daily recurring reminder at a specific local time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time": {
+                        "type": "string",
+                        "description": "Time in HH:MM (24h) local time, e.g. '09:30'.",
+                    },
+                    "message": {"type": "string", "description": "The reminder message."},
+                },
+                "required": ["time", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_journal_entry",
+            "description": "Save a journal entry for the user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The journal entry text."}
+                },
+                "required": ["text"],
+            },
+        },
+    },
+]
+
+
+async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
+    """Run one tool call and return a JSON-serialisable result dict."""
+    user = get_user(chat_id)
+
+    if name == "get_current_time":
+        try:
+            tz = ZoneInfo(user.get("timezone", "UTC"))
+        except Exception:
+            tz = ZoneInfo("UTC")
+        now = datetime.now(tz)
+        return {
+            "time": now.strftime("%H:%M"),
+            "date": now.strftime("%Y-%m-%d"),
+            "weekday": now.strftime("%A"),
+            "timezone": user.get("timezone", "UTC"),
+        }
+
+    if name == "get_tasks":
+        tasks = user.get("tasks", [])
+        return {
+            "count": len(tasks),
+            "tasks": [
+                {"number": i + 1, "text": _task_text(t), "due": _task_due(t)}
+                for i, t in enumerate(tasks)
+            ],
+        }
+
+    if name == "add_task":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {"error": "Task text is required"}
+        due = args.get("due_date")
+        if due:
+            try:
+                date.fromisoformat(due)
+            except ValueError:
+                due = None
+        task = {"text": text, "due": due} if due else text
+        user["tasks"].append(task)
+        save_state(state)
+        return {"success": True, "task": text, "due": due}
+
+    if name == "complete_task":
+        n = int(args.get("task_number", 0))
+        tasks = user.get("tasks", [])
+        if n < 1 or n > len(tasks):
+            return {"error": f"Task {n} not found. There are {len(tasks)} tasks."}
+        completed = tasks.pop(n - 1)
+        archived = user.setdefault("archived_tasks", [])
+        archived.append({
+            "text": _task_text(completed),
+            "due": _task_due(completed),
+            "completed_at": datetime.utcnow().isoformat(),
+        })
+        if len(archived) > 100:
+            user["archived_tasks"] = archived[-100:]
+        save_state(state)
+        return {"success": True, "completed": _task_text(completed)}
+
+    if name == "log_tracker":
+        tname = (args.get("tracker_name") or "").lower().strip()
+        trackers = user.get("trackers", {})
+        if tname not in trackers:
+            return {"error": f"Tracker '{tname}' not found.", "available": list(trackers.keys())}
+        try:
+            value = float(args["value"])
+        except (TypeError, ValueError, KeyError):
+            return {"error": "value must be a number"}
+        log = trackers[tname].setdefault("log", [])
+        log.append({"ts": datetime.utcnow().isoformat(), "value": value})
+        if len(log) > MAX_LOG_ENTRIES:
+            trackers[tname]["log"] = log[-MAX_LOG_ENTRIES:]
+        unit = trackers[tname].get("unit", "")
+        save_state(state)
+        return {"success": True, "logged": f"{value}{unit}", "tracker": tname}
+
+    if name == "add_reminder":
+        time_str = (args.get("time") or "").strip()
+        message = (args.get("message") or "").strip()
+        try:
+            h, m = time_str.split(":")
+            assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+        except (ValueError, AssertionError):
+            return {"error": "Invalid time. Use HH:MM (e.g. 09:30)"}
+        if not message:
+            return {"error": "Reminder message is required"}
+        reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False}
+        user.setdefault("reminders", []).append(reminder)
+        save_state(state)
+        if _app:
+            schedule_user_reminder(_app, chat_id, reminder)
+        return {"success": True, "time": time_str, "message": message}
+
+    if name == "add_journal_entry":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {"error": "Journal text is required"}
+        journal = user.setdefault("journal", [])
+        journal.append({"ts": datetime.utcnow().isoformat(), "entry": text})
+        if len(journal) > MAX_JOURNAL_ENTRIES:
+            user["journal"] = journal[-MAX_JOURNAL_ENTRIES:]
+        save_state(state)
+        return {"success": True}
+
+    return {"error": f"Unknown tool: {name}"}
 
 
 # ─────────────────────── habit helpers ───────────────────────
@@ -375,20 +590,65 @@ async def chat(chat_id: int, user_message: str, system: str = None) -> str:
     user = get_user(chat_id)
     _touch_activity(user)
     system = system or build_system_prompt(user)
-    user["history"].append({"role": "user", "content": user_message})
-    if len(user["history"]) > MAX_HISTORY:
-        user["history"] = user["history"][-MAX_HISTORY:]
+    client = get_llm_client(user)
+    model = get_model(user)
 
+    # Build the full message list (history + new user message)
+    messages = (
+        [{"role": "system", "content": system}]
+        + user["history"]
+        + [{"role": "user", "content": user_message}]
+    )
+
+    reply = None
     try:
-        response = await get_llm_client(user).chat.completions.create(
-            model=get_model(user),
-            messages=[{"role": "system", "content": system}] + user["history"],
-            max_tokens=600,
-            temperature=0.7,
-        )
-        reply = response.choices[0].message.content.strip()
+        # Tool call loop — up to 5 rounds
+        for _round in range(5):
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=600,
+                    temperature=0.7,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+            except Exception as tool_err:
+                # Model may not support tools (e.g. custom model); retry without
+                err_str = str(tool_err).lower()
+                if any(w in err_str for w in ("tool", "function", "unsupported")):
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        max_tokens=600,
+                        temperature=0.7,
+                    )
+                else:
+                    raise
+
+            msg = response.choices[0].message
+            if not msg.tool_calls:
+                reply = (msg.content or "").strip()
+                break
+
+            # Execute each tool call and append results
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                result = await _execute_tool(chat_id, tc.function.name, args)
+                logger.info("Tool %s(%s) → %s", tc.function.name, args, result)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+        else:
+            reply = "I got stuck in a loop. Please try again."
+
     except Exception as e:
-        user["history"].pop()  # don't keep the message without a reply
         logger.error("LLM call failed for %s (%s): %s", chat_id, type(e).__name__, e)
         err = str(e).lower()
         if "auth" in err or "401" in err or "incorrect api key" in err:
@@ -396,10 +656,14 @@ async def chat(chat_id: int, user_message: str, system: str = None) -> str:
         if "rate" in err or "429" in err:
             return "⚠️ API rate limit hit. Try again in a moment."
         if "model" in err and "not found" in err:
-            return f"⚠️ Model not found. Use /setmodel to pick a valid model."
+            return "⚠️ Model not found. Use /setmodel to pick a valid model."
         return "⚠️ AI service temporarily unavailable. Please try again."
 
+    # Store only the user turn and final text reply in history
+    user["history"].append({"role": "user", "content": user_message})
     user["history"].append({"role": "assistant", "content": reply})
+    if len(user["history"]) > MAX_HISTORY:
+        user["history"] = user["history"][-MAX_HISTORY:]
     save_state(state)
     return reply
 
@@ -2253,6 +2517,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     restore_all_jobs(app)
+
+    global _app
+    _app = app  # allow _execute_tool(add_reminder) to schedule jobs
 
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)

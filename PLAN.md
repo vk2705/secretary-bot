@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 9 complete
+## Status: Iteration 10 complete
 
 ---
 
@@ -187,6 +187,18 @@ Evening check-in prompt now asks the user to share one thing they're grateful fo
 
 ### 47. Stale-tracker reminder in morning check-in ✅ done (iteration 9)
 Morning check-in dynamically detects trackers with no log in 2+ days and includes a nudge to log them, by name.
+
+### 48. LLM function calling / tool use ✅ done (iteration 10)
+The AI can now take direct actions mid-conversation using OpenAI-compatible function calling. `chat()` runs a tool loop (up to 5 rounds); tool results are fed back to the model before the final reply. Tool schemas not supported by a user's custom model trigger an automatic no-tools fallback. Only the final user message + text reply are stored in history (tool messages are ephemeral).
+
+**7 tools implemented:**
+- `get_current_time` — user's local datetime (timezone-aware)
+- `get_tasks` — fresh task list with numbers and due dates
+- `add_task(text, due_date?)` — add a task mid-conversation ("remind me to call the dentist next Friday")
+- `complete_task(task_number)` — mark a task done and archive it
+- `log_tracker(tracker_name, value)` — log a numeric value ("I weighed 74kg this morning")
+- `add_reminder(time, message)` — schedule a daily reminder and register the job immediately
+- `add_journal_entry(text)` — save a journal entry when the user describes their day
 
 ## Implementation order
 
