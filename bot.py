@@ -1,10 +1,13 @@
 import os
 import re
+import sys
 import json
 import time
 import logging
 import sqlite3
 import uuid
+import calendar
+import tempfile
 from collections import defaultdict
 from datetime import datetime, date, timedelta, time as dt_time
 from io import BytesIO
@@ -51,10 +54,11 @@ def _get_fernet() -> Fernet:
     if not MASTER_KEY:
         # Auto-generate for single-node dev; loudly warn that it won't survive restart
         generated = Fernet.generate_key().decode()
+        # Print the key to stderr only (never into the persistent log file)
+        print(f"MASTER_KEY={generated}", file=sys.stderr, flush=True)
         logger.warning(
-            "MASTER_KEY not set in env — generated a temporary key. "
-            "API keys will be unreadable after restart. "
-            "Add to env file: MASTER_KEY=%s", generated
+            "MASTER_KEY not set in env — generated a temporary key (printed to stderr). "
+            "API keys will be unreadable after restart until you add MASTER_KEY to your env file."
         )
         MASTER_KEY = generated
     try:
@@ -271,7 +275,7 @@ def db_get_key(chat_id: str) -> str | None:
         return None
     try:
         return _get_fernet().decrypt(row[0].encode()).decode()
-    except (InvalidToken, Exception):
+    except Exception:
         logger.warning("Failed to decrypt key for %s — possibly wrong MASTER_KEY", chat_id)
         return None
 
@@ -311,6 +315,11 @@ def db_add_episodic_memory(chat_id: str, event: str, ttl_days: int = 30) -> None
 def db_get_episodic_memory(chat_id: str, limit: int = 20) -> list[sqlite3.Row]:
     now = datetime.utcnow().isoformat()
     with _db() as con:
+        # Purge expired entries opportunistically to keep the table bounded.
+        con.execute(
+            "DELETE FROM episodic_memory WHERE chat_id=? AND expires_at <= ?",
+            (str(chat_id), now)
+        )
         return con.execute(
             "SELECT id,event,ts FROM episodic_memory "
             "WHERE chat_id=? AND expires_at > ? ORDER BY id DESC LIMIT ?",
@@ -411,8 +420,19 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    # Atomic write: dump to a temp file in the same dir, then replace.
+    d = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 state = load_state()
@@ -626,7 +646,9 @@ TOOLS = [
             "description": (
                 "Silently save anything worth remembering: facts the user shares about themselves, "
                 "decisions, observations, plans, or reflections. "
-                "Use type='note' for facts/plans/short info, 'journal' for reflections/day summaries. "
+                "Use type='profile' for stable facts about the user (name, goals, preferences), "
+                "'episodic' for time-bound events worth recalling for ~30 days, "
+                "'note' for general facts/plans/short info, 'journal' for reflections/day summaries. "
                 "Call this automatically whenever the user shares something meaningful — no need for an explicit command."
             ),
             "parameters": {
@@ -635,8 +657,8 @@ TOOLS = [
                     "text": {"type": "string", "description": "The content to save."},
                     "type": {
                         "type": "string",
-                        "enum": ["note", "journal"],
-                        "description": "'note' for facts/plans, 'journal' for reflections.",
+                        "enum": ["profile", "episodic", "note", "journal"],
+                        "description": "'profile' for stable user facts, 'episodic' for time-bound events, 'note' for facts/plans, 'journal' for reflections.",
                     },
                 },
                 "required": ["text"],
@@ -888,7 +910,6 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             elif recur == "weekly":
                 next_due = base + timedelta(weeks=1)
             else:
-                import calendar
                 m = base.month % 12 + 1
                 y = base.year + (1 if base.month == 12 else 0)
                 d = min(base.day, calendar.monthrange(y, m)[1])
@@ -1243,8 +1264,7 @@ def _tasks_for_prompt(tasks: list) -> str:
 
 # ─────────────────────── LLM helpers ───────────────────────
 
-def get_llm_client(user: dict) -> AsyncOpenAI:
-    chat_id = str(next((k for k, v in state["users"].items() if v is user), "0"))
+def get_llm_client(user: dict, chat_id: int = 0) -> AsyncOpenAI:
     user_key = db_get_key(chat_id) or user["llm"].get("api_key")  # DB first, state fallback
     if user_key:
         if user_key.startswith("gsk_"):
@@ -1255,8 +1275,7 @@ def get_llm_client(user: dict) -> AsyncOpenAI:
     return AsyncOpenAI(api_key=DEFAULT_API_KEY)
 
 
-def get_model(user: dict) -> str:
-    chat_id = str(next((k for k, v in state["users"].items() if v is user), "0"))
+def get_model(user: dict, chat_id: int = 0) -> str:
     user_key = db_get_key(chat_id) or user["llm"].get("api_key")
     user_model = user["llm"].get("model")
     if user_key:
@@ -1367,8 +1386,8 @@ async def chat(chat_id: int, user_message: str, system: str = None) -> str:
     user = get_user(chat_id)
     _touch_activity(user)
     system = system or build_system_prompt(user, chat_id)
-    client = get_llm_client(user)
-    model = get_model(user)
+    client = get_llm_client(user, chat_id)
+    model = get_model(user, chat_id)
 
     # Build the full message list (history + new user message)
     messages = (
@@ -1709,8 +1728,8 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
                 if (t.get("completed_at") or "")[:10] >= week_cutoff
             )
             journal_count = len([
-                e for e in u.get("journal", [])
-                if e["ts"][:10] >= week_cutoff
+                r for r in db_get_journal(str(_cid))
+                if r["ts"][:10] >= week_cutoff
             ])
             prompt = (
                 f"Weekly digest for this user:\n"
@@ -1787,7 +1806,6 @@ def restore_all_jobs(app: Application) -> None:
 # ─────────────────────── tracker helpers ───────────────────────
 
 def _days_ago_iso(n: int) -> str:
-    from datetime import timedelta
     return (datetime.utcnow() - timedelta(days=n)).isoformat()
 
 
@@ -2096,7 +2114,6 @@ async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Same day next month (clamp to last day of month)
                 m = base.month % 12 + 1
                 y = base.year + (1 if base.month == 12 else 0)
-                import calendar
                 d = min(base.day, calendar.monthrange(y, m)[1])
                 next_due = date(y, m, d)
             user["tasks"][idx] = {
