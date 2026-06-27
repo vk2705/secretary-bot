@@ -39,6 +39,7 @@ MAX_JOURNAL_ENTRIES = 200
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
 _rate_log: dict[str, list] = defaultdict(list)
+_snooze_cache: dict[str, str] = {}  # token → reminder message
 
 # Reserved command names that cannot be used as tracker names
 RESERVED_COMMANDS = {
@@ -49,6 +50,7 @@ RESERVED_COMMANDS = {
     "streak", "adminstats", "habit", "mystats", "pomodoro",
     "quiethours", "insights", "setcheckin",
     "donetask", "archive", "reset", "help",
+    "prioritize", "today", "note", "notes", "removenote", "search",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -68,6 +70,8 @@ def _new_user(**overrides) -> dict:
         "quiet_hours": {"start": None, "end": None},
         "checkin_times": {"morning": "08:00", "evening": "21:00"},
         "archived_tasks": [],
+        "notes": [],
+        "today_focus": {"date": "", "text": ""},
         "llm": {"model": None, "api_key": None},
     }
     base.update(overrides)
@@ -295,6 +299,20 @@ def build_system_prompt(user: dict) -> str:
     )
 
     tasks_str = _tasks_for_prompt(user["tasks"])
+
+    focus = user.get("today_focus", {})
+    today_str = date.today().isoformat()
+    focus_section = (
+        f"\nToday's focus: {focus['text']}\n"
+        if focus.get("date") == today_str and focus.get("text") else ""
+    )
+
+    notes = user.get("notes", [])
+    notes_section = (
+        "\nUser's quick notes:\n" + "\n".join(f"  • {n}" for n in notes[-10:]) + "\n"
+        if notes else ""
+    )
+
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
@@ -305,7 +323,7 @@ def build_system_prompt(user: dict) -> str:
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
         "7. Correct English mistakes naturally and briefly when they occur.\n"
-        f"{context_section}{tracker_section}{habit_section}"
+        f"{context_section}{tracker_section}{habit_section}{focus_section}{notes_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
 
@@ -420,7 +438,15 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
         if _is_quiet_now(get_user(_cid)):
             return
         try:
-            await context.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
+            import time as _time
+            token = f"{_cid}_{int(_time.monotonic() * 1000) % 10_000_000}"
+            _snooze_cache[token] = _msg
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
+            ]])
+            await context.bot.send_message(
+                chat_id=_cid, text=f"⏰ Reminder: {_msg}", reply_markup=keyboard
+            )
         except Exception as e:
             logger.error("Reminder failed for %s: %s", _cid, e)
 
@@ -638,7 +664,13 @@ _HELP_TEXT = (
     "Tasks:\n"
     "  /tasks  /addtask [due:YYYY-MM-DD]  /removetask <n>\n"
     "  /donetask <n>  — mark done & archive\n"
+    "  /prioritize <n>  — move to top\n"
     "  /archive  — view completed tasks\n\n"
+    "Focus & Notes:\n"
+    "  /today [<focus>]  — set/view today's intention\n"
+    "  /note <text>  — quick note\n"
+    "  /notes  /removenote <n>\n"
+    "  /search <query>  — search tasks, notes, journal\n\n"
     "Profile:\n"
     "  /setcontext <about you>  /context\n"
     "  /settimezone <IANA>  — e.g. Asia/Jerusalem\n"
@@ -649,7 +681,7 @@ _HELP_TEXT = (
     "  /quiethours HH:MM HH:MM  — silence window\n"
     "  /checkin  — manual check-in\n\n"
     "Reminders:\n"
-    "  /remind add HH:MM <msg>  — daily\n"
+    "  /remind add HH:MM <msg>  — daily (snooze button included)\n"
     "  /remind once 30m|2h|HH:MM <msg>\n"
     "  /remind list  /remind remove <n>\n\n"
     "Habits:\n"
@@ -808,6 +840,110 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Your timezone and API settings were kept.\n"
         "Use /start to set up again."
     )
+
+
+async def prioritize_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("Usage: /prioritize <number>  (moves task to top)")
+        return
+    try:
+        idx = int(context.args[0]) - 1
+        task = user["tasks"].pop(idx)
+        user["tasks"].insert(0, task)
+        save_state(state)
+        await update.message.reply_text(f"⬆️ Moved to top: {_task_text(task)}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /prioritize <number>  (use /tasks to see numbers)")
+
+
+async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    today_str = date.today().isoformat()
+    if not context.args:
+        focus = user.get("today_focus", {})
+        if focus.get("date") == today_str and focus.get("text"):
+            await update.message.reply_text(f"🎯 Today's focus: {focus['text']}")
+        else:
+            await update.message.reply_text(
+                "No focus set for today.\nUse /today <your focus for today> to set one."
+            )
+        return
+    text = " ".join(context.args).strip()
+    user["today_focus"] = {"date": today_str, "text": text}
+    save_state(state)
+    await update.message.reply_text(f"🎯 Today's focus set: {text}")
+
+
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("Usage: /note <text>")
+        return
+    text = " ".join(context.args).strip()
+    notes = user.setdefault("notes", [])
+    notes.append(text)
+    if len(notes) > 50:
+        user["notes"] = notes[-50:]
+    save_state(state)
+    await update.message.reply_text(f"📝 Note saved.")
+
+
+async def notes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    notes = user.get("notes", [])
+    if not notes:
+        await update.message.reply_text("No notes yet. Use /note <text> to add one.")
+        return
+    lines = [f"{i+1}. {n}" for i, n in enumerate(notes)]
+    await update.message.reply_text("📝 Notes:\n" + "\n".join(lines))
+
+
+async def removenote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("Usage: /removenote <number>")
+        return
+    try:
+        idx = int(context.args[0]) - 1
+        removed = user["notes"].pop(idx)
+        save_state(state)
+        await update.message.reply_text(f"Removed: {removed}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /removenote <number>  (use /notes to see numbers)")
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("Usage: /search <query>")
+        return
+    q = " ".join(context.args).lower()
+    results = []
+
+    for i, t in enumerate(user.get("tasks", []), 1):
+        if q in _task_text(t).lower():
+            results.append(f"📋 Task {i}: {_task_text(t)}")
+
+    for entry in user.get("archived_tasks", []):
+        if q in entry["text"].lower():
+            results.append(f"✅ Done ({entry.get('completed_at','')[:10]}): {entry['text']}")
+
+    for i, n in enumerate(user.get("notes", []), 1):
+        if q in n.lower():
+            results.append(f"📝 Note {i}: {n}")
+
+    for entry in user.get("journal", []):
+        if q in entry["entry"].lower():
+            snippet = entry["entry"][:80].replace("\n", " ")
+            results.append(f"📓 Journal ({entry['ts'][:10]}): {snippet}…")
+
+    if not results:
+        await update.message.reply_text(f'No results for "{q}".')
+    else:
+        await update.message.reply_text(
+            f'Search results for "{q}" ({len(results)} found):\n\n' + "\n".join(results[:20])
+        )
 
 
 async def set_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1591,6 +1727,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = query.from_user.id
 
+    # ── snooze button from reminder ──
+    if query.data.startswith("snooze_"):
+        parts = query.data.split("_")
+        # format: snooze_{cid}_{timestamp_token}_{minutes}
+        # token is everything between first and last underscore segment
+        minutes = int(parts[-1])
+        token = "_".join(parts[1:-1])
+        msg_text = _snooze_cache.pop(token, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if not msg_text:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ Snooze expired.")
+            return
+
+        async def _snooze_fire(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _m=msg_text):
+            await ctx.bot.send_message(chat_id=_cid, text=f"⏰ (Snoozed) {_m}")
+
+        context.application.job_queue.run_once(_snooze_fire, when=minutes * 60)
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"⏱ Snoozed {minutes} min. I'll remind you again."
+        )
+        return
+
     if not query.data.startswith("ci:"):
         return
 
@@ -1654,6 +1815,12 @@ def main():
     app.add_handler(CommandHandler("donetask", done_task))
     app.add_handler(CommandHandler("archive", show_archive))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("prioritize", prioritize_task))
+    app.add_handler(CommandHandler("today", today_cmd))
+    app.add_handler(CommandHandler("note", note_cmd))
+    app.add_handler(CommandHandler("notes", notes_cmd))
+    app.add_handler(CommandHandler("removenote", removenote_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("setcontext", set_context))
     app.add_handler(CommandHandler("context", show_context))
     app.add_handler(CommandHandler("subscribe", subscribe))

@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 6 complete
+## Status: Iteration 7 complete
 
 ---
 
@@ -130,6 +130,21 @@ Added `python-telegram-bot[job-queue]>=21.6`, `openai>=1.0.0`, `tzdata`.
 
 ### 28. CLAUDE.md rewrite ✅ done (iteration 6)
 Full rewrite with current architecture, state schema, scheduling table, handler order, LLM routing, and complete command reference.
+
+### 29. Daily focus / intention ✅ done (iteration 7)
+`/today <text>` — sets today's focus (date-scoped; auto-expires). `/today` with no args shows current focus. Focus injected into AI system prompt and visible in check-ins.
+
+### 30. Quick notes scratchpad ✅ done (iteration 7)
+`/note <text>` — appends to a persistent notes list (max 50). `/notes` — numbered list. `/removenote <n>` — delete by index. Notes appear in AI system prompt (last 10).
+
+### 31. Task prioritization ✅ done (iteration 7)
+`/prioritize <n>` — moves task n to position 1 without deleting it. Instant reordering for focus.
+
+### 32. Reminder snooze button ✅ done (iteration 7)
+Daily reminders now include a `🔁 Snooze 30 min` inline button. Tapping schedules a one-shot re-fire 30 minutes later using a `_snooze_cache` token map (no state persistence needed).
+
+### 33. Cross-data search ✅ done (iteration 7)
+`/search <query>` — case-insensitive substring search across active tasks, archived tasks, notes, and journal entries. Returns grouped results (up to 20).
 
 ## Implementation order
 
