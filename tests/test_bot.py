@@ -82,6 +82,13 @@ def _patched_exists(path):
 with patch("os.path.exists", side_effect=_patched_exists):
     import bot  # noqa: E402
 
+# Initialise SQLite DB in a temp file for tests (shared across connections)
+import tempfile as _tempfile
+_db_tmp = _tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+bot.DB_FILE = _db_tmp.name
+_db_tmp.close()
+bot._init_db()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -415,7 +422,8 @@ class TestExecuteToolUnit:
         bot.state["users"]["10"] = fresh_user()
         result = run(bot._execute_tool(10, "add_journal_entry", {"text": "Had a great day"}))
         assert result["success"] is True
-        assert bot.state["users"]["10"]["journal"][0]["entry"] == "Had a great day"
+        rows = bot.db_get_journal("10", limit=5)
+        assert any(r["entry"] == "Had a great day" for r in rows)
 
     def test_unknown_tool_returns_error(self):
         bot.state["users"]["10"] = fresh_user()

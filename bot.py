@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+import sqlite3
 import uuid
 from collections import defaultdict
 from datetime import datetime, date, timedelta, time as dt_time
@@ -33,9 +34,8 @@ MY_CHAT_ID = os.environ.get("MY_CHAT_ID")
 DEFAULT_MODEL = "gpt-4o-mini"
 
 STATE_FILE = "state.json"
+DB_FILE = "bot_memory.db"
 MAX_HISTORY = 20
-MAX_LOG_ENTRIES = 500
-MAX_JOURNAL_ENTRIES = 200
 
 # Rate limiting: max AI calls per hour per user
 RATE_LIMIT = 30
@@ -43,6 +43,130 @@ RATE_WINDOW = 3600
 _rate_log: dict[str, list] = defaultdict(list)
 _snooze_cache: dict[str, str] = {}  # token → reminder message
 _app = None  # set in main(); used by tool executor to schedule reminders
+
+
+# ─────────────────────── SQLite memory store ───────────────────────
+
+def _db() -> sqlite3.Connection:
+    """Return a thread-local SQLite connection with WAL mode."""
+    con = sqlite3.connect(DB_FILE, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _init_db() -> None:
+    """Create tables and migrate existing notes/journal from state.json."""
+    with _db() as con:
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT    NOT NULL,
+                text    TEXT    NOT NULL,
+                ts      TEXT    NOT NULL,
+                auto    INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS journal (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT    NOT NULL,
+                entry   TEXT    NOT NULL,
+                ts      TEXT    NOT NULL,
+                auto    INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_chat   ON notes(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_journal_chat ON journal(chat_id);
+        """)
+    # one-time migration of notes/journal still living in state.json
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            changed = False
+            with _db() as con:
+                for cid, u in s.get("users", {}).items():
+                    for n in u.pop("notes", []):
+                        con.execute(
+                            "INSERT INTO notes(chat_id,text,ts,auto) VALUES(?,?,?,0)",
+                            (cid, n, datetime.utcnow().isoformat())
+                        )
+                        changed = True
+                    for e in u.pop("journal", []):
+                        con.execute(
+                            "INSERT INTO journal(chat_id,entry,ts,auto) VALUES(?,?,?,0)",
+                            (cid, e["entry"], e.get("ts", datetime.utcnow().isoformat()))
+                        )
+                        changed = True
+            if changed:
+                with open(STATE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(s, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("DB migration failed: %s", e)
+
+
+# ── notes helpers ──
+
+def db_add_note(chat_id: str, text: str, auto: bool = False) -> int:
+    with _db() as con:
+        cur = con.execute(
+            "INSERT INTO notes(chat_id,text,ts,auto) VALUES(?,?,?,?)",
+            (str(chat_id), text, datetime.utcnow().isoformat(), int(auto))
+        )
+        return cur.lastrowid
+
+
+def db_get_notes(chat_id: str) -> list[sqlite3.Row]:
+    with _db() as con:
+        return con.execute(
+            "SELECT id,text,ts,auto FROM notes WHERE chat_id=? ORDER BY id",
+            (str(chat_id),)
+        ).fetchall()
+
+
+def db_remove_note(chat_id: str, row_id: int) -> bool:
+    with _db() as con:
+        cur = con.execute(
+            "DELETE FROM notes WHERE id=? AND chat_id=?",
+            (row_id, str(chat_id))
+        )
+        return cur.rowcount > 0
+
+
+def db_search_notes(chat_id: str, q: str) -> list[sqlite3.Row]:
+    with _db() as con:
+        return con.execute(
+            "SELECT id,text,ts FROM notes WHERE chat_id=? AND lower(text) LIKE ?",
+            (str(chat_id), f"%{q.lower()}%")
+        ).fetchall()
+
+
+# ── journal helpers ──
+
+def db_add_journal(chat_id: str, entry: str, auto: bool = False) -> int:
+    with _db() as con:
+        cur = con.execute(
+            "INSERT INTO journal(chat_id,entry,ts,auto) VALUES(?,?,?,?)",
+            (str(chat_id), entry, datetime.utcnow().isoformat(), int(auto))
+        )
+        return cur.lastrowid
+
+
+def db_get_journal(chat_id: str, limit: int = 0) -> list[sqlite3.Row]:
+    sql = "SELECT id,entry,ts,auto FROM journal WHERE chat_id=? ORDER BY id DESC"
+    params: tuple = (str(chat_id),)
+    if limit:
+        sql += " LIMIT ?"
+        params = (str(chat_id), limit)
+    with _db() as con:
+        rows = con.execute(sql, params).fetchall()
+    return list(reversed(rows))
+
+
+def db_search_journal(chat_id: str, q: str) -> list[sqlite3.Row]:
+    with _db() as con:
+        return con.execute(
+            "SELECT id,entry,ts FROM journal WHERE chat_id=? AND lower(entry) LIKE ?",
+            (str(chat_id), f"%{q.lower()}%")
+        ).fetchall()
 
 # Reserved command names that cannot be used as tracker names
 RESERVED_COMMANDS = {
@@ -314,6 +438,47 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "save_memory",
+            "description": (
+                "Silently save anything worth remembering: facts the user shares about themselves, "
+                "decisions, observations, plans, or reflections. "
+                "Use type='note' for facts/plans/short info, 'journal' for reflections/day summaries. "
+                "Call this automatically whenever the user shares something meaningful — no need for an explicit command."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The content to save."},
+                    "type": {
+                        "type": "string",
+                        "enum": ["note", "journal"],
+                        "description": "'note' for facts/plans, 'journal' for reflections.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_journal",
+            "description": "Retrieve the user's recent journal entries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of recent entries to return (default 10).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_tracker",
             "description": "Create a new custom tracker for the user (e.g. steps, weight, mood, sleep). Use this when the user asks to track something new that doesn't exist yet.",
             "parameters": {
@@ -564,8 +729,8 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             return {"error": "value must be a number"}
         log = trackers[tname].setdefault("log", [])
         log.append({"ts": datetime.utcnow().isoformat(), "value": value})
-        if len(log) > MAX_LOG_ENTRIES:
-            trackers[tname]["log"] = log[-MAX_LOG_ENTRIES:]
+        if len(log) > 5000:  # keep last 5000 entries per tracker
+            trackers[tname]["log"] = log[-5000:]
         unit = trackers[tname].get("unit", "")
         save_state(state)
         return {"success": True, "logged": f"{value}{unit}", "tracker": tname}
@@ -643,12 +808,24 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         text = (args.get("text") or "").strip()
         if not text:
             return {"error": "Journal text is required"}
-        journal = user.setdefault("journal", [])
-        journal.append({"ts": datetime.utcnow().isoformat(), "entry": text})
-        if len(journal) > MAX_JOURNAL_ENTRIES:
-            user["journal"] = journal[-MAX_JOURNAL_ENTRIES:]
-        save_state(state)
+        db_add_journal(chat_id, text, auto=False)
         return {"success": True}
+
+    if name == "save_memory":
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {"error": "Text is required"}
+        kind = (args.get("type") or "note").lower()
+        if kind == "journal":
+            db_add_journal(chat_id, text, auto=True)
+        else:
+            db_add_note(chat_id, text, auto=True)
+        return {"success": True, "saved_as": kind}
+
+    if name == "get_journal":
+        limit = int(args.get("limit") or 10)
+        rows = db_get_journal(chat_id, limit=limit)
+        return {"entries": [{"date": r["ts"][:10], "text": r["entry"]} for r in rows], "count": len(rows)}
 
     if name == "remove_task":
         n = int(args.get("task_number", 0))
@@ -725,19 +902,16 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         return {"success": True, "removed": hname}
 
     if name == "get_notes":
-        notes = user.get("notes", [])
-        return {"notes": [{"number": i + 1, "text": n} for i, n in enumerate(notes)], "count": len(notes)}
+        rows = db_get_notes(chat_id)
+        return {"notes": [{"id": r["id"], "number": i + 1, "text": r["text"]} for i, r in enumerate(rows)], "count": len(rows)}
 
     if name == "add_note":
         text = (args.get("text") or "").strip()
         if not text:
             return {"error": "Note text is required."}
-        notes = user.setdefault("notes", [])
-        notes.append(text)
-        if len(notes) > 50:
-            user["notes"] = notes[-50:]
-        save_state(state)
-        return {"success": True, "note": text, "total_notes": len(user["notes"])}
+        row_id = db_add_note(chat_id, text, auto=False)
+        total = len(db_get_notes(chat_id))
+        return {"success": True, "note": text, "total_notes": total}
 
     if name == "set_today_focus":
         text = (args.get("text") or "").strip()
@@ -755,12 +929,10 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         for i, t in enumerate(user.get("tasks", []), 1):
             if q in _task_text(t).lower():
                 results["tasks"].append({"number": i, "text": _task_text(t)})
-        for i, n in enumerate(user.get("notes", []), 1):
-            if q in n.lower():
-                results["notes"].append({"number": i, "text": n})
-        for entry in user.get("journal", []):
-            if q in entry.get("entry", "").lower():
-                results["journal"].append({"date": entry["ts"][:10], "excerpt": entry["entry"][:100]})
+        for r in db_search_notes(chat_id, q):
+            results["notes"].append({"id": r["id"], "text": r["text"]})
+        for r in db_search_journal(chat_id, q):
+            results["journal"].append({"date": r["ts"][:10], "excerpt": r["entry"][:100]})
         total = sum(len(v) for v in results.values())
         return {"query": q, "total_matches": total, **results}
 
@@ -907,7 +1079,7 @@ def get_model(user: dict) -> str:
     return user_model or DEFAULT_MODEL
 
 
-def build_system_prompt(user: dict) -> str:
+def build_system_prompt(user: dict, chat_id: int = 0) -> str:
     context_section = f"\nAbout this user: {user['context']}\n" if user["context"] else ""
 
     tracker_lines = []
@@ -937,10 +1109,17 @@ def build_system_prompt(user: dict) -> str:
         if focus.get("date") == today_str and focus.get("text") else ""
     )
 
-    notes = user.get("notes", [])
+    notes = db_get_notes(str(chat_id))
     notes_section = (
-        "\nUser's quick notes:\n" + "\n".join(f"  • {n}" for n in notes[-10:]) + "\n"
+        "\nUser's recent notes:\n" + "\n".join(f"  • {r['text']}" for r in notes[-10:]) + "\n"
         if notes else ""
+    )
+
+    # Include last few journal entries for context
+    recent_journal = db_get_journal(str(chat_id), limit=3)
+    journal_section = (
+        "\nRecent journal entries:\n" + "\n".join(f"  – {r['entry'][:80]}" for r in recent_journal) + "\n"
+        if recent_journal else ""
     )
 
     lang = user.get("language", "").strip()
@@ -967,8 +1146,11 @@ def build_system_prompt(user: dict) -> str:
         "call create_tracker first, then log_tracker to log the initial value if provided.\n"
         "10. When asked what you can do or how to use you, explain concisely: tasks, trackers, "
         "reminders, habits, journal, check-ins, and that the user can speak naturally.\n"
+        "11. Silently call save_memory whenever the user shares a personal fact, decision, plan, "
+        "or reflection that is worth remembering for future conversations. "
+        "Do NOT tell the user you are saving it — just save it in the background.\n"
         f"{lang_instruction}"
-        f"{context_section}{tracker_section}{habit_section}{focus_section}{notes_section}"
+        f"{context_section}{tracker_section}{habit_section}{focus_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
 
@@ -978,7 +1160,7 @@ def build_system_prompt(user: dict) -> str:
 async def chat(chat_id: int, user_message: str, system: str = None) -> str:
     user = get_user(chat_id)
     _touch_activity(user)
-    system = system or build_system_prompt(user)
+    system = system or build_system_prompt(user, chat_id)
     client = get_llm_client(user)
     model = get_model(user)
 
@@ -1776,34 +1958,31 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /note <text>")
         return
     text = " ".join(context.args).strip()
-    notes = user.setdefault("notes", [])
-    notes.append(text)
-    if len(notes) > 50:
-        user["notes"] = notes[-50:]
-    save_state(state)
-    await update.message.reply_text(f"📝 Note saved.")
+    db_add_note(str(update.effective_chat.id), text, auto=False)
+    await update.message.reply_text("📝 Note saved.")
 
 
 async def notes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_chat.id)
-    notes = user.get("notes", [])
-    if not notes:
+    rows = db_get_notes(str(update.effective_chat.id))
+    if not rows:
         await update.message.reply_text("No notes yet. Use /note <text> to add one.")
         return
-    lines = [f"{i+1}. {n}" for i, n in enumerate(notes)]
+    lines = [f"{i+1}. [{r['id']}] {r['text']}" for i, r in enumerate(rows)]
     await update.message.reply_text("📝 Notes:\n" + "\n".join(lines))
 
 
 async def removenote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text("Usage: /removenote <number>")
+        await update.message.reply_text("Usage: /removenote <number>\n(use /notes to see numbers)")
         return
     try:
-        idx = int(context.args[0]) - 1
-        removed = user["notes"].pop(idx)
-        save_state(state)
-        await update.message.reply_text(f"Removed: {removed}")
+        n = int(context.args[0])
+        rows = db_get_notes(str(update.effective_chat.id))
+        if n < 1 or n > len(rows):
+            raise IndexError
+        row_id = rows[n - 1]["id"]
+        db_remove_note(str(update.effective_chat.id), row_id)
+        await update.message.reply_text(f"Removed: {rows[n-1]['text']}")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /removenote <number>  (use /notes to see numbers)")
 
@@ -1824,14 +2003,12 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q in entry["text"].lower():
             results.append(f"✅ Done ({entry.get('completed_at','')[:10]}): {entry['text']}")
 
-    for i, n in enumerate(user.get("notes", []), 1):
-        if q in n.lower():
-            results.append(f"📝 Note {i}: {n}")
+    for r in db_search_notes(str(update.effective_chat.id), q):
+        results.append(f"📝 Note: {r['text']}")
 
-    for entry in user.get("journal", []):
-        if q in entry["entry"].lower():
-            snippet = entry["entry"][:80].replace("\n", " ")
-            results.append(f"📓 Journal ({entry['ts'][:10]}): {snippet}…")
+    for r in db_search_journal(str(update.effective_chat.id), q):
+        snippet = r["entry"][:80].replace("\n", " ")
+        results.append(f"📓 Journal ({r['ts'][:10]}): {snippet}…")
 
     if not results:
         await update.message.reply_text(f'No results for "{q}".')
@@ -1929,7 +2106,7 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks_str = _tasks_for_prompt(user["tasks"])
     habits = ", ".join(user.get("habits", {}).keys()) or "none"
     journal_recent = " | ".join(
-        e["entry"][:60] for e in user.get("journal", [])[-3:]
+        r["entry"][:60] for r in db_get_journal(str(chat_id), limit=3)
     ) or "no journal entries"
     prompt = (
         f"The user's profile: {ctx or 'not set'}\n"
@@ -1961,7 +2138,7 @@ async def reflect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for name, h in habits.items():
         s = _habit_streak(h.get("completions", []))
         habit_lines.append(f"{name}: {s}-day streak")
-    journal_entries = [e["entry"][:100] for e in user.get("journal", [])[-5:]]
+    reflect_journal = [r["entry"][:100] for r in db_get_journal(str(chat_id), limit=5)]
     n_done = len(user.get("archived_tasks", []))
     prompt = (
         f"User data for reflection:\n"
@@ -1969,7 +2146,7 @@ async def reflect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Tasks completed total: {n_done}\n"
         f"Active tasks: {_tasks_for_prompt(user['tasks'])}\n"
         f"Habits: {'; '.join(habit_lines) or 'none'}\n"
-        f"Recent journal (last 5): {' | '.join(journal_entries) or 'none'}\n\n"
+        f"Recent journal (last 5): {' | '.join(reflect_journal) or 'none'}\n\n"
         "Write a short personal reflection (3-5 sentences) covering: "
         "1) What patterns do you see? "
         "2) What's clearly working? "
@@ -2583,8 +2760,6 @@ async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TY
             return
         entry = {"ts": datetime.utcnow().isoformat(), "value": value}
         tracker.setdefault("log", []).append(entry)
-        if len(tracker["log"]) > MAX_LOG_ENTRIES:
-            tracker["log"] = tracker["log"][-MAX_LOG_ENTRIES:]
         save_state(state)
         unit = tracker.get("unit", "")
         await update.message.reply_text(f"✓ Logged {cmd}: {value}{unit}")
@@ -2642,11 +2817,7 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Usage: /journal <your entry>")
         return
-    user = get_user(update.effective_chat.id)
-    user.setdefault("journal", []).append({"ts": datetime.utcnow().isoformat(), "entry": text})
-    if len(user["journal"]) > MAX_JOURNAL_ENTRIES:
-        user["journal"] = user["journal"][-MAX_JOURNAL_ENTRIES:]
-    save_state(state)
+    db_add_journal(str(update.effective_chat.id), text, auto=False)
 
     prompt = f'The user just wrote this journal entry: "{text}"\nOffer a brief, warm reflection in 2-3 sentences.'
     reply = await chat(update.effective_chat.id, prompt)
@@ -2695,7 +2866,8 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "reminders": [{"time": r["time"], "message": r["message"]} for r in user.get("reminders", [])],
         "trackers": user["trackers"],
         "habits": user.get("habits", {}),
-        "journal": user["journal"],
+        "journal": [{"ts": r["ts"], "entry": r["entry"]} for r in db_get_journal(str(update.effective_chat.id))],
+        "notes": [r["text"] for r in db_get_notes(str(update.effective_chat.id))],
     }
     data_bytes = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
     bio = BytesIO(data_bytes)
@@ -3002,8 +3174,15 @@ async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["habits"] = imported["habits"]
         counts["habits"] = len(user["habits"])
     if "journal" in imported:
-        user["journal"] = imported["journal"]
-        counts["journal"] = len(user["journal"])
+        cid = str(update.effective_chat.id)
+        for e in imported["journal"]:
+            db_add_journal(cid, e.get("entry", ""), auto=False)
+        counts["journal"] = len(imported["journal"])
+    if "notes" in imported:
+        cid = str(update.effective_chat.id)
+        for n in imported["notes"]:
+            db_add_note(cid, n if isinstance(n, str) else n.get("text", ""), auto=False)
+        counts["notes"] = len(imported["notes"])
     if "reminders" in imported:
         for r in imported["reminders"]:
             r.setdefault("id", str(uuid.uuid4()))
@@ -3132,6 +3311,11 @@ async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         streak = _habit_streak(completions)
         total = len(completions)
         parts.append(f"Habit '{name}': {total} completions total, current streak {streak}d")
+
+    recent_journal = db_get_journal(str(update.effective_chat.id), limit=10)
+    if recent_journal:
+        excerpts = " | ".join(r["entry"][:80] for r in recent_journal[-3:])
+        parts.append(f"Recent journal: {excerpts}")
 
     journal = user.get("journal", [])
     if journal:
@@ -3338,6 +3522,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_import))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    _init_db()
     restore_all_jobs(app)
 
     global _app
