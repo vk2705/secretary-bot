@@ -46,7 +46,7 @@ RESERVED_COMMANDS = {
     "subscribe", "unsubscribe", "settimezone", "remind", "addtracker",
     "trackers", "removetracker", "checkin", "clear", "setmodel",
     "setapikey", "clearapikey", "journal", "weekly", "export",
-    "streak", "adminstats",
+    "streak", "adminstats", "habit", "mystats", "pomodoro",
 }
 
 # ─────────────────────── state ───────────────────────
@@ -60,6 +60,7 @@ def _new_user(**overrides) -> dict:
         "timezone": "UTC",
         "reminders": [],
         "trackers": {},
+        "habits": {},
         "journal": [],
         "activity_days": [],
         "llm": {"model": None, "api_key": None},
@@ -147,6 +148,34 @@ def _get_streak(user: dict) -> int:
     return streak
 
 
+# ─────────────────────── habit helpers ───────────────────────
+
+def _habit_streak(completions: list) -> int:
+    """Consecutive days ending today or yesterday (so streak survives the day)."""
+    days = set(completions)
+    if not days:
+        return 0
+    streak = 0
+    d = date.today()
+    if d.isoformat() not in days:
+        d -= timedelta(days=1)
+    while d.isoformat() in days:
+        streak += 1
+        d -= timedelta(days=1)
+    return streak
+
+
+def _habit_summary_lines(habits: dict) -> list[str]:
+    today = date.today().isoformat()
+    lines = []
+    for name, data in habits.items():
+        done = today in data.get("completions", [])
+        streak = _habit_streak(data.get("completions", []))
+        mark = "✓" if done else "○"
+        lines.append(f"  {mark} {name}  ({streak}d streak)")
+    return lines
+
+
 # ─────────────────────── LLM helpers ───────────────────────
 
 def get_llm_client(user: dict) -> AsyncOpenAI:
@@ -188,6 +217,12 @@ def build_system_prompt(user: dict) -> str:
         if tracker_lines else ""
     )
 
+    habit_lines = _habit_summary_lines(user.get("habits", {}))
+    habit_section = (
+        "\nToday's habits:\n" + "\n".join(habit_lines) + "\n"
+        if habit_lines else ""
+    )
+
     tasks_str = ", ".join(user["tasks"]) if user["tasks"] else "none set yet"
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
@@ -199,7 +234,7 @@ def build_system_prompt(user: dict) -> str:
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
         "7. Correct English mistakes naturally and briefly when they occur.\n"
-        f"{context_section}{tracker_section}"
+        f"{context_section}{tracker_section}{habit_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
 
@@ -372,7 +407,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /setmodel <model>  — e.g. gpt-4o\n"
         "  (Groq keys start with gsk_ and use Llama for free)\n\n"
         "More:\n"
-        "  /journal <text>  /weekly  /export  /streak"
+        "  /journal <text>  /weekly  /export  /streak  /mystats\n"
+        "  /pomodoro [min]  — focus timer\n"
+        "  /habit add|done|list|remove <name>  — daily habits\n"
+        "  (Send your export JSON to import data)"
     )
 
 
@@ -815,6 +853,7 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "timezone": user["timezone"],
         "reminders": [{"time": r["time"], "message": r["message"]} for r in user.get("reminders", [])],
         "trackers": user["trackers"],
+        "habits": user.get("habits", {}),
         "journal": user["journal"],
     }
     data_bytes = json.dumps(export, ensure_ascii=False, indent=2).encode("utf-8")
@@ -861,6 +900,180 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─────────────────────── handlers: habits ───────────────────────
+
+async def habit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    habits = user.setdefault("habits", {})
+    args = context.args
+
+    if not args or args[0].lower() in ("list", "ls"):
+        if not habits:
+            await update.message.reply_text(
+                "No habits yet. Add one with /habit add <name>"
+            )
+            return
+        lines = _habit_summary_lines(habits)
+        await update.message.reply_text("Your habits:\n" + "\n".join(lines))
+        return
+
+    sub = args[0].lower()
+
+    if sub == "add":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /habit add <name>")
+            return
+        name = args[1].lower()
+        if name in habits:
+            await update.message.reply_text(f"Habit '{name}' already exists.")
+            return
+        habits[name] = {"completions": [], "created": date.today().isoformat()}
+        save_state(state)
+        await update.message.reply_text(
+            f"Habit '{name}' added!\nMark it done today with /habit done {name}"
+        )
+
+    elif sub == "done":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /habit done <name>")
+            return
+        name = args[1].lower()
+        if name not in habits:
+            await update.message.reply_text(f"No habit named '{name}'. Use /habit list.")
+            return
+        today = date.today().isoformat()
+        completions = habits[name].setdefault("completions", [])
+        if today in completions:
+            await update.message.reply_text(f"'{name}' already marked done today.")
+            return
+        completions.append(today)
+        if len(completions) > 365:
+            habits[name]["completions"] = completions[-365:]
+        save_state(state)
+        streak = _habit_streak(completions)
+        await update.message.reply_text(f"✓ '{name}' done! 🔥 Streak: {streak} day{'s' if streak != 1 else ''}")
+
+    elif sub == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /habit remove <name>")
+            return
+        name = args[1].lower()
+        if name not in habits:
+            await update.message.reply_text(f"No habit named '{name}'.")
+            return
+        del habits[name]
+        save_state(state)
+        await update.message.reply_text(f"Habit '{name}' removed.")
+
+    else:
+        await update.message.reply_text("Usage: /habit add|done|list|remove <name>")
+
+
+# ─────────────────────── handlers: mystats & pomodoro ───────────────────────
+
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    streak = _get_streak(user)
+    total_days = len(user.get("activity_days", []))
+    activity = sorted(user.get("activity_days", []))
+    first_seen = activity[0] if activity else "N/A"
+
+    model = get_model(user)
+    has_own_key = bool(user["llm"].get("api_key"))
+    model_info = f"{model} (your key)" if has_own_key else f"{model} (default)"
+
+    lines = [
+        f"🔥 Streak: {streak} day{'s' if streak != 1 else ''}",
+        f"🗓 Active: {total_days} days (first: {first_seen})",
+        f"✅ Tasks: {len(user['tasks'])}",
+        f"📋 Trackers: {', '.join(user.get('trackers', {}).keys()) or 'none'}",
+        f"📓 Journal: {len(user.get('journal', []))} entries",
+        f"⏰ Reminders: {len(user.get('reminders', []))}",
+        f"🤖 Model: {model_info}",
+    ]
+    habit_lines = _habit_summary_lines(user.get("habits", {}))
+    if habit_lines:
+        lines.append("\nHabits today:")
+        lines.extend(habit_lines)
+
+    await update.message.reply_text("📊 Your stats:\n" + "\n".join(lines))
+
+
+async def pomodoro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    minutes = 25
+    if context.args:
+        try:
+            minutes = int(context.args[0])
+            assert 1 <= minutes <= 120
+        except (ValueError, AssertionError):
+            await update.message.reply_text("Usage: /pomodoro [minutes]  (1–120, default 25)")
+            return
+
+    chat_id = update.effective_chat.id
+
+    async def _done(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _min=minutes):
+        await ctx.bot.send_message(
+            chat_id=_cid,
+            text=f"🍅 Pomodoro done! {_min} min complete. Take a short break, then keep going."
+        )
+
+    context.application.job_queue.run_once(_done, when=minutes * 60)
+    await update.message.reply_text(f"🍅 Pomodoro started: {minutes} min. I'll ping you when it's done!")
+
+
+# ─────────────────────── handlers: import ───────────────────────
+
+async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".json"):
+        await update.message.reply_text("Please send a secretary_export.json file from /export.")
+        return
+
+    tg_file = await context.bot.get_file(doc.file_id)
+    raw = await tg_file.download_as_bytearray()
+    try:
+        imported = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        await update.message.reply_text("Invalid JSON file.")
+        return
+
+    user = get_user(update.effective_chat.id)
+    counts = {}
+
+    if "tasks" in imported:
+        user["tasks"] = imported["tasks"]
+        counts["tasks"] = len(user["tasks"])
+    if "context" in imported:
+        user["context"] = imported["context"]
+    if "timezone" in imported:
+        try:
+            ZoneInfo(imported["timezone"])
+            user["timezone"] = imported["timezone"]
+        except (ZoneInfoNotFoundError, KeyError):
+            pass
+    if "trackers" in imported:
+        user["trackers"] = imported["trackers"]
+        counts["trackers"] = len(user["trackers"])
+    if "habits" in imported:
+        user["habits"] = imported["habits"]
+        counts["habits"] = len(user["habits"])
+    if "journal" in imported:
+        user["journal"] = imported["journal"]
+        counts["journal"] = len(user["journal"])
+    if "reminders" in imported:
+        for r in imported["reminders"]:
+            r.setdefault("id", str(uuid.uuid4()))
+            r.setdefault("once", False)
+        user["reminders"] = imported["reminders"]
+        counts["reminders"] = len(user["reminders"])
+        for reminder in user["reminders"]:
+            schedule_user_reminder(context.application, update.effective_chat.id, reminder)
+
+    save_state(state)
+    summary = "  " + "\n  ".join(f"{k}: {v}" for k, v in counts.items())
+    await update.message.reply_text(f"✓ Import successful!\n{summary}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if is_rate_limited(chat_id):
@@ -900,8 +1113,13 @@ def main():
     app.add_handler(CommandHandler("export", export_data))
     app.add_handler(CommandHandler("streak", streak_cmd))
     app.add_handler(CommandHandler("adminstats", admin_stats))
-    # Catch-all for user-defined tracker commands (must be last)
+    app.add_handler(CommandHandler("habit", habit_cmd))
+    app.add_handler(CommandHandler("mystats", my_stats))
+    app.add_handler(CommandHandler("pomodoro", pomodoro_cmd))
+    # Catch-all for user-defined tracker commands (must be last command handler)
     app.add_handler(MessageHandler(filters.COMMAND, handle_custom_command))
+    # Document handler for /import (JSON file upload)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_import))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     restore_all_jobs(app)

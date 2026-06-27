@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 2 complete
+## Status: Iteration 3 complete — all planned features shipped
 
 ---
 
@@ -45,6 +45,22 @@ Bot owner sets `GROQ_API_KEY` in env. Users without their own API key get routed
 
 ### 12. Admin stats ✅ done
 `/adminstats` — bot-owner only. Shows total users, subscribed count, custom key count, etc.
+
+### 13. Habit tracking ✅ done (iteration 3)
+`/habit add <name>` — create a daily habit.
+`/habit done <name>` — mark today's completion; shows per-habit streak.
+`/habit list` — shows all habits with today's status and streak.
+`/habit remove <name>` — delete.
+Habits appear in the AI system prompt so check-ins reference them.
+
+### 14. /mystats dashboard ✅ done (iteration 3)
+One-shot summary: streak, active days, task count, trackers, journal count, reminders, model, and today's habit statuses.
+
+### 15. Pomodoro timer ✅ done (iteration 3)
+`/pomodoro [minutes]` — fires a one-time job after N min (default 25) with a completion message.
+
+### 16. /import from export ✅ done (iteration 3)
+Send the JSON file from /export back to the bot to restore tasks, trackers, habits, journal, reminders, timezone, and context. Schedules restored reminders immediately.
 
 ### 5. Journal entries ✅ planned
 `/journal <text>` — saves entry with timestamp, AI reflects briefly.
