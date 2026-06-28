@@ -137,6 +137,13 @@ def _init_db() -> None:
                 fired_at TEXT NOT NULL,
                 PRIMARY KEY (chat_id, job_type, fired_at)
             );
+            -- User preferences: survive state.json overwrites
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                chat_id TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                value   TEXT NOT NULL,
+                PRIMARY KEY (chat_id, key)
+            );
             CREATE INDEX IF NOT EXISTS idx_notes_chat        ON notes(chat_id);
             CREATE INDEX IF NOT EXISTS idx_journal_chat      ON journal(chat_id);
             CREATE INDEX IF NOT EXISTS idx_profile_chat      ON profile_memory(chat_id);
@@ -196,6 +203,38 @@ def db_add_note(chat_id: str, text: str, auto: bool = False) -> int:
             (str(chat_id), text, datetime.utcnow().isoformat(), int(auto))
         )
         return cur.lastrowid
+
+
+# ── user_prefs helpers ──
+
+def db_set_pref(chat_id: str, key: str, value: str) -> None:
+    """Upsert a single user preference into SQLite."""
+    with _db() as con:
+        con.execute(
+            "INSERT INTO user_prefs(chat_id, key, value) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id, key) DO UPDATE SET value=excluded.value",
+            (str(chat_id), key, value)
+        )
+
+
+def db_get_pref(chat_id: str, key: str) -> str | None:
+    """Return a user preference value, or None if not set."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT value FROM user_prefs WHERE chat_id=? AND key=?",
+            (str(chat_id), key)
+        ).fetchone()
+    return row["value"] if row else None
+
+
+def db_get_all_prefs(chat_id: str) -> dict:
+    """Return all stored prefs for a user as a dict."""
+    with _db() as con:
+        rows = con.execute(
+            "SELECT key, value FROM user_prefs WHERE chat_id=?",
+            (str(chat_id),)
+        ).fetchall()
+    return {r["key"]: r["value"] for r in rows}
 
 
 def db_get_notes(chat_id: str) -> list[sqlite3.Row]:
@@ -449,6 +488,10 @@ def get_user(chat_id: int) -> dict:
     # Forward-fill nested llm dict
     for k, v in _new_user()["llm"].items():
         u["llm"].setdefault(k, v)
+    # Overlay critical prefs from SQLite (survive state.json overwrites)
+    db_tz = db_get_pref(key, "timezone")
+    if db_tz:
+        u["timezone"] = db_tz
     return u
 
 
@@ -907,6 +950,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             return {"error": f"Unknown timezone: {tz_raw}. Use an IANA name like Asia/Jerusalem or a UTC offset like UTC+3."}
         user["timezone"] = tz_str
         save_state(state)
+        db_set_pref(str(chat_id), "timezone", tz_str)
         if _app:
             schedule_user_checkins(_app, chat_id)
             schedule_user_alerts(_app, chat_id)
@@ -2790,6 +2834,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(chat_id)
     user["timezone"] = tz_str
     save_state(state)
+    db_set_pref(str(chat_id), "timezone", tz_str)
     schedule_user_checkins(context.application, chat_id)
     schedule_user_alerts(context.application, chat_id)
     for reminder in user.get("reminders", []):
@@ -2831,6 +2876,7 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     user["timezone"] = tz_str
     save_state(state)
+    db_set_pref(str(update.effective_chat.id), "timezone", tz_str)
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
     for reminder in user.get("reminders", []):
