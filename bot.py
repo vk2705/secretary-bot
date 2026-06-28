@@ -1357,6 +1357,18 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         if lang else ""
     )
 
+    tz_str = user.get("timezone", "UTC")
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _tz = _ZI(tz_str)
+        from datetime import datetime as _dt
+        _now = _dt.now(_tz)
+        _offset = _now.strftime("%z")
+        _utc_label = f"UTC{_offset[:3]}:{_offset[3:]}" if len(_offset) == 5 else tz_str
+    except Exception:
+        _utc_label = tz_str
+    tz_section = f"\nThe user's timezone is {tz_str} ({_utc_label}).\n"
+
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
@@ -1381,7 +1393,7 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "'journal' for reflections or day summaries, 'note' for short reminders or plans. "
         "Do NOT tell the user you are saving it — just save it in the background.\n"
         f"{lang_instruction}"
-        f"{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
+        f"{tz_section}{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
 
@@ -2714,7 +2726,14 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_alerts(context.application, update.effective_chat.id)
     for reminder in user.get("reminders", []):
         schedule_user_reminder(context.application, update.effective_chat.id, reminder)
-    await update.message.reply_text(f"Timezone set to {tz_str}.")
+    # Show user-friendly offset for Etc/GMT zones (POSIX sign is inverted)
+    display = tz_str
+    import re as _re2
+    m2 = _re2.fullmatch(r"Etc/GMT([+-])(\d+)", tz_str)
+    if m2:
+        friendly_sign = "+" if m2.group(1) == "-" else "-"
+        display = f"UTC{friendly_sign}{m2.group(2)} ({tz_str})"
+    await update.message.reply_text(f"Timezone set to {display}.")
 
 
 async def manual_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
