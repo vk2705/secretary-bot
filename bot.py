@@ -537,6 +537,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_timezone",
+            "description": (
+                "Save the user's timezone. Always convert city/country names to a valid IANA "
+                "timezone name (e.g. 'Jerusalem' → 'Asia/Jerusalem', 'Moscow' → 'Europe/Moscow', "
+                "'New York' → 'America/New_York'). Also accepts UTC offsets like 'UTC+3'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone name (e.g. 'Asia/Jerusalem') or UTC offset (e.g. 'UTC+3').",
+                    }
+                },
+                "required": ["timezone"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_tasks",
             "description": "Get the user's current task list with their numbers.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -845,6 +866,32 @@ TOOLS = [
 async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
     """Run one tool call and return a JSON-serialisable result dict."""
     user = get_user(chat_id)
+
+    if name == "set_timezone":
+        tz_raw = (args.get("timezone") or "").strip()
+        if not tz_raw:
+            return {"error": "timezone is required"}
+        tz_str = _normalize_tz(tz_raw)
+        try:
+            ZoneInfo(tz_str)
+        except (ZoneInfoNotFoundError, KeyError):
+            return {"error": f"Unknown timezone: {tz_raw}. Use an IANA name like Asia/Jerusalem or a UTC offset like UTC+3."}
+        user["timezone"] = tz_str
+        save_state(state)
+        if _app:
+            schedule_user_checkins(_app, chat_id)
+            schedule_user_alerts(_app, chat_id)
+            for reminder in user.get("reminders", []):
+                schedule_user_reminder(_app, chat_id, reminder)
+        # Build friendly label
+        try:
+            _tz = ZoneInfo(tz_str)
+            _now = datetime.now(_tz)
+            _off = _now.strftime("%z")
+            _label = f"UTC{_off[:3]}:{_off[3:]}" if len(_off) == 5 else tz_str
+        except Exception:
+            _label = tz_str
+        return {"success": True, "timezone": tz_str, "utc_offset": _label}
 
     if name == "get_current_time":
         try:
