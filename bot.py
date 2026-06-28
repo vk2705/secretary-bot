@@ -558,6 +558,37 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_checkins",
+            "description": (
+                "Enable or disable daily morning/evening check-ins and alerts for the user. "
+                "Call with enabled=true when the user asks for morning/evening check-ins, "
+                "daily plans, accountability prompts, or 'subscribe'. "
+                "Call with enabled=false to stop them. "
+                "Optionally set morning/evening times (HH:MM 24h)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "True to enable daily check-ins, false to disable.",
+                    },
+                    "morning": {
+                        "type": "string",
+                        "description": "Morning check-in time HH:MM (optional, default 08:00).",
+                    },
+                    "evening": {
+                        "type": "string",
+                        "description": "Evening check-in time HH:MM (optional, default 21:00).",
+                    },
+                },
+                "required": ["enabled"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_tasks",
             "description": "Get the user's current task list with their numbers.",
             "parameters": {"type": "object", "properties": {}, "required": []},
@@ -890,6 +921,39 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         except Exception:
             _label = tz_str
         return {"success": True, "timezone": tz_str, "utc_offset": _label}
+
+    if name == "set_checkins":
+        enabled = bool(args.get("enabled", True))
+        morning = (args.get("morning") or "").strip()
+        evening = (args.get("evening") or "").strip()
+        def _valid_time(s):
+            try:
+                h, m = s.split(":")
+                assert 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+                return True
+            except Exception:
+                return False
+        times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
+        if morning and _valid_time(morning):
+            times["morning"] = morning
+        if evening and _valid_time(evening):
+            times["evening"] = evening
+        user["checkin_times"] = times
+        user["checkin_enabled"] = enabled
+        save_state(state)
+        if _app:
+            schedule_user_checkins(_app, chat_id)
+            schedule_user_alerts(_app, chat_id)
+        if enabled:
+            tz = user.get("timezone", "UTC")
+            return {
+                "success": True,
+                "enabled": True,
+                "morning": times["morning"],
+                "evening": times["evening"],
+                "timezone": tz,
+            }
+        return {"success": True, "enabled": False}
 
     if name == "get_current_time":
         try:
