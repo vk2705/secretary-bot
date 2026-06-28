@@ -622,11 +622,9 @@ TOOLS = [
             "name": "add_reminder",
             "description": (
                 "Schedule a single reminder. For relative time ('in 5 minutes', 'in 2 hours') use "
-                "delay_minutes. For a specific clock time use time. "
-                "Set once=true for a one-time reminder, or once=false for a daily recurring one. "
-                "IMPORTANT: only make a reminder recurring (once=false) when the user EXPLICITLY asks "
-                "for repetition (e.g. 'every day', 'daily', 'each morning', 'каждый день'). "
-                "Otherwise default to a one-time reminder (once=true). "
+                "delay_minutes — this always fires once. For a specific clock time use time. "
+                "Clock-time reminders default to daily recurring (once=false). "
+                "Set once=true ONLY when the user explicitly says 'one time', 'just today', or similar. "
                 "When the user lists several times in one message (e.g. 'at 13:30, 17:30 and 21:30'), "
                 "call this tool once per time and use the SAME once value for all of them — never mix "
                 "daily and one-time within a single request."
@@ -645,7 +643,7 @@ TOOLS = [
                     },
                     "once": {
                         "type": "boolean",
-                        "description": "True = fire only once (default). False = repeat daily; use ONLY when the user explicitly asks for a recurring/daily reminder.",
+                        "description": "False (default) = repeat daily. True = fire only once; use ONLY when user explicitly requests a one-time reminder.",
                     },
                 },
                 "required": ["message"],
@@ -998,7 +996,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         if not message:
             return {"error": "Reminder message is required"}
         delay_minutes = args.get("delay_minutes")
-        once = bool(args.get("once", True))
+        once = bool(args.get("once", False))
         # ── relative: fire once after N minutes ──
         if delay_minutes is not None:
             try:

@@ -434,7 +434,7 @@ class TestExecuteToolUnit:
         bot._app.job_queue = MagicMock()
         with patch("bot.schedule_user_reminder"):
             result = run(bot._execute_tool(10, "add_reminder", {
-                "message": "Evening walk", "time": "20:00", "once": False
+                "message": "Evening walk", "time": "20:00"
             }))
         assert result["success"] is True
         assert len(bot.state["users"]["10"]["reminders"]) == 1
