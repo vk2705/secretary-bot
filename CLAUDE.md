@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A multi-user personal secretary/accountability Telegram bot (`bot.py`, ~3800 lines). Any Telegram user can register. It uses OpenAI or Groq for AI responses with full function-calling (tool-use) support. State is split across `state.json` (user prefs/tasks/habits/trackers) and `bot_memory.db` (SQLite for notes, journal, profile/episodic memory, encrypted API keys, rate log, job log).
+A multi-user personal secretary/accountability Telegram bot (`bot.py`, ~4200 lines, single-file architecture). Any Telegram user can register. It uses OpenAI or Groq for AI responses with full function-calling (tool-use) support. State is split across `state.json` (user prefs/tasks/habits/trackers) and `bot_memory.db` (SQLite for notes, journal, profile/episodic memory, encrypted API keys, rate log, job log).
 
 ## Running the bot
 
@@ -109,7 +109,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 
 ### LLM tool-use (function calling)
 
-`chat()` runs a tool-call loop (max 5 rounds). The `TOOLS` list (defined at module level, ~line 528) exposes these functions to the model:
+`chat()` runs a tool-call loop (max 5 rounds). The `TOOLS` list (defined at module level, ~line 623) exposes these functions to the model:
 
 | Tool | What it does |
 |---|---|
