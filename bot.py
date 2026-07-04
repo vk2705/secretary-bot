@@ -144,10 +144,24 @@ def _init_db() -> None:
                 value   TEXT NOT NULL,
                 PRIMARY KEY (chat_id, key)
             );
+            -- Reminder history: every reminder ever created, so past (removed) ones
+            -- stay searchable even after they're gone from state.json.
+            CREATE TABLE IF NOT EXISTS reminder_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        TEXT    NOT NULL,
+                reminder_uuid  TEXT,
+                message        TEXT    NOT NULL,
+                reason         TEXT,
+                kind           TEXT    NOT NULL,
+                time           TEXT,
+                created_at     TEXT    NOT NULL,
+                removed_at     TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_notes_chat        ON notes(chat_id);
             CREATE INDEX IF NOT EXISTS idx_journal_chat      ON journal(chat_id);
             CREATE INDEX IF NOT EXISTS idx_profile_chat      ON profile_memory(chat_id);
             CREATE INDEX IF NOT EXISTS idx_episodic_chat     ON episodic_memory(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_reminder_log_chat ON reminder_log(chat_id);
         """)
     # one-time migration of notes/journal still living in state.json
     if os.path.exists(STATE_FILE):
@@ -289,6 +303,44 @@ def db_search_journal(chat_id: str, q: str) -> list[sqlite3.Row]:
         return con.execute(
             "SELECT id,entry,ts FROM journal WHERE chat_id=? AND lower(entry) LIKE ?",
             (str(chat_id), f"%{q.lower()}%")
+        ).fetchall()
+
+
+# ── reminder history (survives removal, unlike state.json reminders) ──
+
+def db_log_reminder(chat_id: str, reminder_uuid: str | None, message: str,
+                     reason: str | None, kind: str, time: str | None) -> int:
+    with _db() as con:
+        cur = con.execute(
+            "INSERT INTO reminder_log(chat_id,reminder_uuid,message,reason,kind,time,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (str(chat_id), reminder_uuid, message, reason, kind, time, datetime.utcnow().isoformat())
+        )
+        return cur.lastrowid
+
+
+def db_mark_reminder_removed(chat_id: str, reminder_uuid: str) -> None:
+    with _db() as con:
+        con.execute(
+            "UPDATE reminder_log SET removed_at=? WHERE chat_id=? AND reminder_uuid=? AND removed_at IS NULL",
+            (datetime.utcnow().isoformat(), str(chat_id), reminder_uuid)
+        )
+
+
+def db_get_reminder_history(chat_id: str, limit: int = 50) -> list[sqlite3.Row]:
+    with _db() as con:
+        return con.execute(
+            "SELECT * FROM reminder_log WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+            (str(chat_id), limit)
+        ).fetchall()
+
+
+def db_search_reminders(chat_id: str, q: str) -> list[sqlite3.Row]:
+    with _db() as con:
+        return con.execute(
+            "SELECT * FROM reminder_log WHERE chat_id=? AND "
+            "(lower(message) LIKE ? OR lower(reason) LIKE ?) ORDER BY id DESC",
+            (str(chat_id), f"%{q.lower()}%", f"%{q.lower()}%")
         ).fetchall()
 
 
@@ -707,6 +759,10 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "message": {"type": "string", "description": "The reminder message."},
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this reminder matters to the user, if known from context or memory (e.g. 'to keep your leg mobile', 'you wanted to learn Kubernetes for work'). Included when the reminder fires. Omit if unknown — don't invent one.",
+                    },
                     "delay_minutes": {
                         "type": "integer",
                         "description": "Fire once after this many minutes from now. Use for relative requests like 'in 5 minutes'. When set, time and once are ignored.",
@@ -721,6 +777,40 @@ TOOLS = [
                     },
                 },
                 "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_reminders",
+            "description": "List the user's active reminders with their numbers and reasons, so a specific one can be targeted with remove_reminder. Call this first if the user refers to a reminder by description rather than number. Set include_history=true to also see past (removed) reminders.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_history": {
+                        "type": "boolean",
+                        "description": "Also include past/removed reminders from the reminder history. Default false.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_reminder",
+            "description": "Delete a reminder by its number (from get_reminders or /remind list).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_number": {
+                        "type": "integer",
+                        "description": "The reminder's number as shown by get_reminders (1-based).",
+                    },
+                },
+                "required": ["reminder_number"],
             },
         },
     },
@@ -899,6 +989,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "remove_note",
+            "description": "Delete a quick note by its number (from get_notes or /notes).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_number": {
+                        "type": "integer",
+                        "description": "The note's number as shown by get_notes (1-based).",
+                    },
+                },
+                "required": ["note_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_today_focus",
             "description": "Set the user's main focus or intention for today.",
             "parameters": {
@@ -914,7 +1021,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Search across the user's tasks, notes, and journal entries.",
+            "description": "Search across the user's tasks, notes, journal entries, and reminders (current and past/removed).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -955,7 +1062,8 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             schedule_user_checkins(_app, chat_id)
             schedule_user_alerts(_app, chat_id)
             for reminder in user.get("reminders", []):
-                schedule_user_reminder(_app, chat_id, reminder)
+                if not reminder.get("annual"):
+                    schedule_user_reminder(_app, chat_id, reminder)
         # Build friendly label
         try:
             _tz = ZoneInfo(tz_str)
@@ -1103,6 +1211,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         message = (args.get("message") or "").strip()
         if not message:
             return {"error": "Reminder message is required"}
+        reason = (args.get("reason") or "").strip() or None
         delay_minutes = args.get("delay_minutes")
         once = bool(args.get("once", False))
         # ── relative: fire once after N minutes ──
@@ -1114,9 +1223,13 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 return {"error": "delay_minutes must be a positive integer"}
             if not _app:
                 return {"error": "Scheduler not available"}
-            async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
+            db_log_reminder(chat_id, None, message, reason, "once", None)
+            async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message, _reason=reason):
                 try:
-                    await ctx.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
+                    text = f"⏰ Reminder: {_msg}"
+                    if _reason:
+                        text += f"\n💡 {_reason}"
+                    await ctx.bot.send_message(chat_id=_cid, text=text)
                 except Exception as e:
                     logger.error("One-time reminder failed: %s", e)
             _app.job_queue.run_once(_once_job, when=delay_minutes * 60,
@@ -1137,21 +1250,66 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             delay = _parse_once_delay(time_str, user_tz)
             if delay is None or delay <= 0:
                 return {"error": f"Time {time_str} is in the past or invalid"}
-            async def _once_time_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
+            db_log_reminder(chat_id, None, message, reason, "once", time_str)
+            async def _once_time_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message, _reason=reason):
                 try:
-                    await ctx.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
+                    text = f"⏰ Reminder: {_msg}"
+                    if _reason:
+                        text += f"\n💡 {_reason}"
+                    await ctx.bot.send_message(chat_id=_cid, text=text)
                 except Exception as e:
                     logger.error("One-time reminder failed: %s", e)
             _app.job_queue.run_once(_once_time_job, when=delay,
                                     name=f"once_{chat_id}_{uuid.uuid4()}")
             return {"success": True, "once_at": time_str, "message": message}
         # ── daily recurring ──
-        reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False}
+        reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False, "reason": reason}
         user.setdefault("reminders", []).append(reminder)
         save_state(state)
+        db_log_reminder(chat_id, reminder["id"], message, reason, "daily", time_str)
         if _app:
             schedule_user_reminder(_app, chat_id, reminder)
         return {"success": True, "daily_at": time_str, "message": message}
+
+    if name == "get_reminders":
+        reminders = user.get("reminders", [])
+        result = []
+        for i, r in enumerate(reminders):
+            if r.get("annual"):
+                kind = f"annual {r.get('date', '')}"
+            elif r.get("once"):
+                kind = "once"
+            else:
+                kind = "daily"
+            result.append({
+                "number": i + 1, "time": r["time"], "kind": kind,
+                "message": r["message"], "reason": r.get("reason"),
+            })
+        response = {"reminders": result, "count": len(result)}
+        if args.get("include_history"):
+            history = []
+            for r in db_get_reminder_history(chat_id):
+                history.append({
+                    "message": r["message"], "reason": r["reason"], "kind": r["kind"],
+                    "time": r["time"], "created_at": r["created_at"][:10],
+                    "status": "removed" if r["removed_at"] else "active",
+                })
+            response["history"] = history
+        return response
+
+    if name == "remove_reminder":
+        n = int(args.get("reminder_number", 0))
+        reminders = user.get("reminders", [])
+        if n < 1 or n > len(reminders):
+            return {"error": f"Reminder {n} not found. There are {len(reminders)} reminders. Call get_reminders first."}
+        removed = reminders.pop(n - 1)
+        save_state(state)
+        db_mark_reminder_removed(chat_id, removed["id"])
+        if _app:
+            job_name = f"reminder_{chat_id}_{removed['id']}"
+            for job in _app.job_queue.get_jobs_by_name(job_name):
+                job.schedule_removal()
+        return {"success": True, "removed": removed["message"], "time": removed["time"]}
 
     if name == "create_tracker":
         tname = (args.get("name") or "").lower().strip()
@@ -1281,6 +1439,15 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         total = len(db_get_notes(chat_id))
         return {"success": True, "note": text, "total_notes": total}
 
+    if name == "remove_note":
+        n = int(args.get("note_number", 0))
+        rows = db_get_notes(chat_id)
+        if n < 1 or n > len(rows):
+            return {"error": f"Note {n} not found. There are {len(rows)} notes. Call get_notes first."}
+        removed = rows[n - 1]
+        db_remove_note(chat_id, removed["id"])
+        return {"success": True, "removed": removed["text"]}
+
     if name == "set_today_focus":
         text = (args.get("text") or "").strip()
         if not text:
@@ -1293,7 +1460,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         q = (args.get("query") or "").lower().strip()
         if not q:
             return {"error": "Query is required."}
-        results = {"tasks": [], "notes": [], "journal": []}
+        results = {"tasks": [], "notes": [], "journal": [], "reminders": []}
         for i, t in enumerate(user.get("tasks", []), 1):
             if q in _task_text(t).lower():
                 results["tasks"].append({"number": i, "text": _task_text(t)})
@@ -1301,6 +1468,12 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             results["notes"].append({"id": r["id"], "text": r["text"]})
         for r in db_search_journal(chat_id, q):
             results["journal"].append({"date": r["ts"][:10], "excerpt": r["entry"][:100]})
+        for r in db_search_reminders(chat_id, q):
+            results["reminders"].append({
+                "message": r["message"], "reason": r["reason"], "kind": r["kind"],
+                "time": r["time"], "created_at": r["created_at"][:10],
+                "status": "removed" if r["removed_at"] else "active",
+            })
         total = sum(len(v) for v in results.values())
         return {"query": q, "total_matches": total, **results}
 
@@ -1735,7 +1908,8 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
         job.schedule_removal()
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
 
-    async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=reminder["message"]):
+    async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=reminder["message"],
+                   _reason=reminder.get("reason")):
         if _is_quiet_now(get_user(_cid)) or _is_muted(get_user(_cid)):
             return
         try:
@@ -1745,8 +1919,11 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
             ]])
+            text = f"⏰ Reminder: {_msg}"
+            if _reason:
+                text += f"\n💡 {_reason}"
             await context.bot.send_message(
-                chat_id=_cid, text=f"⏰ Reminder: {_msg}", reply_markup=keyboard
+                chat_id=_cid, text=text, reply_markup=keyboard
             )
         except Exception as e:
             logger.error("Reminder failed for %s: %s", _cid, e)
@@ -1940,7 +2117,11 @@ def restore_all_jobs(app: Application) -> None:
         schedule_user_checkins(app, cid)
         schedule_user_alerts(app, cid)
         for reminder in user.get("reminders", []):
-            schedule_user_reminder(app, cid, reminder)
+            # Annual reminders fire via the deadline-alert job's date check, not
+            # as their own daily job — scheduling them here would make them fire
+            # every day instead of once a year.
+            if not reminder.get("annual"):
+                schedule_user_reminder(app, cid, reminder)
 
         # Missed check-in catch-up
         if not user.get("checkin_enabled"):
@@ -2325,7 +2506,17 @@ async def show_archive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Wipe all user data and start fresh."""
-    user = get_user(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    # Cancel every per-reminder job (daily/annual/once) before the reminders list
+    # that names them is wiped below — otherwise they become orphaned: still firing,
+    # but invisible to /remind list and unrecoverable after a restart.
+    prefixes = (f"reminder_{chat_id}_", f"once_{chat_id}_")
+    for job in context.application.job_queue.jobs():
+        if job.name and job.name.startswith(prefixes):
+            job.schedule_removal()
+    for r in user.get("reminders", []):
+        db_mark_reminder_removed(chat_id, r["id"])
     # Keep LLM settings and timezone; wipe everything else
     user.update({
         "tasks": [],
@@ -2341,8 +2532,8 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "quiet_hours": {"start": None, "end": None},
     })
     # Cancel all scheduled jobs
-    schedule_user_checkins(context.application, update.effective_chat.id)
-    schedule_user_alerts(context.application, update.effective_chat.id)
+    schedule_user_checkins(context.application, chat_id)
+    schedule_user_alerts(context.application, chat_id)
     save_state(state)
     await update.message.reply_text(
         "♻️ Account reset. All tasks, habits, trackers, and history cleared.\n"
@@ -2880,7 +3071,8 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
     for reminder in user.get("reminders", []):
-        schedule_user_reminder(context.application, update.effective_chat.id, reminder)
+        if not reminder.get("annual"):
+            schedule_user_reminder(context.application, update.effective_chat.id, reminder)
     # Show user-friendly offset for Etc/GMT zones (POSIX sign is inverted)
     display = tz_str
     import re as _re2
@@ -2993,7 +3185,10 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kind = "once"
             else:
                 kind = "daily"
-            lines.append(f"{i+1}. [{kind}] {r['time']} {tz} — {r['message']}")
+            line = f"{i+1}. [{kind}] {r['time']} {tz} — {r['message']}"
+            if r.get("reason"):
+                line += f" (💡 {r['reason']})"
+            lines.append(line)
         await update.message.reply_text("Your reminders:\n" + "\n".join(lines))
 
     elif sub == "add":
@@ -3011,6 +3206,7 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False}
         user.setdefault("reminders", []).append(reminder)
         save_state(state)
+        db_log_reminder(update.effective_chat.id, reminder["id"], message, None, "daily", time_str)
         schedule_user_reminder(context.application, update.effective_chat.id, reminder)
         tz = user.get("timezone", "UTC")
         await update.message.reply_text(f"Daily reminder set: {time_str} ({tz}) — {message}")
@@ -3029,6 +3225,7 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminder_id = str(uuid.uuid4())
         job_name = f"once_{update.effective_chat.id}_{reminder_id}"
         chat_id = update.effective_chat.id
+        db_log_reminder(chat_id, reminder_id, message, None, "once", spec)
 
         async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
             try:
@@ -3053,6 +3250,7 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for job in context.application.job_queue.get_jobs_by_name(job_name):
                 job.schedule_removal()
             save_state(state)
+            db_mark_reminder_removed(update.effective_chat.id, removed["id"])
             await update.message.reply_text(f"Removed: {removed['time']} — {removed['message']}")
         except (IndexError, ValueError):
             await update.message.reply_text("Invalid number. Use /remind list to see numbers.")
@@ -3086,6 +3284,7 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         user.setdefault("reminders", []).append(reminder)
         save_state(state)
+        db_log_reminder(update.effective_chat.id, reminder["id"], message, None, "annual", time_str)
         tz = user.get("timezone", "UTC")
         await update.message.reply_text(
             f"📅 Annual reminder set: every {date_str} at {time_str} ({tz}) — {message}"
@@ -3641,7 +3840,8 @@ async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["reminders"] = imported["reminders"]
         counts["reminders"] = len(user["reminders"])
         for reminder in user["reminders"]:
-            schedule_user_reminder(context.application, update.effective_chat.id, reminder)
+            if not reminder.get("annual"):
+                schedule_user_reminder(context.application, update.effective_chat.id, reminder)
 
     save_state(state)
     summary = "  " + "\n  ".join(f"{k}: {v}" for k, v in counts.items())

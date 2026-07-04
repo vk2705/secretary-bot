@@ -994,6 +994,91 @@ class TestNewExecuteTools:
         result = run(bot._execute_tool(20, "add_note", {"text": ""}))
         assert "error" in result
 
+    def test_remove_note_success(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.db_add_note("20", "Note A")
+        bot.db_add_note("20", "Note B")
+        result = run(bot._execute_tool(20, "remove_note", {"note_number": 1}))
+        assert result["success"] is True
+        assert result["removed"] == "Note A"
+        rows = bot.db_get_notes("20")
+        assert len(rows) == 1 and rows[0]["text"] == "Note B"
+
+    def test_remove_note_out_of_range(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "remove_note", {"note_number": 5}))
+        assert "error" in result
+
+    # ── get_reminders / remove_reminder ──────────────────────────────────────
+
+    def test_get_reminders_tool(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_reminder", {"message": "drink water", "time": "09:00"}))
+        run(bot._execute_tool(20, "add_reminder", {"message": "stretch", "time": "10:00"}))
+        result = run(bot._execute_tool(20, "get_reminders", {}))
+        assert result["count"] == 2
+        assert result["reminders"][0]["number"] == 1
+        assert result["reminders"][0]["message"] == "drink water"
+        assert result["reminders"][0]["kind"] == "daily"
+
+    def test_get_reminders_empty(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "get_reminders", {}))
+        assert result["count"] == 0
+
+    def test_remove_reminder_success(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_reminder", {"message": "drink water", "time": "09:00"}))
+        run(bot._execute_tool(20, "add_reminder", {"message": "stretch", "time": "10:00"}))
+        result = run(bot._execute_tool(20, "remove_reminder", {"reminder_number": 1}))
+        assert result["success"] is True
+        assert result["removed"] == "drink water"
+        remaining = bot.state["users"]["20"]["reminders"]
+        assert len(remaining) == 1 and remaining[0]["message"] == "stretch"
+
+    def test_remove_reminder_out_of_range(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "remove_reminder", {"reminder_number": 5}))
+        assert "error" in result
+
+    def test_add_reminder_with_reason(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_reminder", {
+            "message": "Do exercise", "time": "11:00", "reason": "to keep your leg mobile",
+        }))
+        result = run(bot._execute_tool(20, "get_reminders", {}))
+        assert result["reminders"][0]["reason"] == "to keep your leg mobile"
+
+    def test_get_reminders_include_history(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_reminder", {
+            "message": "Do exercise", "time": "11:00", "reason": "stay active",
+        }))
+        run(bot._execute_tool(20, "remove_reminder", {"reminder_number": 1}))
+        result = run(bot._execute_tool(20, "get_reminders", {"include_history": True}))
+        assert result["count"] == 0
+        assert len(result["history"]) == 1
+        assert result["history"][0]["message"] == "Do exercise"
+        assert result["history"][0]["reason"] == "stay active"
+        assert result["history"][0]["status"] == "removed"
+
+    def test_search_finds_active_reminder(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_reminder", {
+            "message": "Do exercise", "time": "11:00", "reason": "stay active",
+        }))
+        result = run(bot._execute_tool(20, "search", {"query": "exercise"}))
+        assert len(result["reminders"]) == 1
+        assert result["reminders"][0]["status"] == "active"
+
+    def test_search_finds_removed_reminder(self):
+        bot.state["users"]["20"] = fresh_user()
+        run(bot._execute_tool(20, "add_reminder", {"message": "Do exercise", "time": "11:00"}))
+        run(bot._execute_tool(20, "remove_reminder", {"reminder_number": 1}))
+        result = run(bot._execute_tool(20, "search", {"query": "exercise"}))
+        assert len(result["reminders"]) == 1
+        assert result["reminders"][0]["status"] == "removed"
+
     # ── set_today_focus ──────────────────────────────────────────────────────
 
     def test_set_today_focus(self):
