@@ -89,6 +89,13 @@ bot.DB_FILE = _db_tmp.name
 _db_tmp.close()
 bot._init_db()
 
+# Redirect state.json too — save_state() writes straight to bot.STATE_FILE with no
+# isolation of its own, so without this every test run overwrites the real
+# production state.json in the repo with whatever fixture data the tests built.
+_state_tmp = _tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+bot.STATE_FILE = _state_tmp.name
+_state_tmp.close()
+
 
 def _fresh_db():
     """Point bot at a brand-new temp DB and initialise it."""
