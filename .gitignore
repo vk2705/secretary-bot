@@ -1,4 +1,5 @@
 env
+mcp_remote.env
 state.json
 bot_memory.db
 bot_memory.db-*

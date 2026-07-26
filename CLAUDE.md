@@ -39,7 +39,7 @@ export $(grep -v '^#' env | xargs) && python -m pytest tests/test_bot.py -v -k s
 export $(grep -v '^#' env | xargs) && python -m pytest tests/test_bot.py -v -k nl
 ```
 
-The test file stubs out `telegram`, `telegram.ext`, and `timezonefinder` at import time so `bot.py` can be imported without a running Telegram app. Each test gets an isolated SQLite temp file via an autouse `isolate_db` fixture.
+The test file stubs out `telegram`, `telegram.ext`, and `timezonefinder` at import time so `bot.py` can be imported without a running Telegram app. `bot.STATE_FILE` and `bot.DB_FILE` are both redirected to temp files at import time (so the suite never touches the real `state.json`/`bot_memory.db`), and each test additionally gets a fresh SQLite temp file via an autouse `isolate_db` fixture.
 
 ## Environment (`env` file)
 
@@ -62,7 +62,9 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 ### Storage: hybrid
 
 - **`state.json`** — tasks, conversation history, user prefs (timezone, check-in times, quiet hours, habits, trackers, archived tasks, `today_focus`, `language`, `milestones_sent`, `muted_until`, `llm`). Written atomically via `tempfile.mkstemp` + `os.replace`.
-- **`bot_memory.db`** (SQLite, WAL mode) — notes, journal entries, profile memory, episodic memory, encrypted API keys, rate-limit log, job-fire log. `_db()` opens a new connection per call (thread-safe). `_init_db()` creates all tables and migrates legacy data from state.json.
+- **`bot_memory.db`** (SQLite, WAL mode) — notes, journal entries, profile memory, episodic memory, encrypted API keys, rate-limit log, job-fire log, `user_prefs` (critical prefs that must survive a `state.json` overwrite/restore — currently just `timezone`), `reminder_log` (append-only history of every reminder ever created/removed, so removed reminders stay searchable). `_db()` opens a new connection per call (thread-safe). `_init_db()` creates all tables and migrates legacy data from state.json.
+
+`get_user(chat_id)` overlays `user_prefs.timezone` from SQLite onto `state.json`'s copy on every call — SQLite wins if set. This is why `set_timezone`/`/settimezone`/location-detection all call `db_set_pref(chat_id, "timezone", ...)` in addition to setting `user["timezone"]`: without the SQLite write, a stale `/import` or manual `state.json` edit would silently revert the user's timezone.
 
 ### State schema (per user, authoritative source: `_new_user()`)
 
@@ -121,7 +123,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 | `set_checkins` | Natural-language subscribe/unsubscribe to daily check-ins |
 | `get_tasks` / `add_task` / `complete_task` / `remove_task` | Task CRUD |
 | `log_tracker` / `get_trackers` / `create_tracker` | Tracker logging |
-| `add_reminder` / `get_reminders` / `remove_reminder` | Schedule/list/delete reminders (delay_minutes for relative, time for clock; remove by 1-based number from `get_reminders`) |
+| `add_reminder` / `get_reminders` / `remove_reminder` | Schedule/list/delete reminders (delay_minutes for relative, time for clock; remove by 1-based number from `get_reminders`; `get_reminders(include_history=true)` also returns removed reminders from `reminder_log`) |
 | `add_journal_entry` / `get_journal` | Journal write/read |
 | `save_memory` | Persist facts: `profile` (permanent), `episodic` (30-day TTL), `note`, or `journal` |
 | `add_habit` / `complete_habit` / `remove_habit` / `get_habits` | Habit management |
@@ -242,4 +244,10 @@ Handlers are registered in this order (important for precedence):
 
 ## `mcp_server.py`
 
-A separate MCP (Model Context Protocol) server exposing a user's tasks/habits/trackers/reminders as tools for Claude Desktop/Code, run standalone (`python3 mcp_server.py`, stdio transport). It reads/writes `state.json` directly and does **not** go through `bot.py`'s runtime or `_execute_tool` dispatch. Its `journal`/`notes` tools operate on a legacy `state.json["journal"]` array — this has diverged from `bot.py`, which stores journal/notes in `bot_memory.db` (SQLite). Edits made through this MCP server will not appear in the bot's actual journal/notes, and vice versa; treat it as task/habit/tracker-only in practice.
+A separate MCP (Model Context Protocol) server exposing a user's data as tools for Claude Desktop/Code/claude.ai, run standalone. It does **not** go through `bot.py`'s runtime or `_execute_tool` dispatch — it reads/writes `state.json` and `bot_memory.db` directly with its own helpers (`_load`/`_save`, `_db()`). Tasks/habits/trackers/reminders live in `state.json`; notes/journal/profile+episodic memory are read and written directly against `bot_memory.db` (same tables as `bot.py`, so edits made through either surface are immediately visible in the other). Timezone is read from `state.json` but overridden by the SQLite `user_prefs` row when present (`_timezone()`), matching `bot.py`'s `get_user()` precedence — `state.json`'s copy can go stale after `settimezone`.
+
+Two transports:
+- **stdio** (default, `python3 mcp_server.py`) — for Claude Desktop/Code.
+- **remote HTTP** (`MCP_TRANSPORT=remote`) — serves `streamable-http` on `MCP_REMOTE_HOST:MCP_REMOTE_PORT` (default `127.0.0.1:8545`) so claude.ai's web app can connect, since it can't reach local stdio servers. This process does **not** terminate TLS itself — nginx owns port 443 on the host (it also fronts an unrelated Alteon MCP server on the same box, port-routed by hostname) and reverse-proxies `https://mcp-sbot.alteon.help` to this port; see `/etc/nginx/conf.d/mcp-sbot.alteon.help.conf`. Managed as systemd unit `secretary-mcp.service` (`EnvironmentFile=mcp_remote.env`, `Restart=on-failure`). Config via `mcp_remote.env` (gitignored): `MCP_REMOTE_TOKEN`, `MCP_REMOTE_DOMAIN`, `MCP_REMOTE_HOST`, `MCP_REMOTE_PORT`. Auth is a `?key=` query param (`_TokenAuthMiddleware`), not a header, because claude.ai's custom-connector dialog only accepts a URL. `MCP_REMOTE_DOMAIN` also sets the allowed `Host` header via `TransportSecuritySettings` to block DNS-rebinding — it must match the public hostname nginx forwards (`Host: $host`), not the internal port.
+  - TLS cert for `mcp-sbot.alteon.help` is Let's Encrypt via certbot (`webroot` method, since nginx permanently owns 80/443 — `standalone` would conflict), copied into `/etc/pki/nginx/` (nginx's expected location on this box) rather than read from `/etc/letsencrypt/live/` directly. A renewal deploy-hook (`/etc/letsencrypt/renewal-hooks/deploy/copy-to-nginx.sh`, host-wide — also benefits the Alteon cert) re-copies and reloads nginx automatically on renewal.
+  - nginx has no explicit `default_server` on port 80/443; the first server block loaded from `conf.d/*.conf` (alphabetical) wins as the fallback for unmatched hostnames. Any new vhost needs its own explicit `server_name` block, or requests to it will silently fall through to whichever vhost happens to load first.

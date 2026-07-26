@@ -370,13 +370,31 @@ secretary-bot/
 
 ## MCP Server
 
-`mcp_server.py` exposes the bot's data as an [MCP](https://modelcontextprotocol.io/) server so Claude Desktop or Claude Code can read and modify any user's data directly.
+`mcp_server.py` exposes the bot's data as an [MCP](https://modelcontextprotocol.io/) server so Claude Desktop, Claude Code, or claude.ai can read and modify any user's data directly — tasks, habits, trackers, reminders (`state.json`), plus notes, journal, and profile/episodic memory (`bot_memory.db`).
+
+### stdio (Claude Desktop / Claude Code, local)
 
 ```bash
-python3 mcp_server.py          # stdio transport (for Claude Desktop)
+python3 mcp_server.py
 ```
 
-Tools exposed: `list_users`, `get_tasks`, `add_task`, `complete_task`, `remove_task`, `get_archived_tasks`, `get_habits`, `log_tracker`.
+### Remote HTTPS (claude.ai "Add custom connector")
+
+claude.ai's web app can't reach a local stdio server, so a second deployment runs `mcp_server.py` in `MCP_TRANSPORT=remote` mode as a long-running service (systemd unit `secretary-mcp.service`), listening on `127.0.0.1:8545`. nginx terminates TLS on port 443 for the public hostname and reverse-proxies to that port (`/etc/nginx/conf.d/mcp-sbot.alteon.help.conf`) — the app itself never binds a public port directly. This box also fronts an unrelated Alteon MCP server the same way, routed by hostname.
+
+Add a custom connector in claude.ai with:
+
+```
+https://mcp-sbot.alteon.help/mcp?key=<MCP_REMOTE_TOKEN>
+```
+
+`<MCP_REMOTE_TOKEN>` is the value of `MCP_REMOTE_TOKEN` in `mcp_remote.env` (gitignored — not reproduced here since this file is committed to git). Since claude.ai's connector dialog only takes a URL, the shared secret rides as a `?key=` query param instead of an `Authorization` header; a request with a missing or wrong key gets `403 Forbidden` (deliberately not `401`, which would make the client think this server supports OAuth and attempt a doomed client-registration flow — see the docstring on `_TokenAuthMiddleware` in `mcp_server.py`). All requests are logged to `journalctl -u secretary-mcp.service` (method, path, client, key validity, status — never the token value itself) for debugging connector issues.
+
+Config (`mcp_remote.env`): `MCP_REMOTE_TOKEN`, `MCP_REMOTE_DOMAIN` (public hostname, used for the Host-header DNS-rebinding check), `MCP_REMOTE_HOST`/`MCP_REMOTE_PORT` (local bind address, default `127.0.0.1:8545`).
+
+### Tools exposed
+
+`list_users`, `get_tasks`, `add_task`, `complete_task`, `remove_task`, `get_archived_tasks`, `get_habits`, `log_habit`, `get_trackers`, `log_tracker`, `get_journal`, `add_journal_entry`, `get_notes`, `add_note`, `remove_note`, `get_memory`, `get_user_stats`, `get_reminders`.
 
 ---
 
