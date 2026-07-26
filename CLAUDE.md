@@ -85,9 +85,12 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
   "language": "",
   "milestones_sent": ["streak_7", "tasks_10"],
   "muted_until": "",
-  "llm": {"model": null, "api_key": null}
+  "llm": {"model": null, "api_key": null},
+  "pending_checkin": null
 }
 ```
+
+`pending_checkin` holds `"morning"`/`"evening"`/`null` — set to the check-in label whenever a proactive check-in fires, cleared whenever the user genuinely engages (any `chat()` call with `touch_activity=True`, the default). Used to (a) tell the model when a check-in went unanswered so it can acknowledge the silence instead of repeating the same prompt, and (b) keep `activity_days`/streak honest — see below.
 
 `get_user(chat_id)` forward-fills any missing keys using `_new_user()` defaults, so new fields are automatically backward-compatible.
 
@@ -96,7 +99,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 | Function | Purpose |
 |---|---|
 | `get_user(chat_id)` | Init or load user; forward-fills missing keys |
-| `chat(chat_id, msg)` | Tool-call loop (up to 5 rounds) → final text reply; stores exchange in history |
+| `chat(chat_id, msg, touch_activity=True)` | Tool-call loop (up to 5 rounds) → final text reply; stores exchange in history. `touch_activity=False` (used by proactive/automated sends — check-ins, weekly digest, missed-checkin catch-up) skips marking the day active and skips clearing `pending_checkin`, so a bot-initiated nudge is never counted as the user having responded |
 | `build_system_prompt(user)` | Injects context, tracker readings, habits, task deadlines, profile/episodic memory |
 | `get_llm_client(user)` | Returns `AsyncOpenAI` with user or bot key; Groq auto-detected by `gsk_` prefix |
 | `get_model(user)` | User model → Groq default → OpenAI default |

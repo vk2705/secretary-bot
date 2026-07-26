@@ -484,6 +484,7 @@ def _new_user(**overrides) -> dict:
         "milestones_sent": [],
         "muted_until": "",
         "llm": {"model": None, "api_key": None},
+        "pending_checkin": None,
     }
     base.update(overrides)
     return base
@@ -564,6 +565,23 @@ def is_rate_limited(chat_id: int) -> bool:
             return True
         con.execute("INSERT INTO rate_log(chat_id,ts) VALUES(?,?)", (key, now))
     return False
+
+
+# ─────────────────────── date helpers ───────────────────────
+
+def _local_date(ts_iso: str, tz_str: str = "UTC") -> str:
+    """Convert a stored UTC-naive ISO timestamp to the user's local calendar date.
+
+    ts columns are written with datetime.utcnow(), so a truncated ts[:10] shows
+    the UTC calendar day, which is off by one for anyone whose local time has
+    already crossed midnight while it's still the previous day in UTC (or vice
+    versa). Converting to the user's timezone before taking the date fixes that.
+    """
+    try:
+        dt = datetime.fromisoformat(ts_iso).replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(ZoneInfo(tz_str)).date().isoformat()
+    except (ValueError, ZoneInfoNotFoundError, KeyError):
+        return ts_iso[:10]
 
 
 # ─────────────────────── activity / streak ───────────────────────
@@ -1331,7 +1349,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         if not text:
             return {"error": "Journal text is required"}
         db_add_journal(chat_id, text, auto=False)
-        return {"success": True}
+        return {"success": True, "date": _local_date(datetime.utcnow().isoformat(), user.get("timezone", "UTC"))}
 
     if name == "save_memory":
         text = (args.get("text") or "").strip()
@@ -1346,12 +1364,19 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             db_add_episodic_memory(chat_id, text, ttl_days=30)
         else:  # "note" or unknown
             db_add_note(chat_id, text, auto=True)
-        return {"success": True, "saved_as": kind}
+        result = {"success": True, "saved_as": kind}
+        if kind == "journal":
+            result["date"] = _local_date(datetime.utcnow().isoformat(), user.get("timezone", "UTC"))
+        return result
 
     if name == "get_journal":
         limit = int(args.get("limit") or 10)
         rows = db_get_journal(chat_id, limit=limit)
-        return {"entries": [{"date": r["ts"][:10], "text": r["entry"]} for r in rows], "count": len(rows)}
+        tz_str = user.get("timezone", "UTC")
+        return {
+            "entries": [{"date": _local_date(r["ts"], tz_str), "text": r["entry"]} for r in rows],
+            "count": len(rows),
+        }
 
     if name == "remove_task":
         n = int(args.get("task_number", 0))
@@ -1671,8 +1696,11 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
 
     # Include last few journal entries for context
     recent_journal = db_get_journal(str(chat_id), limit=3)
+    journal_tz = user.get("timezone", "UTC")
     journal_section = (
-        "\nRecent journal entries:\n" + "\n".join(f"  – {r['entry'][:80]}" for r in recent_journal) + "\n"
+        "\nRecent journal entries:\n" + "\n".join(
+            f"  – [{_local_date(r['ts'], journal_tz)}] {r['entry'][:80]}" for r in recent_journal
+        ) + "\n"
         if recent_journal else ""
     )
 
@@ -1726,9 +1754,15 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
 
 # ─────────────────────── chat ───────────────────────
 
-async def chat(chat_id: int, user_message: str, system: str = None) -> str:
+async def chat(chat_id: int, user_message: str, system: str = None, touch_activity: bool = True) -> str:
     user = get_user(chat_id)
-    _touch_activity(user)
+    if touch_activity:
+        # Only genuine user-initiated turns count toward the activity streak and
+        # clear a pending check-in — proactive bot-initiated messages (check-ins,
+        # weekly digest, missed-checkin catch-up) pass touch_activity=False so
+        # sending a nudge is never mistaken for the user having responded.
+        _touch_activity(user)
+        user["pending_checkin"] = None
     system = system or build_system_prompt(user, chat_id)
     client = get_llm_client(user, chat_id)
     model = get_model(user, chat_id)
@@ -1835,16 +1869,23 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
             continue
 
         t = _parse_local_time(times.get(label, "08:00" if label == "morning" else "21:00"), tz_str)
+        variety_instruction = (
+            "Open with a natural greeting that's noticeably different from how you've opened "
+            "recent check-ins — check the conversation history and don't reuse the same phrasing "
+            "or structure. Where it genuinely fits, weave in something specific and recent — a "
+            "task, a journal entry, a note, or something you remember about the user — so it "
+            "reads as personal rather than templated. Don't force a callback if nothing fits."
+        )
         if label == "morning":
             prompt = (
-                "It's morning check-in time. Greet the user briefly, "
-                "then ask what they plan to work on today from their task list. "
+                f"It's morning check-in time. {variety_instruction} "
+                "Then ask what they plan to work on today from their task list. "
                 "Pick 1-2 specific tasks to focus on."
             )
         else:
             prompt = (
-                "It's evening check-in time. Ask the user how their day went. "
-                "Ask specifically about what progress they made on their tasks. "
+                f"It's evening check-in time. {variety_instruction} "
+                "Ask how their day went and specifically about progress on their tasks. "
                 "If they didn't do much, gently push back and encourage them to do "
                 "at least one small thing."
             )
@@ -1877,12 +1918,13 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
                             f" Also mention that these trackers haven't been updated in 2+ days "
                             f"and nudge the user to log: {', '.join(stale)}."
                         )
-                else:
-                    # Evening: ask for gratitude
+                if user_now.get("pending_checkin"):
                     dynamic_prompt += (
-                        " At the end, ask them to share one thing they're grateful for today."
+                        " Note: the user did not reply to your last check-in message. "
+                        "Briefly acknowledge the silence and vary your wording instead of "
+                        "repeating the same question."
                     )
-                reply = await chat(_cid, dynamic_prompt)
+                reply = await chat(_cid, dynamic_prompt, touch_activity=False)
                 keyboard = InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton("✅ Going well", callback_data="ci:well"),
@@ -1894,6 +1936,8 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
                     ],
                 ])
                 await context.bot.send_message(chat_id=_cid, text=reply, reply_markup=keyboard)
+                user_now["pending_checkin"] = label
+                save_state(state)
                 db_log_job(str(_cid), f"checkin_{'morning' if _morning else 'evening'}")
             except Exception as e:
                 logger.error("Check-in failed for %s: %s", _cid, e)
@@ -2090,7 +2134,11 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
                 "acknowledge their progress, highlight one strength, "
                 "suggest one priority for the coming week. Be specific, not generic."
             )
-            reply = await chat(_cid, prompt, system="You are a supportive weekly accountability coach.")
+            reply = await chat(
+                _cid, prompt,
+                system="You are a supportive weekly accountability coach.",
+                touch_activity=False,
+            )
             await context.bot.send_message(
                 chat_id=_cid,
                 text=f"📅 Weekly digest:\n\n{reply}"
@@ -2146,13 +2194,19 @@ def restore_all_jobs(app: Application) -> None:
                         u = get_user(_cid)
                         if _is_quiet_now(u) or _is_muted(u):
                             return
-                        prompt = (
-                            "Missed morning check-in catch-up: greet the user and ask about their plans."
-                            if _label == "morning" else
-                            "Missed evening check-in catch-up: ask briefly how their day went."
+                        catchup_variety = (
+                            "Vary your opening from recent check-ins instead of using a generic "
+                            "template, and reference something specific and recent if it fits naturally."
                         )
-                        reply = await chat(_cid, prompt)
+                        prompt = (
+                            f"Missed morning check-in catch-up: greet the user and ask about their plans. {catchup_variety}"
+                            if _label == "morning" else
+                            f"Missed evening check-in catch-up: ask briefly how their day went. {catchup_variety}"
+                        )
+                        reply = await chat(_cid, prompt, touch_activity=False)
                         await ctx.bot.send_message(chat_id=_cid, text=reply)
+                        u["pending_checkin"] = _label
+                        save_state(state)
                         db_log_job(str(_cid), f"checkin_{_label}")
                     app.job_queue.run_once(_catchup, when=10)
 
@@ -3461,11 +3515,14 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Usage: /journal <your entry>")
         return
-    db_add_journal(str(update.effective_chat.id), text, auto=False)
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    db_add_journal(str(chat_id), text, auto=False)
+    entry_date = _local_date(datetime.utcnow().isoformat(), user.get("timezone", "UTC"))
 
     prompt = f'The user just wrote this journal entry: "{text}"\nOffer a brief, warm reflection in 2-3 sentences.'
-    reply = await chat(update.effective_chat.id, prompt)
-    await update.message.reply_text(f"\U0001f4d4 Saved.\n\n{reply}")
+    reply = await chat(chat_id, prompt)
+    await update.message.reply_text(f"\U0001f4d4 Saved ({entry_date}).\n\n{reply}")
 
 
 async def weekly_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
