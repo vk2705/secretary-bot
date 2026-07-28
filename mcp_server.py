@@ -12,6 +12,7 @@ Run with:
 """
 
 import calendar
+import functools
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -28,9 +31,21 @@ STATE_FILE = Path(os.environ.get("BOT_STATE_FILE", Path(__file__).parent / "stat
 DB_FILE = Path(os.environ.get("BOT_DB_FILE", Path(__file__).parent / "bot_memory.db"))
 
 # Public hostname for the remote HTTPS deployment (see "remote HTTPS mode"
-# below). Only affects HTTP transports' DNS-rebinding Host-header check;
-# irrelevant to the default stdio transport used by Claude Desktop/Code.
+# below). Only affects HTTP transports' DNS-rebinding Host-header check and
+# OIDC login redirects; irrelevant to the default stdio transport used by
+# Claude Desktop/Code.
 _REMOTE_DOMAIN = os.environ.get("MCP_REMOTE_DOMAIN", "")
+
+# Only the remote HTTP transport needs auth -- stdio is a locally-invoked
+# trusted process (Claude Desktop/Code spawn it directly), so it's exempt
+# (see _check_access below).
+_oauth_provider = None
+if os.environ.get("MCP_TRANSPORT") == "remote":
+    from mcp_oauth import ADMIN_SCOPE, GoogleOAuthProxyProvider
+
+    _oauth_provider = GoogleOAuthProxyProvider(callback_url=f"https://{_REMOTE_DOMAIN}/google/callback")
+else:
+    ADMIN_SCOPE = "*"
 
 mcp = FastMCP(
     "secretary-bot",
@@ -44,7 +59,43 @@ mcp = FastMCP(
         allowed_hosts=["127.0.0.1:*", "localhost:*", f"{_REMOTE_DOMAIN}:*", _REMOTE_DOMAIN],
         allowed_origins=["https://claude.ai"],
     ) if _REMOTE_DOMAIN else None,
+    auth_server_provider=_oauth_provider,
+    auth=AuthSettings(
+        issuer_url=f"https://{_REMOTE_DOMAIN}",
+        resource_server_url=f"https://{_REMOTE_DOMAIN}/mcp",
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+    ) if _oauth_provider else None,
 )
+
+if _oauth_provider is not None:
+    @mcp.custom_route("/google/callback", methods=["GET"])
+    async def _google_oauth_callback(request):
+        return await _oauth_provider.handle_google_callback(request)
+
+
+def _check_access(chat_id: str) -> None:
+    """Enforce that the authenticated caller may act on this chat_id.
+
+    A no-op under stdio (no HTTP auth layer at all -> get_access_token() is
+    always None there). Under the remote transport, RequireAuthMiddleware
+    already rejects unauthenticated requests before any tool runs, so a
+    token is always present here; its `subject` is the chat_id resolved at
+    Google-login time (or "*" for an admin entry in MCP_OIDC_USERS).
+    """
+    token = get_access_token()
+    if token is None:
+        return
+    if token.subject != ADMIN_SCOPE and token.subject != str(chat_id):
+        raise PermissionError(f"Not authorized to access chat_id {chat_id}")
+
+
+def _scoped(fn):
+    """Decorator for tools whose first argument is chat_id: enforces _check_access."""
+    @functools.wraps(fn)
+    def wrapper(chat_id, *args, **kwargs):
+        _check_access(str(chat_id))
+        return fn(chat_id, *args, **kwargs)
+    return wrapper
 
 
 def _db() -> sqlite3.Connection:
@@ -124,10 +175,15 @@ def _timezone(chat_id: str, fallback: str) -> str:
 
 @mcp.tool()
 def list_users() -> list[dict]:
-    """List all registered bot users with basic info."""
+    """List registered bot users with basic info (admins see everyone; a
+    caller scoped to a single chat_id sees only their own entry)."""
     state = _load()
+    token = get_access_token()
+    only_chat_id = token.subject if (token is not None and token.subject != ADMIN_SCOPE) else None
     result = []
     for cid, u in state.get("users", {}).items():
+        if only_chat_id is not None and cid != only_chat_id:
+            continue
         activity = sorted(u.get("activity_days", []))
         result.append({
             "chat_id": cid,
@@ -146,6 +202,7 @@ def list_users() -> list[dict]:
 # ─────────────── tools: tasks ───────────────
 
 @mcp.tool()
+@_scoped
 def get_tasks(chat_id: str) -> dict:
     """Get all active tasks for a user."""
     state = _load()
@@ -157,6 +214,7 @@ def get_tasks(chat_id: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 def add_task(chat_id: str, text: str, due_date: str = "", recur: str = "") -> dict:
     """
     Add a task for a user.
@@ -191,6 +249,7 @@ def add_task(chat_id: str, text: str, due_date: str = "", recur: str = "") -> di
 
 
 @mcp.tool()
+@_scoped
 def complete_task(chat_id: str, task_number: int) -> dict:
     """
     Mark a task as done. Non-recurring tasks are archived; recurring tasks
@@ -237,6 +296,7 @@ def complete_task(chat_id: str, task_number: int) -> dict:
 
 
 @mcp.tool()
+@_scoped
 def remove_task(chat_id: str, task_number: int) -> dict:
     """Permanently delete a task (use complete_task to archive instead)."""
     state = _load()
@@ -250,6 +310,7 @@ def remove_task(chat_id: str, task_number: int) -> dict:
 
 
 @mcp.tool()
+@_scoped
 def get_archived_tasks(chat_id: str, limit: int = 20) -> dict:
     """Get recently completed tasks (most recent first)."""
     state = _load()
@@ -261,6 +322,7 @@ def get_archived_tasks(chat_id: str, limit: int = 20) -> dict:
 # ─────────────── tools: habits ───────────────
 
 @mcp.tool()
+@_scoped
 def get_habits(chat_id: str) -> list[dict]:
     """Get all habits with current streak and today's completion status."""
     state = _load()
@@ -280,6 +342,7 @@ def get_habits(chat_id: str) -> list[dict]:
 
 
 @mcp.tool()
+@_scoped
 def log_habit(chat_id: str, habit_name: str) -> dict:
     """Mark a habit as done for today."""
     state = _load()
@@ -302,6 +365,7 @@ def log_habit(chat_id: str, habit_name: str) -> dict:
 # ─────────────── tools: trackers ───────────────
 
 @mcp.tool()
+@_scoped
 def get_trackers(chat_id: str) -> list[dict]:
     """Get all custom trackers with their latest value and recent history."""
     state = _load()
@@ -322,6 +386,7 @@ def get_trackers(chat_id: str) -> list[dict]:
 
 
 @mcp.tool()
+@_scoped
 def log_tracker(chat_id: str, tracker_name: str, value: float) -> dict:
     """Log a numeric value to a user's tracker."""
     state = _load()
@@ -341,6 +406,7 @@ def log_tracker(chat_id: str, tracker_name: str, value: float) -> dict:
 # ─────────────── tools: journal (SQLite) ───────────────
 
 @mcp.tool()
+@_scoped
 def get_journal(chat_id: str, limit: int = 10) -> list[dict]:
     """Get recent journal entries from bot_memory.db (most recent first)."""
     with _db() as con:
@@ -352,6 +418,7 @@ def get_journal(chat_id: str, limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
+@_scoped
 def add_journal_entry(chat_id: str, text: str) -> dict:
     """Save a journal entry for a user into bot_memory.db."""
     ts = datetime.utcnow().isoformat()
@@ -367,6 +434,7 @@ def add_journal_entry(chat_id: str, text: str) -> dict:
 # ─────────────── tools: notes (SQLite) ───────────────
 
 @mcp.tool()
+@_scoped
 def get_notes(chat_id: str) -> dict:
     """Get all quick notes for a user from bot_memory.db."""
     with _db() as con:
@@ -381,6 +449,7 @@ def get_notes(chat_id: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 def add_note(chat_id: str, text: str) -> dict:
     """Save a quick note for a user into bot_memory.db."""
     ts = datetime.utcnow().isoformat()
@@ -394,6 +463,7 @@ def add_note(chat_id: str, text: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 def remove_note(chat_id: str, note_number: int) -> dict:
     """Delete a note by its 1-based number, as shown by get_notes()."""
     with _db() as con:
@@ -411,6 +481,7 @@ def remove_note(chat_id: str, note_number: int) -> dict:
 # ─────────────── tools: memory (SQLite) ───────────────
 
 @mcp.tool()
+@_scoped
 def get_memory(chat_id: str) -> dict:
     """
     Get everything the bot has learned/remembered about a user:
@@ -436,6 +507,7 @@ def get_memory(chat_id: str) -> dict:
 # ─────────────── tools: stats & overview ───────────────
 
 @mcp.tool()
+@_scoped
 def get_user_stats(chat_id: str) -> dict:
     """Get a full stats overview for a user."""
     state = _load()
@@ -482,6 +554,7 @@ def get_user_stats(chat_id: str) -> dict:
 
 
 @mcp.tool()
+@_scoped
 def get_reminders(chat_id: str) -> list[dict]:
     """List all scheduled reminders for a user."""
     state = _load()
@@ -551,54 +624,37 @@ def resource_stats(chat_id: str) -> str:
 # MCP_REMOTE_PORT, the same pattern used for the Alteon MCP server on this
 # box. Do not point this at 0.0.0.0/443 directly; that port belongs to nginx.
 #
-# claude.ai's "Add custom connector" dialog has no field for a bearer token
-# or custom header -- just a URL (plus optional OAuth client id/secret). So
-# instead of an Authorization header, the shared secret is a query parameter
-# baked into the URL you paste into claude.ai: https://host/mcp?key=<token>.
+# Auth is real OIDC now (see mcp_oauth.py), not a shared ?key= token: this
+# server acts as an OAuth 2.1 Authorization Server towards MCP clients (so
+# claude.ai's "Add custom connector" dialog, which supports an OAuth
+# client id/secret, can register a client and run the standard
+# authorize+PKCE dance), while delegating the actual login step to Google.
+# FastMCP wires up /.well-known/oauth-protected-resource,
+# /.well-known/oauth-authorization-server, /authorize, /token, and
+# /register automatically from the `auth`/`auth_server_provider` passed to
+# FastMCP(...) above; the one route we add ourselves is /google/callback,
+# which Google redirects back to after the user logs in.
 
 _log = logging.getLogger("secretary_mcp.remote")
 
 
-class _TokenAuthMiddleware:
-    """Reject any request to the MCP endpoint whose ?key= doesn't match MCP_REMOTE_TOKEN.
+class _RequestLogMiddleware:
+    """Log every request (method, path, client, status) for debugging connector
+    issues via `journalctl -u secretary-mcp.service`. No gating here -- auth
+    is enforced by the SDK's own bearer-auth middleware, wired in via
+    FastMCP(auth=..., auth_server_provider=...) above."""
 
-    Only gates the actual /mcp route -- everything else (in particular the
-    OAuth discovery paths claude.ai's connector probes, like
-    /.well-known/oauth-protected-resource and /register) is passed through
-    to the app, which has no auth configured and 404s them naturally. That
-    404 is what tells the client "no OAuth here, just use the URL's token."
-
-    Rejects with 403, not 401: per the MCP Authorization spec, a 401 is
-    specifically the signal that tells a client "this resource requires
-    OAuth" and makes it attempt discovery + dynamic client registration
-    against this server (which doesn't implement either, so it always fails
-    with a "couldn't register" error in the client). 403 ("forbidden, and
-    auth won't fix it") carries no such meaning, so the shared-secret check
-    still works but doesn't get misread as an OAuth challenge.
-
-    Every request is logged (method, path, client, whether ?key= matched,
-    and the eventual response status) for debugging connector issues via
-    `journalctl -u secretary-mcp.service`. The token value itself is never
-    logged, only whether it matched.
-    """
-
-    def __init__(self, app, token: str):
+    def __init__(self, app):
         self.app = app
-        self.token = token
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        from urllib.parse import parse_qs
-        query = parse_qs(scope.get("query_string", b"").decode())
-        key_valid = query.get("key", [None])[0] == self.token
         client = scope.get("client") or ("?", 0)
         headers = dict(scope.get("headers") or [])
         user_agent = headers.get(b"user-agent", b"").decode(errors="replace")
-        gated = scope.get("path", "").startswith("/mcp")
-
         status = {}
 
         async def logging_send(message):
@@ -606,28 +662,22 @@ class _TokenAuthMiddleware:
                 status["code"] = message["status"]
             await send(message)
 
-        if gated and not key_valid:
-            from starlette.responses import PlainTextResponse
-            response = PlainTextResponse("Forbidden", status_code=403)
-            await response(scope, receive, logging_send)
-        else:
-            await self.app(scope, receive, logging_send)
+        await self.app(scope, receive, logging_send)
 
         _log.info(
-            "%s %s client=%s:%s key_valid=%s ua=%r status=%s",
+            "%s %s client=%s:%s ua=%r status=%s",
             scope.get("method"), scope.get("path"),
-            client[0], client[1], key_valid, user_agent, status.get("code", "?"),
+            client[0], client[1], user_agent, status.get("code", "?"),
         )
 
 
 def _run_remote() -> None:
     import uvicorn
 
-    token = os.environ["MCP_REMOTE_TOKEN"]
     host = os.environ.get("MCP_REMOTE_HOST", "127.0.0.1")
     port = int(os.environ.get("MCP_REMOTE_PORT", "8545"))
 
-    app = _TokenAuthMiddleware(mcp.streamable_http_app(), token)
+    app = _RequestLogMiddleware(mcp.streamable_http_app())
     uvicorn.run(app, host=host, port=port)
 
 

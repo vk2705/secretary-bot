@@ -355,6 +355,7 @@ python3 -m pytest tests/test_bot.py -k "nl" -v
 secretary-bot/
 ├── bot.py               # Main bot (~3500 lines)
 ├── mcp_server.py        # MCP server exposing bot data to Claude Desktop
+├── mcp_oauth.py         # Google OIDC login for mcp_server.py's remote transport
 ├── state.json           # User data (gitignored)
 ├── bot_memory.db        # SQLite notes + journal (gitignored)
 ├── nohup.out            # Log file (gitignored)
@@ -382,15 +383,23 @@ python3 mcp_server.py
 
 claude.ai's web app can't reach a local stdio server, so a second deployment runs `mcp_server.py` in `MCP_TRANSPORT=remote` mode as a long-running service (systemd unit `secretary-mcp.service`), listening on `127.0.0.1:8545`. nginx terminates TLS on port 443 for the public hostname and reverse-proxies to that port (`/etc/nginx/conf.d/mcp-sbot.alteon.help.conf`) — the app itself never binds a public port directly. This box also fronts an unrelated Alteon MCP server the same way, routed by hostname.
 
-Add a custom connector in claude.ai with:
+Auth is real OIDC (`mcp_oauth.py`), not a shared token: `mcp_server.py` acts as an OAuth 2.1 Authorization Server towards MCP clients — claude.ai's "Add custom connector" dialog does the standard dynamic-client-registration + authorize + PKCE dance against it — but delegates the actual login step to Google. After a user approves the Google consent screen, `mcp_server.py` mints its own short-lived signed access token that encodes the caller's Telegram `chat_id`, resolved via the `MCP_OIDC_USERS` mapping; every tool call is then restricted to that `chat_id` (or every `chat_id`, for an entry mapped to the special `"*"` admin value).
+
+Add a custom connector in claude.ai with just the base URL — no query-string token needed anymore:
 
 ```
-https://mcp-sbot.alteon.help/mcp?key=<MCP_REMOTE_TOKEN>
+https://mcp-sbot.alteon.help/mcp
 ```
 
-`<MCP_REMOTE_TOKEN>` is the value of `MCP_REMOTE_TOKEN` in `mcp_remote.env` (gitignored — not reproduced here since this file is committed to git). Since claude.ai's connector dialog only takes a URL, the shared secret rides as a `?key=` query param instead of an `Authorization` header; a request with a missing or wrong key gets `403 Forbidden` (deliberately not `401`, which would make the client think this server supports OAuth and attempt a doomed client-registration flow — see the docstring on `_TokenAuthMiddleware` in `mcp_server.py`). All requests are logged to `journalctl -u secretary-mcp.service` (method, path, client, key validity, status — never the token value itself) for debugging connector issues.
+claude.ai will discover the OAuth endpoints from `/.well-known/oauth-protected-resource`, register itself, and redirect the user to Google to log in.
 
-Config (`mcp_remote.env`): `MCP_REMOTE_TOKEN`, `MCP_REMOTE_DOMAIN` (public hostname, used for the Host-header DNS-rebinding check), `MCP_REMOTE_HOST`/`MCP_REMOTE_PORT` (local bind address, default `127.0.0.1:8545`).
+Config (`mcp_remote.env`, gitignored):
+- `GOOGLE_OIDC_CLIENT_ID` / `GOOGLE_OIDC_CLIENT_SECRET` — an OAuth 2.0 Web application client from Google Cloud Console, with `https://mcp-sbot.alteon.help/google/callback` registered as its authorized redirect URI.
+- `MCP_OIDC_USERS` — JSON mapping of allowed Google account emails to Telegram `chat_id` (or `"*"` for admin access to every user), e.g. `{"vitaly.kroivets@gmail.com": "123456789"}`. Anyone not in this map is rejected at the Google-callback step with `403`.
+- `MCP_OIDC_JWT_SECRET` — HMAC secret this server uses to sign its own access/refresh tokens. Generate one the same way as `MASTER_KEY`: `python3 -c "import secrets; print(secrets.token_hex(32))"`. If unset, an ephemeral secret is generated at startup and logged as a warning — every issued token stops validating on the next restart, forcing callers to log back in.
+- `MCP_REMOTE_DOMAIN` (public hostname — used both for the Host-header DNS-rebinding check and as the OIDC `issuer_url`/Google callback base), `MCP_REMOTE_HOST`/`MCP_REMOTE_PORT` (local bind address, default `127.0.0.1:8545`).
+
+All OAuth state (pending Google logins, issued codes, refresh tokens) is kept in memory only, so a restart just forces a fresh login — nothing sensitive is written to disk. Requests are logged to `journalctl -u secretary-mcp.service` (method, path, client, status) for debugging connector issues.
 
 ### Tools exposed
 
