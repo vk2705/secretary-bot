@@ -95,49 +95,63 @@ Explicitly excluded. Documented to prevent scope creep.
 
 ## Traceability
 
-Populated during roadmap creation.
+Populated during roadmap creation (2026-08-01).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DEBUG-01 | TBD | Pending |
-| DEBUG-02 | TBD | Pending |
-| DEBUG-03 | TBD | Pending |
-| RETR-01 | TBD | Pending |
-| RETR-02 | TBD | Pending |
-| RETR-03 | TBD | Pending |
-| RETR-04 | TBD | Pending |
-| MODEL-01 | TBD | Pending |
-| MODEL-02 | TBD | Pending |
-| MODEL-03 | TBD | Pending |
-| MODEL-04 | TBD | Pending |
-| MODEL-05 | TBD | Pending |
-| MOTIV-01 | TBD | Pending |
-| MOTIV-02 | TBD | Pending |
-| MOTIV-03 | TBD | Pending |
-| MOTIV-04 | TBD | Pending |
-| MOTIV-05 | TBD | Pending |
-| MOTIV-06 | TBD | Pending |
-| MOTIV-07 | TBD | Pending |
-| MOTIV-08 | TBD | Pending |
-| MOTIV-09 | TBD | Pending |
-| PERSONA-01 | TBD | Pending |
-| PERSONA-02 | TBD | Pending |
-| PERSONA-03 | TBD | Pending |
-| PERSONA-04 | TBD | Pending |
-| REINF-01 | TBD | Pending |
-| REINF-02 | TBD | Pending |
-| REINF-03 | TBD | Pending |
-| CONV-01 | TBD | Pending |
-| CONV-02 | TBD | Pending |
-| CONV-03 | TBD | Pending |
-| CONV-04 | TBD | Pending |
-| CONV-05 | TBD | Pending |
+| DEBUG-01 | Phase 1 | Pending |
+| DEBUG-02 | Phase 1 | Pending |
+| DEBUG-03 | Phase 1 | Pending |
+| RETR-01 | Phase 2 | Pending |
+| RETR-02 | Phase 2 | Pending |
+| RETR-03 | Phase 2 | Pending |
+| RETR-04 | Phase 2 | Pending |
+| MODEL-01 | Phase 5 | Pending |
+| MODEL-02 | Phase 5 | Pending |
+| MODEL-03 | Phase 5 | Pending |
+| MODEL-04 | Phase 5 | Pending |
+| MODEL-05 | Phase 5 | Pending |
+| MOTIV-01 | Phase 6 | Pending |
+| MOTIV-02 | Phase 6 | Pending |
+| MOTIV-03 | Phase 6 | Pending |
+| MOTIV-04 | Phase 6 | Pending |
+| MOTIV-05 | Phase 6 | Pending |
+| MOTIV-06 | Phase 6 | Pending |
+| MOTIV-07 | Phase 7 | Pending |
+| MOTIV-08 | Phase 6 | Pending |
+| MOTIV-09 | Phase 6 | Pending |
+| PERSONA-01 | Phase 4 | Pending |
+| PERSONA-02 | Phase 4 | Pending |
+| PERSONA-03 | Phase 4 | Pending |
+| PERSONA-04 | Phase 4 | Pending |
+| REINF-01 | Phase 7 | Pending |
+| REINF-02 | Phase 7 | Pending |
+| REINF-03 | Phase 7 | Pending |
+| CONV-01 | Phase 3 | Pending |
+| CONV-02 | Phase 3 | Pending |
+| CONV-03 | Phase 3 | Pending |
+| CONV-04 | Phase 3 | Pending |
+| CONV-05 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 33 total
-- Mapped to phases: 0
-- Unmapped: 33 ⚠️ (expected prior to roadmap creation)
+- Mapped to phases: 33 ✓
+- Unmapped: 0
+
+**By phase:**
+
+| Phase | Name | Requirements |
+|-------|------|--------------|
+| 1 | Debug and Dry-Run | 3 |
+| 2 | Semantic Retrieval | 4 |
+| 3 | Conversation, Not Buttons | 5 |
+| 4 | Persona You Set by Talking | 4 |
+| 5 | The Model of the User | 5 |
+| 6 | Plans That Survive Contact | 8 |
+| 7 | Why It Mattered, and Forgiveness | 4 |
+
+**Not mapped (deliberately out of this roadmap):** RECALL-01 (v2), AUTH-01/02/03 (Milestone B).
 
 ---
 *Requirements defined: 2026-08-01*
-*Last updated: 2026-08-01 after initial definition*
+*Last updated: 2026-08-01 after roadmap creation*
