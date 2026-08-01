@@ -1,0 +1,1 @@
+{"content":"OpenAI text-embedding-3-small: $0.02/1M tokens, 1536 dims, MTEB 62.3, MIRACL multilingual 44.0. text-embedding-3-large: $0.13/1M tokens, 3072 dims, MTEB 64.6. Small recommended for 95% of use cases; large only when quality is critical.","source":"web","provider":"websearch","confidence":"MEDIUM","fetched_at":"2026-08-01T19:50:57.339Z","ttl":86400000,"kind":"web"}
