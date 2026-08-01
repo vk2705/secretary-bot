@@ -43,6 +43,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - [ ] The model of the user is visible and editable by the user
 - [ ] Why-anchoring: record the reason a task or habit matters, and surface it when motivation dips rather than on a schedule
 - [ ] Implementation intentions: probe for what exactly and when exactly, plus the likely obstacle, then form an if-then and replay it at the obstacle moment
+- [ ] Task decomposition: help break a large or aversive task into concrete next steps, so that "too big to start" stops being the obstacle
 - [ ] Configurable persona: tone, contact frequency, accountability pressure, and explicit never-do rules — all set by talking to the bot, not by a settings screen
 - [ ] Variable reinforcement — acknowledgement that differs each time rather than uniform praise
 - [ ] Identity-based framing alongside outcome framing
@@ -105,6 +106,7 @@ A related bug from the same transcript, journal entries returned without dates, 
 | Accountability pressure is a user-set dial, not a fixed stance | Consistent with the autonomy argument the product is built on, rather than a compromise between two designs | — Pending |
 | Success is judged qualitatively | With one user there is nothing to A/B; inventing metrics would contradict the anti-metric thesis | — Pending |
 | Debug mode is built early, not last | Scheduler-driven behaviour cannot be iterated at one attempt per day | — Pending |
+| Psychology research gets a dedicated researcher | A list derived from ideas we already had can only confirm them; a separate remit is needed to surface mechanisms neither of us proposed | — Pending |
 
 ## Evolution
 
