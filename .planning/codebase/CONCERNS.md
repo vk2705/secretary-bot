@@ -121,7 +121,7 @@ Meanwhile, `bot.py` writes atomically via tempfile + os.replace (`bot.py:514-527
 **Files:** `mcp_server.py:562-620`, nginx configuration (external)
 
 **Current mitigation:** 
-- `_TokenAuthMiddleware` logs only whether key matched, not the token itself (`bot.py` line 616)
+- `_TokenAuthMiddleware` logs only whether key matched, not the token itself (`mcp_server.py:562`)
 - TLS is enforced by nginx
 - Auth is application-level, not HTTP Basic/Bearer (which are standard but also loggable)
 
@@ -182,12 +182,12 @@ Meanwhile, `bot.py` writes atomically via tempfile + os.replace (`bot.py:514-527
 
 ### History and Tracker Log Caps
 
-**Issue:** Conversation history is capped at 20 pairs (40 messages) per user (`MAX_HISTORY = 20`, `bot.py:42`). Tracker logs are capped at 5,000 entries per tracker (`bot.py:1222`). These are enforced by simple list truncation on each append.
+**Issue:** Conversation history is capped at 20 *messages* per user, not 20 exchanges — `user["history"]` is a flat list of `{"role", "content"}` entries truncated by `user["history"][-MAX_HISTORY:]` (`MAX_HISTORY = 20`, `bot.py:42`). Since `chat()` appends both the user turn and the assistant reply, the effective memory is only ~10 exchanges. Tracker logs are capped at 5,000 entries per tracker (`bot.py:1222`). Both are enforced by simple list truncation on each append.
 
-**Files:** `bot.py:1839-1840` (history), `bot.py:1222-1223` (tracker log)
+**Files:** `bot.py:1837-1840` (history append + truncation), `bot.py:1222-1223` (tracker log)
 
 **Impact:** 
-- Long conversations lose context after 20 pairs; important earlier messages are discarded
+- Long conversations lose context after ~10 exchanges; important earlier messages are discarded
 - Heavy tracker users (e.g., daily weight logs for years) lose old data
 - No warning to user when truncation occurs
 - No configurable limits per user
@@ -250,7 +250,7 @@ Meanwhile, `bot.py` writes atomically via tempfile + os.replace (`bot.py:514-527
 - Database size and performance
 - Memory usage or long-running operations
 
-**Files:** `bot.py:3945` (admin_stats command)
+**Files:** `bot.py:3599` (admin_stats command)
 
 **Impact:** 
 - Operational issues (e.g., a user's jobs crashing) go undetected
@@ -265,18 +265,6 @@ Meanwhile, `bot.py` writes atomically via tempfile + os.replace (`bot.py:514-527
 ---
 
 ## Known Limitations
-
-### No Automatic Timezone Update on Location Share
-
-**Issue:** When a user shares a location via Telegram, `handle_location()` calls `get_timezone_from_location()` which is called via tool, but the timezone is only set if the user's current timezone is "UTC" or invalid. If they already have a timezone set, location sharing doesn't update it.
-
-**Files:** `bot.py:3119-3124` (location handler includes logic to avoid overwriting existing timezone if valid)
-
-**Impact:** 
-- Users can't update timezone by sharing location after initial setup
-- Requires manual `/settimezone` command for timezone changes
-
----
 
 ### No Duplicate Task Detection
 
