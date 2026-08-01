@@ -42,18 +42,24 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - [ ] Model of the user: periodically synthesised behavioural regularities, each carrying its supporting evidence and a confidence level
 - [ ] The model of the user is visible and editable by the user
 - [ ] Why-anchoring: record the reason a task or habit matters, and surface it when motivation dips rather than on a schedule
-- [ ] Implementation intentions: probe for what exactly and when exactly, plus the likely obstacle, then form an if-then and replay it at the obstacle moment
-- [ ] Task decomposition: help break a large or aversive task into concrete next steps, so that "too big to start" stops being the obstacle
+- [ ] Implementation intentions: probe for what exactly and when exactly, plus the likely obstacle, then form an if-then and replay it at the obstacle moment (plain if-then, not the full WOOP wish/outcome script — evidence shows the extra steps add little beyond the if-then itself)
+- [ ] Task decomposition: help break a large or aversive task into concrete next steps, distinguishing ambiguity ("don't know the first move") from difficulty ("know it, it's just hard") — decomposition addresses the former
+- [ ] Motivational-interviewing framing: reflect and evoke rather than argue or advise; suppress the reflexive urge to correct
+- [ ] Affect labelling on stalled tasks: name the feeling before problem-solving it, as the first move when a task has stalled
+- [ ] Procrasti-planning detection: notice repeated re-planning with no attempted step, and say so gently
 - [ ] Configurable persona: tone, contact frequency, accountability pressure, and explicit never-do rules — all set by talking to the bot, not by a settings screen
 - [ ] Variable reinforcement — acknowledgement that differs each time rather than uniform praise
-- [ ] Identity-based framing alongside outcome framing
-- [ ] Unprompted recall — occasionally resurface something meaningful from weeks ago
+- [ ] Identity-based framing as occasional garnish only — the flagship 2011 field study behind this technique failed replication in 2016; never templated, never load-bearing, only used when grounded in something actually observed
 - [ ] Streak freeze: a permitted number of missed days that does not break a streak
 - [ ] Remove every inline keyboard; all interaction happens in conversation
 - [ ] Weekly contact is one substantive question, not a statistics report
 - [ ] Ask permission before giving advice
 - [ ] Graceful return after an absence — no accounting, no guilt, one small re-entry
 - [ ] Off-topic conversation is welcome and never steered back to tasks
+
+**Deferred past Milestone A**
+
+- [ ] Unprompted recall — the bot resurfaces something meaningful from weeks ago, unprompted. Highest payoff but highest failure cost: a confident wrong recall directly violates Core Value. Held until the model of the user has enough of a track record to trust unsupervised.
 
 **Milestone B — MCP authentication**
 
@@ -71,6 +77,8 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - **Web or mobile UI** — Telegram is the surface; Claude via MCP is the secondary one.
 - **Scale engineering** — no work premised on large user counts.
 - **Adding more features for their own sake** — the stated goal is a bot that is smarter, not bigger.
+- **The bot authoring the user's plans or goals** — a 2026 preprint found AI-authored goals undermine motivation. The bot elicits and reflects the user's own plan; it does not propose one.
+- **Habit stacking and temptation bundling** — well-evidenced techniques, poor fit here: no environmental or location cue source and no enforcement mechanism in a text medium.
 
 ## Context
 
