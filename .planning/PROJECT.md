@@ -93,7 +93,7 @@ A related bug from the same transcript, journal entries returned without dates, 
 - **Deployment**: the bot runs under `nohup` with no process supervisor; only the MCP server has a systemd unit. Anything requiring reliable background execution inherits this fragility.
 - **Scale**: one user today. Do not engineer for more.
 - **Working style**: ideas are discussed and agreed before any code is written.
-- **Privacy**: the bot holds a personal journal and a behavioural model of a real person. Live secrets and user data (`env`, `mcp_remote.env`, `state.json`, `bot_memory.db`) are gitignored and must never enter planning artifacts.
+- **Privacy**: the bot holds a personal journal and a behavioural model of a real person. Live secrets and user data (`env`, `mcp_remote.env`, `state.json`, `bot_memory.db`) are gitignored and must never enter planning artifacts. Data-at-rest hardening (encryption of journal/observations, stronger key handling) is explicitly deferred — accepted as proportionate to a single-user personal server for this milestone, to be revisited if the user base grows.
 
 ## Key Decisions
 
@@ -107,6 +107,7 @@ A related bug from the same transcript, journal entries returned without dates, 
 | Success is judged qualitatively | With one user there is nothing to A/B; inventing metrics would contradict the anti-metric thesis | — Pending |
 | Debug mode is built early, not last | Scheduler-driven behaviour cannot be iterated at one attempt per day | — Pending |
 | Psychology research gets a dedicated researcher | A list derived from ideas we already had can only confirm them; a separate remit is needed to surface mechanisms neither of us proposed | — Pending |
+| Data-at-rest risk for journal + inferred profile is accepted, not hardened, this milestone | Single user, personal server, proportionate to actual risk today; revisit if the user base grows | — Pending |
 
 ## Evolution
 
