@@ -23,7 +23,7 @@ See: .planning/PROJECT.md (updated 2026-08-01)
 Phase: 1 of 7 (Debug and Dry-Run)
 Plan: 0 of TBD in current phase
 Status: Ready to plan
-Last activity: 2026-08-01 — Roadmap created; 33 v1 requirements mapped across 7 phases
+Last activity: 2026-08-02 - Completed quick task 260802-4rx: Create a start script for bot.py and register it as a systemd service so it survives reboots
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -69,8 +69,14 @@ None yet.
 
 - **Phase 2 research gate (cross-lingual retrieval):** 30-50% degradation is documented even with multilingual models. Must validate against 20-30 real Russian↔English pairs from the actual journal before retrieval is called done. Escalate if precision degrades >10%.
 - **Phase 5 research gate (confidence calibration):** Observation thresholds (occasion count, time window, consistency) must be tuned against the real journal with manual false-positive review, not guessed.
-- **Deploy fragility:** the bot runs under `nohup` with no process supervisor. Anything needing reliable background execution (Phase 5 synthesis job) inherits this.
+- **Deploy fragility (resolved 2026-08-02 for `bot.py`):** `bot.py` now runs under systemd (`secretary-bot.service`, enabled + `Restart=on-failure`), matching the existing `secretary-mcp.service` pattern — see quick task `260802-4rx`. Any *future* background process (e.g. Phase 5 synthesis job) still needs its own supervision if it's not simply scheduled inside `bot.py`'s existing APScheduler jobs.
 - **Known accepted gap:** `mcp_server.py` writes bypass the retrieval index hooks. Documented, not fixed this milestone.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260802-4rx | Create a start script for bot.py and register it as a systemd service so it survives reboots | 2026-08-02 | 11eb9f5 | [260802-4rx-create-a-start-script-for-bot-py-and-reg](./quick/260802-4rx-create-a-start-script-for-bot-py-and-reg/) |
 
 ## Deferred Items
 
