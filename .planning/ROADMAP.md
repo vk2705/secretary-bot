@@ -36,7 +36,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. User can set a simulated "now" for their own account and watch time-dependent behaviour respond to it: a deadline badge for a date that has not arrived, a quiet-hours window that is not currently active, an annual reminder months away
   3. User can ask for the exact assembled system prompt for their account and read it back verbatim — no LLM call made, no message sent, no guessing what the bot was actually told
   4. Debug output containing real journal content and debug commands themselves are owner-gated and never written anywhere tracked by git
-**Plans**: TBD
+**Plans:** 5 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Tracer: owner-gated `/debug` command firing one real scheduled job end-to-end
+- [ ] 01-02-PLAN.md — `/debug prompt`: verbatim system-prompt dump, no LLM call, no disk write
+- [ ] 01-03-PLAN.md — `/debug fire` across all seven scheduled behaviours, guards reported by name
+- [ ] 01-04-PLAN.md — `/debug clock`: persistent, bounded simulated "now" and the time helpers behind it
+- [ ] 01-05-PLAN.md — Ambient breadth: route every compare-and-display site through the simulated clock
 
 **Notes for planning:**
 - This phase comes first because every behaviour later in the milestone is scheduler-driven (check-ins 08:00/21:00, deadline alerts 09:00, habit reminders 20:00, idle nudge 11:00, weekly digest Sunday 10:00). Iterating at one attempt per day is not viable, and no other phase depends on this being deferred.
@@ -162,7 +169,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Debug and Dry-Run | 0/TBD | Not started | - |
+| 1. Debug and Dry-Run | 0/5 | Planned | - |
 | 2. Semantic Retrieval | 0/TBD | Not started | - |
 | 3. Conversation, Not Buttons | 0/TBD | Not started | - |
 | 4. Persona You Set by Talking | 0/TBD | Not started | - |
