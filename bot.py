@@ -251,6 +251,15 @@ def db_get_all_prefs(chat_id: str) -> dict:
     return {r["key"]: r["value"] for r in rows}
 
 
+def db_delete_pref(chat_id: str, key: str) -> None:
+    """Delete a single user preference from SQLite, if present."""
+    with _db() as con:
+        con.execute(
+            "DELETE FROM user_prefs WHERE chat_id=? AND key=?",
+            (str(chat_id), key)
+        )
+
+
 def db_get_notes(chat_id: str) -> list[sqlite3.Row]:
     with _db() as con:
         return con.execute(
@@ -485,6 +494,8 @@ def _new_user(**overrides) -> dict:
         "muted_until": "",
         "llm": {"model": None, "api_key": None},
         "pending_checkin": None,
+        "debug_clock": "",
+        "debug_clock_expires": "",
     }
     base.update(overrides)
     return base
@@ -545,6 +556,17 @@ def get_user(chat_id: int) -> dict:
     db_tz = db_get_pref(key, "timezone")
     if db_tz:
         u["timezone"] = db_tz
+    # Debug-only simulated clock (DEBUG-02): SQLite is the durable store so
+    # the override survives a state.json overwrite/restore, exactly like
+    # timezone above. The expiry is overlaid onto the user dict too, so
+    # _debug_now stays a pure function of the user dict and never needs its
+    # own database access.
+    db_clock = db_get_pref(key, "debug_clock")
+    if db_clock:
+        u["debug_clock"] = db_clock
+    db_clock_expires = db_get_pref(key, "debug_clock_expires")
+    if db_clock_expires:
+        u["debug_clock_expires"] = db_clock_expires
     return u
 
 
@@ -1085,8 +1107,8 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         # Build friendly label
         try:
             _tz = ZoneInfo(tz_str)
-            _now = datetime.now(_tz)
-            _off = _now.strftime("%z")
+            _now_dt = datetime.now(_tz)
+            _off = _now_dt.strftime("%z")
             _label = f"UTC{_off[:3]}:{_off[3:]}" if len(_off) == 5 else tz_str
         except Exception:
             _label = tz_str
@@ -1573,6 +1595,74 @@ def _is_quiet_now(user: dict) -> bool:
     return now >= start_t or now < end_t
 
 
+# ─────────────────────── debug clock (DEBUG-02) ───────────────────────
+# A persistent, bounded, per-account simulated "now" (D-01). `_debug_now` is
+# the single place the override is resolved; `_now`/`_today`/`_utcnow` are
+# thin call-site wrappers that are exact no-ops when no override is active.
+
+def _debug_now(user: dict) -> datetime | None:
+    """Return the active simulated-now override for this user as an aware
+    datetime, or None if no override is active. Swallows a missing,
+    unparseable or expired override rather than raising, in the same shape
+    `_is_muted` already uses for a bad stored value. The expiry is always
+    judged against the real wall clock, never the override, so an override
+    can never extend itself."""
+    raw = user.get("debug_clock")
+    if not raw:
+        return None
+    expires_raw = user.get("debug_clock_expires")
+    if not expires_raw:
+        return None
+    try:
+        expires = datetime.fromisoformat(expires_raw)
+    except ValueError:
+        return None
+    if datetime.utcnow() >= expires:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        try:
+            tz = ZoneInfo(user.get("timezone", "UTC"))
+        except (ZoneInfoNotFoundError, KeyError):
+            tz = ZoneInfo("UTC")
+        dt = dt.replace(tzinfo=tz)
+    return dt
+
+
+def _now(tz, user: dict = None) -> datetime:
+    """datetime.now(tz), or the active simulated-now override converted into
+    tz when one is set for this user."""
+    debug_dt = _debug_now(user) if user is not None else None
+    if debug_dt is not None:
+        return debug_dt.astimezone(tz)
+    return datetime.now(tz)
+
+
+def _today(user: dict = None) -> date:
+    """date.today(), or the active simulated-now override's date when one is
+    set for this user. Deliberately server-local, matching date.today()'s
+    existing semantics with no override active (D-P6) -- not user-timezone
+    aware, and this scope deliberately doesn't change that."""
+    debug_dt = _debug_now(user) if user is not None else None
+    if debug_dt is not None:
+        return debug_dt.date()
+    return date.today()
+
+
+def _utcnow(user: dict = None) -> datetime:
+    """datetime.utcnow(), or the active simulated-now override converted to
+    UTC and stripped to naive when one is set for this user -- so a one-token
+    swap keeps comparisons against naive stored UTC ISO strings (e.g.
+    muted_until) safe."""
+    debug_dt = _debug_now(user) if user is not None else None
+    if debug_dt is not None:
+        return debug_dt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return datetime.utcnow()
+
+
 # ─────────────────────── task helpers ───────────────────────
 
 def _task_text(task) -> str:
@@ -1716,8 +1806,8 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         from zoneinfo import ZoneInfo as _ZI
         _tz = _ZI(tz_str)
         from datetime import datetime as _dt
-        _now = _dt.now(_tz)
-        _offset = _now.strftime("%z")
+        _now_dt = _dt.now(_tz)
+        _offset = _now_dt.strftime("%z")
         _utc_label = f"UTC{_offset[:3]}:{_offset[3:]}" if len(_offset) == 5 else tz_str
     except Exception:
         _utc_label = tz_str

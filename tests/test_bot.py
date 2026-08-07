@@ -1270,6 +1270,173 @@ class TestMuteLogic:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6b: Debug clock / simulated-now helpers (DEBUG-02, plan 01-04)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNowHelper:
+    """`_debug_now`/`_now`/`_today`/`_utcnow`: with no override set every
+    helper is an exact no-op for the standard-library call it replaces; with
+    an override set, resolution is a single guarded function of the user
+    dict, expiring against the real wall clock."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def _with_override(self, cid, clock, hours_ahead=12):
+        """Round-trip an override through SQLite exactly as the real /debug
+        clock command would, then read it back through get_user()."""
+        bot.db_set_pref(str(cid), "debug_clock", clock)
+        expires = (bot.datetime.utcnow() + bot.timedelta(hours=hours_ahead)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expires)
+        return bot.get_user(cid)
+
+    # ── no override: exact no-ops against the standard library ──
+
+    def test_now_helper_no_override_now_matches_stdlib(self):
+        from zoneinfo import ZoneInfo
+        u = fresh_user()
+        before = bot.datetime.now(ZoneInfo("UTC"))
+        result = bot._now(ZoneInfo("UTC"), user=u)
+        after = bot.datetime.now(ZoneInfo("UTC"))
+        assert before <= result <= after
+        assert bot._now(ZoneInfo("UTC")) is not None  # user=None default also works
+
+    def test_now_helper_no_override_today_matches_stdlib(self):
+        u = fresh_user()
+        assert bot._today(user=u) == date.today()
+        assert bot._today() == date.today()
+
+    def test_now_helper_no_override_utcnow_matches_stdlib(self):
+        from datetime import timedelta as _td
+        u = fresh_user()
+        before = bot.datetime.utcnow()
+        result = bot._utcnow(user=u)
+        after = bot.datetime.utcnow()
+        assert before - _td(seconds=1) <= result <= after + _td(seconds=1)
+
+    def test_now_helper_no_override_debug_now_is_none(self):
+        u = fresh_user()
+        assert bot._debug_now(u) is None
+
+    # ── override set: resolution and conversion ──
+
+    def test_now_helper_override_resolves_aware_local_time(self):
+        from zoneinfo import ZoneInfo
+        cid = 9700
+        u = self._with_override(cid, "2027-03-05T09:30")
+        u["timezone"] = "Europe/Berlin"
+        dt = bot._debug_now(u)
+        assert dt is not None and dt.tzinfo is not None
+        assert (dt.year, dt.month, dt.day, dt.hour, dt.minute) == (2027, 3, 5, 9, 30)
+
+    def test_now_helper_today_matches_override_date(self):
+        cid = 9701
+        u = self._with_override(cid, "2027-03-05T09:30")
+        u["timezone"] = "Europe/Berlin"
+        assert bot._today(user=u) == date(2027, 3, 5)
+
+    def test_now_helper_now_converts_to_requested_tz(self):
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+        cid = 9702
+        u = self._with_override(cid, "2027-03-05T09:30")
+        u["timezone"] = "Europe/Berlin"
+        expected_berlin = _dt(2027, 3, 5, 9, 30, tzinfo=ZoneInfo("Europe/Berlin"))
+        expected_utc = expected_berlin.astimezone(ZoneInfo("UTC"))
+        assert bot._now(ZoneInfo("UTC"), user=u) == expected_utc
+
+    def test_now_helper_date_only_override_midnight_local(self):
+        cid = 9703
+        u = self._with_override(cid, "2027-03-05")
+        dt = bot._debug_now(u)
+        assert (dt.hour, dt.minute) == (0, 0)
+        assert bot._today(user=u) == date(2027, 3, 5)
+
+    def test_now_helper_utcnow_override_naive_and_comparable(self):
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+        cid = 9704
+        u = self._with_override(cid, "2027-03-05T09:30")
+        u["timezone"] = "Europe/Berlin"
+        result = bot._utcnow(user=u)
+        assert result.tzinfo is None
+        expected_berlin = _dt(2027, 3, 5, 9, 30, tzinfo=ZoneInfo("Europe/Berlin"))
+        expected_naive_utc = expected_berlin.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        assert result == expected_naive_utc
+        # naive-vs-naive comparison, matching the shape muted_until uses
+        assert isinstance(result < bot.datetime.utcnow() + bot.timedelta(days=1), bool)
+
+    # ── expiry and malformed input: never raise, treated as absent ──
+
+    def test_now_helper_expired_override_treated_as_absent(self):
+        cid = 9705
+        bot.db_set_pref(str(cid), "debug_clock", "2020-01-01T00:00")
+        expired = (bot.datetime.utcnow() - bot.timedelta(hours=1)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expired)
+        u = bot.get_user(cid)
+        assert bot._debug_now(u) is None
+        assert bot._today(user=u) == date.today()
+
+    def test_now_helper_unparseable_override_returns_none(self):
+        cid = 9706
+        u = self._with_override(cid, "not-a-date")
+        assert bot._debug_now(u) is None
+
+    def test_now_helper_unparseable_expiry_returns_none(self):
+        cid = 9707
+        bot.db_set_pref(str(cid), "debug_clock", "2027-03-05T09:30")
+        bot.db_set_pref(str(cid), "debug_clock_expires", "not-a-date")
+        u = bot.get_user(cid)
+        assert bot._debug_now(u) is None
+
+    def test_now_helper_missing_expiry_returns_none(self):
+        cid = 9708
+        bot.db_set_pref(str(cid), "debug_clock", "2027-03-05T09:30")
+        u = bot.get_user(cid)
+        assert bot._debug_now(u) is None
+
+    # ── storage: get_user overlay and db_delete_pref ──
+
+    def test_now_helper_get_user_overlays_debug_clock_sqlite_wins(self):
+        cid = 9709
+        bot.state["users"][str(cid)] = fresh_user(debug_clock="stale-in-state-json")
+        bot.db_set_pref(str(cid), "debug_clock", "2027-03-05T09:30")
+        expires = (bot.datetime.utcnow() + bot.timedelta(hours=12)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expires)
+        u = bot.get_user(cid)
+        assert u["debug_clock"] == "2027-03-05T09:30"
+
+    def test_now_helper_db_delete_pref_removes_only_named_key(self):
+        cid_a, cid_b = 9710, 9711
+        bot.db_set_pref(str(cid_a), "debug_clock", "2027-01-01T00:00")
+        bot.db_set_pref(str(cid_a), "timezone", "Europe/Berlin")
+        bot.db_set_pref(str(cid_b), "debug_clock", "2027-02-02T00:00")
+        bot.db_delete_pref(str(cid_a), "debug_clock")
+        assert bot.db_get_pref(str(cid_a), "debug_clock") is None
+        assert bot.db_get_pref(str(cid_a), "timezone") == "Europe/Berlin"
+        assert bot.db_get_pref(str(cid_b), "debug_clock") == "2027-02-02T00:00"
+
+    # ── shadowing-local regression guard (D-P6 hard prerequisite) ──
+
+    def test_now_helper_set_timezone_tool_no_shadow_regression(self):
+        """The module-level _now helper must remain callable from inside
+        _execute_tool's set_timezone branch after the local rename."""
+        cid = 9712
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_timezone", {"timezone": "Europe/Berlin"}))
+        assert result["success"] is True
+        assert result["timezone"] == "Europe/Berlin"
+
+    def test_now_helper_build_system_prompt_no_shadow_regression(self):
+        """The module-level _now helper must remain callable from inside
+        build_system_prompt after the local rename."""
+        cid = 9713
+        u = fresh_user()
+        prompt = bot.build_system_prompt(u, cid)
+        assert isinstance(prompt, str) and len(prompt) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 7: Parse helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
