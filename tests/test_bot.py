@@ -3015,3 +3015,163 @@ class TestDebugClockAmbient:
         lines_real = bot._habit_summary_lines(habits)
         assert "○" in lines_real[0]
 
+    # ── Task 2: job runners, tool branches, command handlers ──
+
+    def test_weekly_digest_runner_sunday_override_does_normal_work(self):
+        """2027-06-13 is a Sunday: with the clock moved there the runner does
+        its normal work instead of reporting the Sunday gate."""
+        cid = 9910
+        bot.state["users"][str(cid)] = fresh_user()
+        self._with_clock(cid, "2027-06-13T10:00:00")
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Nice week!")):
+            result = run(bot._run_weekly_digest(context, cid))
+        assert result is None
+        context.bot.send_message.assert_awaited_once()
+
+    def test_weekly_digest_runner_non_sunday_override_reports_gate(self):
+        """2027-06-14 is a Monday: the runner reports the Sunday gate instead
+        of doing its normal work -- paired with the Sunday case above."""
+        cid = 9911
+        bot.state["users"][str(cid)] = fresh_user()
+        self._with_clock(cid, "2027-06-14T10:00:00")
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Nice week!")):
+            result = run(bot._run_weekly_digest(context, cid))
+        assert result == "not sunday"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_deadline_alert_runner_matches_annual_reminder_months_away(self):
+        cid = 9912
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["reminders"] = [
+            {"id": "r1", "time": "09:00", "message": "Anniversary",
+             "once": False, "annual": True, "date": "11-25"}
+        ]
+        self._with_clock(cid, "2027-11-25T09:00:00")
+        context = _debug_context([])
+        result = run(bot._run_deadline_alert(context, cid))
+        assert result is None
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "Anniversary" in kwargs["text"]
+
+    def test_deadline_alert_runner_reports_overdue_by_simulated_week(self):
+        cid = 9913
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["tasks"] = [
+            {"text": "Ship the report", "due": "2027-06-01"}
+        ]
+        self._with_clock(cid, "2027-06-08T09:00:00")
+        context = _debug_context([])
+        result = run(bot._run_deadline_alert(context, cid))
+        assert result is None
+        _, kwargs = context.bot.send_message.call_args
+        assert "Overdue 7d" in kwargs["text"]
+
+    def test_idle_nudge_runner_four_days_past_does_normal_work(self):
+        cid = 9914
+        bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"])
+        bot.state["users"][str(cid)]["activity_days"] = ["2027-06-01"]
+        self._with_clock(cid, "2027-06-05T09:00:00")  # 4 days past
+        context = _debug_context([])
+        result = run(bot._run_idle_nudge(context, cid))
+        assert result is None
+        context.bot.send_message.assert_awaited_once()
+
+    def test_idle_nudge_runner_one_day_past_reports_not_idle_enough(self):
+        cid = 9915
+        bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"])
+        bot.state["users"][str(cid)]["activity_days"] = ["2027-06-01"]
+        self._with_clock(cid, "2027-06-02T09:00:00")  # 1 day past
+        context = _debug_context([])
+        result = run(bot._run_idle_nudge(context, cid))
+        assert result == "no recent inactivity"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_habit_reminder_runner_lists_undone_habit_on_simulated_date(self):
+        cid = 9916
+        bot.state["users"][str(cid)] = fresh_user(
+            habits={"meditation": {"completions": ["2027-06-01"], "created": "2027-06-01"}}
+        )
+        self._with_clock(cid, "2027-06-02T09:00:00")  # no completion for this date
+        context = _debug_context([])
+        result = run(bot._run_habit_reminder(context, cid))
+        assert result is None
+        _, kwargs = context.bot.send_message.call_args
+        assert "meditation" in kwargs["text"]
+
+    def test_get_current_time_tool_reports_simulated_date(self):
+        cid = 9917
+        bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
+        self._with_clock(cid, "2027-06-15T14:30:00")
+        result = run(bot._execute_tool(cid, "get_current_time", {}))
+        assert result["date"] == "2027-06-15"
+        assert result["time"] == "14:30"
+
+    def test_get_habits_tool_reports_done_today_on_simulated_date(self):
+        cid = 9918
+        bot.state["users"][str(cid)] = fresh_user(
+            habits={"meditation": {"completions": ["2027-06-15"], "created": "2027-06-01"}}
+        )
+        self._with_clock(cid, "2027-06-15T09:00:00")
+        result = run(bot._execute_tool(cid, "get_habits", {}))
+        habit = result["habits"][0]
+        assert habit["done_today"] is True
+        assert habit["streak"] == 1
+
+    def test_time_cmd_reports_simulated_date(self):
+        cid = 9919
+        bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
+        self._with_clock(cid, "2027-06-15T14:30:00")
+        update = _debug_update(cid)
+        run(bot.time_cmd(update, _debug_context([])))
+        text = update.message.reply_text.call_args[0][0]
+        assert "14:30" in text
+        assert "2027" in text
+
+    def test_habit_cmd_stats_last_seven_days_uses_simulated_date(self):
+        cid = 9920
+        bot.state["users"][str(cid)] = fresh_user(
+            habits={"meditation": {"completions": ["2027-06-15"], "created": "2027-06-01"}}
+        )
+        self._with_clock(cid, "2027-06-15T09:00:00")
+        update = _debug_update(cid)
+        run(bot.habit_cmd(update, _debug_context(["stats", "meditation"])))
+        text = update.message.reply_text.call_args[0][0]
+        assert "Current streak: 1 day" in text
+
+    def test_my_stats_seven_day_chart_uses_simulated_date(self):
+        cid = 9921
+        bot.state["users"][str(cid)] = fresh_user(activity_days=["2027-06-15"])
+        self._with_clock(cid, "2027-06-15T09:00:00")
+        update = _debug_update(cid)
+        run(bot.my_stats(update, _debug_context([])))
+        text = update.message.reply_text.call_args[0][0]
+        assert "█" in text  # today's cell in the 7-day chart is filled
+
+    def test_no_override_job_runners_and_commands_unchanged(self):
+        """Control: with no override active, the runners and command handlers
+        touched by Task 2 behave exactly as before this plan (T-1-19)."""
+        cid = 9922
+        bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
+        result = run(bot._execute_tool(cid, "get_current_time", {}))
+        assert result["date"] == date.today().isoformat()
+
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="x")):
+            result = run(bot._run_weekly_digest(context, cid))
+        expected = None if date.today().weekday() == 6 else "not sunday"
+        assert result == expected
+
+    def test_once_delay_arithmetic_unaffected_by_active_override(self):
+        """The one-shot reminder delay computation (Table B exclusion, second
+        prohibition) produces the same value whether or not an override is
+        active -- it must never route through the simulated clock."""
+        cid = 9923
+        bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
+        no_override = bot._parse_once_delay("30m", "UTC")
+        self._with_clock(cid, "2030-01-01T00:00:00")
+        with_override = bot._parse_once_delay("30m", "UTC")
+        assert no_override == with_override == 1800.0
+

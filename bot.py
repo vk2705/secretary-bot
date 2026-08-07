@@ -1152,7 +1152,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             tz = ZoneInfo(user.get("timezone", "UTC"))
         except Exception:
             tz = ZoneInfo("UTC")
-        now = datetime.now(tz)
+        now = _now(tz, user=user)
         return {
             "time": now.strftime("%H:%M"),
             "date": now.strftime("%Y-%m-%d"),
@@ -1989,7 +1989,7 @@ async def _run_checkin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: 
                 if log:
                     last_ts = log[-1]["ts"][:10]
                     try:
-                        if (date.today() - date.fromisoformat(last_ts)).days >= 2:
+                        if (_today(user=user_now) - date.fromisoformat(last_ts)).days >= 2:
                             stale.append(tname)
                     except ValueError:
                         pass
@@ -2105,7 +2105,7 @@ async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         return "quiet hours"
     if _is_muted(u):
         return "muted"
-    today = date.today()
+    today = _today(user=u)
     alerts = []
     for task in u.get("tasks", []):
         due = _task_due(task)
@@ -2162,7 +2162,7 @@ async def _run_habit_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     if _is_muted(u):
         return "muted"
     habits = u.get("habits", {})
-    today_str = date.today().isoformat()
+    today_str = _today(user=u).isoformat()
     undone = [n for n, d in habits.items() if today_str not in d.get("completions", [])]
     if not undone:
         return "nothing undone"
@@ -2198,7 +2198,7 @@ async def _run_idle_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> s
     if not days:
         return "no recent inactivity"
     last_active = date.fromisoformat(days[-1])
-    if (date.today() - last_active).days < 3:
+    if (_today(user=u) - last_active).days < 3:
         return "no recent inactivity"
     try:
         await context.bot.send_message(
@@ -2228,7 +2228,7 @@ async def _run_weekly_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -
         return "muted"
     # Use user's local date for the Sunday check
     tz = ZoneInfo(u.get("timezone", "UTC"))
-    today = datetime.now(tz).date()
+    today = _now(tz, user=u).date()
     if today.weekday() != 6:
         return "not sunday"
     try:
@@ -3081,7 +3081,7 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = ZoneInfo(tz_str)
     except Exception:
         tz = ZoneInfo("UTC")
-    now = datetime.now(tz)
+    now = _now(tz, user=user)
     await update.message.reply_text(
         f"🕐 Your local time: {now.strftime('%H:%M')} on {now.strftime('%A, %d %b %Y')}\n"
         f"Timezone: {tz_str}"
