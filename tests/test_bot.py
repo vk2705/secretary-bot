@@ -1638,3 +1638,88 @@ class TestDebugFire:
         _, kwargs = job_context.bot.send_message.call_args
         assert "Renew passport" in kwargs["text"]
 
+
+class TestDebugOwnerGate:
+    """T-1-01 mitigation: prove the owner gate is a property of the whole
+    /debug command, not of one branch — every argument shape is rejected for
+    non-owners and when MY_CHAT_ID is unset or empty, the gate precedes any
+    get_user() call (so probing registers nothing), string-form comparison
+    accepts an int chat_id, and the command stays out of help output."""
+
+    ARG_SHAPES = [
+        pytest.param([], id="no_args"),
+        pytest.param(["fire"], id="fire"),
+        pytest.param(["clock"], id="clock"),
+        pytest.param(["prompt"], id="prompt"),
+        pytest.param(["wibble"], id="unknown"),
+    ]
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    @pytest.mark.parametrize("args", ARG_SHAPES)
+    def test_debug_owner_gate_rejects_non_owner(self, args):
+        cid = 8100
+        with as_owner(999999):  # someone else is configured as owner
+            update = _debug_update(cid)
+            context = _debug_context(args)
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        context.bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("args", ARG_SHAPES)
+    def test_debug_owner_gate_rejects_when_my_chat_id_unset(self, args):
+        cid = 8200
+        prev = bot.MY_CHAT_ID
+        bot.MY_CHAT_ID = None
+        try:
+            update = _debug_update(cid)
+            context = _debug_context(args)
+            run(bot.debug_cmd(update, context))
+        finally:
+            bot.MY_CHAT_ID = prev
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        context.bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("args", ARG_SHAPES)
+    def test_debug_owner_gate_rejects_when_my_chat_id_empty(self, args):
+        cid = 8300
+        prev = bot.MY_CHAT_ID
+        bot.MY_CHAT_ID = ""
+        try:
+            update = _debug_update(cid)
+            context = _debug_context(args)
+            run(bot.debug_cmd(update, context))
+        finally:
+            bot.MY_CHAT_ID = prev
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_owner_gate_accepts_int_chat_id_against_string_my_chat_id(self):
+        """The gate compares string forms (str(chat_id) != MY_CHAT_ID): an int
+        effective_chat.id must be accepted when MY_CHAT_ID holds the matching
+        string, pinning the coercion against a later silent-lockout regression."""
+        cid = 8400  # plain int, as Telegram actually sends it
+        with as_owner(cid):
+            assert isinstance(bot.MY_CHAT_ID, str)
+            update = _debug_update(cid)
+            context = _debug_context([])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert text != "Admin only."
+
+    def test_debug_owner_gate_probing_registers_no_user(self):
+        """A rejected non-owner call must not call get_user() — probing the
+        command must never register the prober's chat_id as a user."""
+        cid = 8500
+        with as_owner(999999):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "deadline_alert"])
+            run(bot.debug_cmd(update, context))
+        assert str(cid) not in bot.state["users"]
+
+    def test_debug_owner_gate_help_text_omits_debug(self):
+        assert "/debug" not in bot._HELP_TEXT
+        assert "debug" not in bot._HELP_TEXT.lower()
+
