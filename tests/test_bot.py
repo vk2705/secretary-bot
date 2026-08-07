@@ -1863,3 +1863,167 @@ class TestDebugPrompt:
         update.message.reply_text.assert_awaited_once_with("Admin only.")
         mock_build.assert_not_called()
 
+    # ── Task 2: section-by-section, encoding, threshold and determinism edges ──
+
+    _SECTION_CASES = [
+        pytest.param(
+            9400,
+            lambda user, cid: user.__setitem__("context", "I am a software engineer"),
+            "About this user:",
+            id="context",
+        ),
+        pytest.param(
+            9401,
+            lambda user, cid: user.__setitem__("trackers", {
+                "weight": {"unit": "kg", "log": [{"ts": bot.datetime.utcnow().isoformat(), "value": 80.0}]}
+            }),
+            "Recent tracker readings:",
+            id="trackers",
+        ),
+        pytest.param(
+            9402,
+            lambda user, cid: user.__setitem__("habits", {
+                "meditation": {"completions": [], "created": date.today().isoformat()}
+            }),
+            "Today's habits:",
+            id="habits",
+        ),
+        pytest.param(
+            9403,
+            lambda user, cid: user.__setitem__("today_focus", {
+                "date": date.today().isoformat(), "text": "Deep work session"
+            }),
+            "Today's focus:",
+            id="today_focus",
+        ),
+        pytest.param(
+            9404,
+            lambda user, cid: bot.db_add_note(str(cid), "Remember to call the dentist"),
+            "User's recent notes:",
+            id="notes",
+        ),
+        pytest.param(
+            9405,
+            lambda user, cid: bot.db_add_profile_memory(str(cid), "Prefers direct feedback"),
+            "Permanent user facts:",
+            id="profile_memory",
+        ),
+        pytest.param(
+            9406,
+            lambda user, cid: bot.db_add_episodic_memory(str(cid), "Mentioned feeling stressed about work"),
+            "Recent observations (last 30 days):",
+            id="episodic_memory",
+        ),
+        pytest.param(
+            9407,
+            lambda user, cid: bot.db_add_journal(str(cid), "Felt very productive today"),
+            "Recent journal entries:",
+            id="journal",
+        ),
+        pytest.param(
+            9408,
+            lambda user, cid: user.__setitem__("language", "Hebrew"),
+            "Always respond exclusively in",
+            id="language",
+        ),
+    ]
+
+    @pytest.mark.parametrize("cid,seed_fn,marker", _SECTION_CASES)
+    def test_debug_prompt_section_absent_then_present(self, cid, seed_fn, marker):
+        """Each optional prompt section is absent for an empty user and
+        present once its backing data is seeded through the same helper the
+        production code uses; in both states the dump matches
+        build_system_prompt exactly."""
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        empty_prompt = bot.build_system_prompt(user, cid)
+        assert marker not in empty_prompt
+
+        seed_fn(user, cid)
+        seeded_prompt = bot.build_system_prompt(user, cid)
+        assert marker in seeded_prompt
+
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        assert _delivered_text(update) == seeded_prompt
+
+    def test_debug_prompt_emoji_and_mixed_script_notes_round_trip(self):
+        """A note containing an emoji and a note containing mixed Cyrillic
+        and Latin text both round-trip through the document path unchanged."""
+        cid = 9500
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        bot.db_add_note(str(cid), "Do not forget the 🎉 party plans this weekend! " * 40)
+        bot.db_add_note(str(cid), "Смешанный текст mixed with English слова тут " * 40)
+        expected = bot.build_system_prompt(user, cid)
+        assert len(expected) > 4000, "fixture must exceed the delivery threshold"
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_document.assert_awaited_once()
+        assert _delivered_text(update) == expected
+
+    def test_debug_prompt_threshold_boundary_text_vs_document(self):
+        """A prompt landing exactly on the 4000-char threshold takes the text
+        path; one character more takes the document path. Padding is derived
+        from a measured probe rather than a hard-coded note size, so this
+        stays correct if prompt assembly is reshaped later (e.g. Phase 3)."""
+        base_cid = 9300
+        bot.state["users"][str(base_cid)] = fresh_user()
+        base_len = len(bot.build_system_prompt(bot.state["users"][str(base_cid)], base_cid))
+
+        probe_cid = 9301
+        bot.state["users"][str(probe_cid)] = fresh_user()
+        probe_user = bot.state["users"][str(probe_cid)]
+        bot.db_add_note(str(probe_cid), "X")
+        probe_len = len(bot.build_system_prompt(probe_user, probe_cid))
+        overhead = probe_len - base_len - 1  # fixed chars the notes section wraps around the text
+
+        target_note_len = 4000 - base_len - overhead
+
+        at_cid = 9302
+        bot.state["users"][str(at_cid)] = fresh_user()
+        at_user = bot.state["users"][str(at_cid)]
+        bot.db_add_note(str(at_cid), "A" * target_note_len)
+        at_prompt = bot.build_system_prompt(at_user, at_cid)
+        assert len(at_prompt) == 4000
+        with as_owner(at_cid):
+            update = _debug_update(at_cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        update.message.reply_document.assert_not_awaited()
+
+        over_cid = 9303
+        bot.state["users"][str(over_cid)] = fresh_user()
+        over_user = bot.state["users"][str(over_cid)]
+        bot.db_add_note(str(over_cid), "A" * (target_note_len + 1))
+        over_prompt = bot.build_system_prompt(over_user, over_cid)
+        assert len(over_prompt) == 4001
+        with as_owner(over_cid):
+            update = _debug_update(over_cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_document.assert_awaited_once()
+        update.message.reply_text.assert_not_awaited()
+
+    def test_debug_prompt_deterministic_across_consecutive_calls(self):
+        """Two consecutive /debug prompt calls with no intervening state
+        change produce identical output -- guards against a future prompt
+        section that sorts non-deterministically or embeds a live timestamp."""
+        cid = 9600
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["tasks"] = ["Write tests"]
+        bot.db_add_note(str(cid), "Consistent note content")
+        with as_owner(cid):
+            update1 = _debug_update(cid)
+            context1 = _debug_context(["prompt"])
+            run(bot.debug_cmd(update1, context1))
+            update2 = _debug_update(cid)
+            context2 = _debug_context(["prompt"])
+            run(bot.debug_cmd(update2, context2))
+        assert _delivered_text(update1) == _delivered_text(update2)
+
