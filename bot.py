@@ -1969,7 +1969,8 @@ async def _run_checkin(
     paths can never diverge. Passes touch_activity=False to chat() so a
     proactive check-in is never mistaken for the user having responded.
     Returns a short reason string when quiet hours or mute suppress the
-    check-in, None once it sent one. `simulate` (default True, as used by
+    check-in, or when something in the try block raised ("send failed" --
+    WR-01); None once it sent one. `simulate` (default True, as used by
     /debug fire) controls whether the guards *and* this runner's own
     date/time reads (the stale-tracker check below) honor an active /debug
     clock override; the real scheduled wrapper always passes simulate=False
@@ -2048,6 +2049,7 @@ async def _run_checkin(
         db_log_job(str(chat_id), f"checkin_{'morning' if is_morning else 'evening'}")
     except Exception as e:
         logger.error("Check-in failed for %s: %s", chat_id, e)
+        return "send failed"
     return None
 
 
@@ -2080,8 +2082,9 @@ async def _run_reminder(
     snooze token. Shared by the per-reminder scheduled job (via
     schedule_user_reminder's thin wrapper) and `/debug fire reminder <n>` so
     the two paths can never diverge. Returns a short reason string when quiet
-    hours or mute suppress the reminder, None once it sent one. See
-    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
+    hours or mute suppress the reminder, or when the send itself raised
+    ("send failed" -- WR-01); None once it sent one. See `_run_checkin`'s
+    docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
@@ -2104,6 +2107,7 @@ async def _run_reminder(
         )
     except Exception as e:
         logger.error("Reminder failed for %s: %s", chat_id, e)
+        return "send failed"
     return None
 
 
@@ -2127,12 +2131,13 @@ async def _run_deadline_alert(
     annual reminders due today for chat_id. Shared by the 09:00 scheduled job
     (via schedule_user_alerts's thin wrapper) and `/debug fire deadline_alert`
     so the two paths can never diverge. Returns a short reason string when
-    quiet hours or mute suppress the alert, or when nothing was due and no
-    annual reminder matched today; None once it sent at least one message —
-    the same suppression-reason contract as the other five runners
-    (_run_checkin, _run_habit_reminder, _run_idle_nudge, _run_weekly_digest,
-    _run_reminder). See `_run_checkin`'s docstring for what `simulate`
-    controls (CR-01)."""
+    quiet hours or mute suppress the alert, when nothing was due and no
+    annual reminder matched today ("nothing due"), or when something was due
+    but every send attempt raised ("send failed" -- WR-01); None once it sent
+    at least one message — the same suppression-reason contract as the other
+    five runners (_run_checkin, _run_habit_reminder, _run_idle_nudge,
+    _run_weekly_digest, _run_reminder). See `_run_checkin`'s docstring for
+    what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
@@ -2160,7 +2165,9 @@ async def _run_deadline_alert(
         except ValueError:
             pass
     sent = False
+    attempted = False
     if alerts:
+        attempted = True
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -2174,6 +2181,7 @@ async def _run_deadline_alert(
     today_mmdd = today.strftime("%m-%d")
     for r in u.get("reminders", []):
         if r.get("annual") and r.get("date") == today_mmdd:
+            attempted = True
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -2183,7 +2191,9 @@ async def _run_deadline_alert(
             except Exception as e:
                 logger.error("Annual reminder failed for %s: %s", chat_id, e)
 
-    return None if sent else "nothing due"
+    if sent:
+        return None
+    return "send failed" if attempted else "nothing due"
 
 
 async def _run_habit_reminder(
@@ -2192,8 +2202,9 @@ async def _run_habit_reminder(
     """Send the list of not-yet-done-today habits at 20:00. Shared by the
     scheduled job (via schedule_user_alerts's thin wrapper) and
     `/debug fire habit_reminder` so the two paths can never diverge. Returns
-    a short reason string when quiet hours or mute suppress the reminder, or
-    when every habit is already done today; None once it sent one. See
+    a short reason string when quiet hours or mute suppress the reminder, when
+    every habit is already done today ("nothing undone"), or when the send
+    itself raised ("send failed" -- WR-01); None once it sent one. See
     `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
@@ -2217,6 +2228,7 @@ async def _run_habit_reminder(
         )
     except Exception as e:
         logger.error("Habit reminder failed for %s: %s", chat_id, e)
+        return "send failed"
     return None
 
 
@@ -2227,9 +2239,10 @@ async def _run_idle_nudge(
     Shared by the scheduled job (via schedule_user_alerts's thin wrapper) and
     `/debug fire idle_nudge` so the two paths can never diverge. Returns a
     short reason string when quiet hours or mute suppress the nudge, when the
-    user has no tasks and no habits, or when the last active day is under
-    three days old; None once it sent one. See `_run_checkin`'s docstring for
-    what `simulate` controls (CR-01)."""
+    user has no tasks and no habits, when the last active day is under three
+    days old, or when the send itself raised ("send failed" -- WR-01); None
+    once it sent one. See `_run_checkin`'s docstring for what `simulate`
+    controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
@@ -2255,6 +2268,7 @@ async def _run_idle_nudge(
         )
     except Exception as e:
         logger.error("Idle nudge failed for %s: %s", chat_id, e)
+        return "send failed"
     return None
 
 
@@ -2266,8 +2280,9 @@ async def _run_weekly_digest(
     `/debug fire weekly_digest` so the two paths can never diverge. Passes
     touch_activity=False to chat() for the same reason _run_checkin does.
     Returns a short reason string when quiet hours or mute suppress the
-    digest, or when today isn't Sunday; None once it sent one. See
-    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
+    digest, when today isn't Sunday, or when the send itself raised
+    ("send failed" -- WR-01); None once it sent one. See `_run_checkin`'s
+    docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
@@ -2315,6 +2330,7 @@ async def _run_weekly_digest(
         )
     except Exception as e:
         logger.error("Weekly digest failed for %s: %s", chat_id, e)
+        return "send failed"
     return None
 
 

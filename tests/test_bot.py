@@ -2109,6 +2109,82 @@ class TestDebugFire:
         assert result == "nothing due"
         context.bot.send_message.assert_not_awaited()
 
+    @pytest.mark.parametrize("runner_name,call_kwargs", [
+        pytest.param("_run_reminder", {"reminder": {"id": "r9", "time": "09:00", "message": "hi", "once": False}}, id="reminder"),
+        pytest.param("_run_habit_reminder", {}, id="habit_reminder"),
+        pytest.param("_run_idle_nudge", {}, id="idle_nudge"),
+    ])
+    def test_wr01_runner_reports_send_failed_on_genuine_exception(self, runner_name, call_kwargs):
+        """WR-01: a genuine send failure must be reported as a distinguishable
+        reason string, never as silent success (None)."""
+        cid = 9063
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True,
+            tasks=["Do a thing"],
+            habits={"meditation": {"completions": [], "created": date.today().isoformat()}},
+            activity_days=[(date.today() - timedelta(days=5)).isoformat()],
+        )
+        context = _debug_context([])
+        context.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        runner = getattr(bot, runner_name)
+        if runner_name == "_run_reminder":
+            result = run(runner(context, cid, call_kwargs["reminder"]))
+        else:
+            result = run(runner(context, cid))
+        assert result == "send failed"
+
+    def test_wr01_weekly_digest_reports_send_failed_on_genuine_exception(self):
+        cid = 9067
+        bot.state["users"][str(cid)] = fresh_user()
+        context = _debug_context([])
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        sunday = _dt(2023, 1, 1, 10, 0, tzinfo=_ZI("UTC"))
+        with patch.object(bot, "chat", AsyncMock(return_value="Great week!")), \
+             patch.object(bot, "datetime") as mock_dt:
+            mock_dt.now.return_value = sunday
+            mock_dt.utcnow.return_value = _dt.utcnow()
+            context.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+            result = run(bot._run_weekly_digest(context, cid))
+        assert result == "send failed"
+
+    def test_wr01_checkin_reports_send_failed_on_genuine_exception(self):
+        cid = 9064
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(side_effect=RuntimeError("llm outage"))):
+            result = run(bot._run_checkin(context, cid, "morning"))
+        assert result == "send failed"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_wr01_deadline_alert_reports_send_failed_when_totally_unsent(self):
+        """The partial exception WR-01 called out: something was due but the
+        send itself raised -- must be "send failed", not "nothing due"."""
+        cid = 9065
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=[{"text": "Ship it", "due": date.today().isoformat()}]
+        )
+        context = _debug_context([])
+        context.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        result = run(bot._run_deadline_alert(context, cid))
+        assert result == "send failed"
+
+    def test_debug_fire_reports_send_failed_not_success(self):
+        """/debug fire must not report '✅ Fired' when the runner returns a
+        genuine failure reason (WR-01's user-facing consequence)."""
+        cid = 9066
+        bot.state["users"][str(cid)] = fresh_user(
+            reminders=[{"id": "r1", "time": "09:00", "message": "Take pills", "once": False}]
+        )
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "reminder", "1"])
+            context.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+            run(bot.debug_cmd(update, context))
+        text = update.message.reply_text.call_args[0][0]
+        assert "✅" not in text
+        assert "send failed" in text
+
     def test_scheduled_checkin_matches_debug_path(self):
         """schedule_user_checkins registers checkin_morning_{chat_id} and
         checkin_evening_{chat_id} as run_daily jobs; awaiting either callback
@@ -2235,6 +2311,12 @@ class TestDebugFire:
             with patch.object(bot, "chat", AsyncMock(return_value="reply")), \
                  patch.object(bot, "datetime") as mock_dt:
                 mock_dt.now.return_value = sunday
+                # _run_checkin's success path logs a real timestamp via
+                # db_log_job -- only .now() is under test here (the Sunday
+                # gate), so utcnow() must still return a real datetime or the
+                # SQLite write raises and (correctly, per WR-01) the runner
+                # reports "send failed" instead of "✅ Fired".
+                mock_dt.utcnow.return_value = _dt.utcnow()
                 run(bot.debug_cmd(update, context))
         update.message.reply_text.assert_awaited_once()
         text = update.message.reply_text.call_args[0][0]
