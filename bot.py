@@ -3653,6 +3653,33 @@ async def _debug_fire(update: Update, context: ContextTypes.DEFAULT_TYPE, args: 
         )
 
 
+async def _debug_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/debug prompt` — dump build_system_prompt(user, chat_id) verbatim to the
+    owner. This is a read, not a chat turn: no LLM client is constructed, no
+    completion is requested, nothing is appended to history, and nothing is
+    written to disk. The prompt carries the user's real journal entries, notes
+    and profile memory (T-1-02), so delivery stays entirely in memory, never a
+    filesystem handle, and this function contains no logging statement.
+
+    Below the threshold the prompt is the entire message body verbatim; above
+    it, follow export_data's in-memory document pattern exactly so a long
+    prompt is delivered whole rather than truncated or split (T-1-06)."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    prompt = build_system_prompt(user, chat_id)
+    if len(prompt) <= 4000:
+        await update.message.reply_text(prompt)
+    else:
+        data_bytes = prompt.encode("utf-8")
+        bio = BytesIO(data_bytes)
+        bio.name = "system_prompt.txt"
+        await update.message.reply_document(
+            document=bio,
+            filename="system_prompt.txt",
+            caption=f"System prompt ({len(prompt)} chars)."
+        )
+
+
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/debug fire|clock|prompt — owner-only debug surface (DEBUG-01/02/03).
     Fails closed: rejects every caller, including the developer, when
@@ -3675,7 +3702,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif sub == "clock":
         await update.message.reply_text("/debug clock: not implemented yet.")
     elif sub == "prompt":
-        await update.message.reply_text("/debug prompt: not implemented yet.")
+        await _debug_prompt(update, context)
     else:
         await update.message.reply_text(
             "Unknown subcommand. Use fire, clock, or prompt."

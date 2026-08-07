@@ -1518,6 +1518,30 @@ class as_owner:
         return False
 
 
+def _no_llm_client():
+    """MagicMock LLM client whose .chat.completions.create is an AsyncMock, so
+    a test can assert it was never awaited. Reusable by any /debug or dry-run
+    test across plans 01-02 through 01-05 that needs to pin "no LLM call was
+    made" — there was no existing precedent for this assertion in the suite
+    before this plan."""
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock()
+    return client
+
+
+def _delivered_text(update):
+    """Return the text actually delivered by a /debug prompt call, regardless
+    of whether it went through the short reply_text path or the long
+    reply_document path, so one assertion works against either branch."""
+    if update.message.reply_document.await_count:
+        _, kwargs = update.message.reply_document.call_args
+        doc = kwargs["document"]
+        doc.seek(0)
+        return doc.read().decode("utf-8")
+    args, _ = update.message.reply_text.call_args
+    return args[0]
+
+
 class TestDebugFire:
     """Tracer slice: /debug fire deadline_alert produces the identical message
     and side effects as the 09:00 scheduled job, through the shared
@@ -1722,4 +1746,120 @@ class TestDebugOwnerGate:
     def test_debug_owner_gate_help_text_omits_debug(self):
         assert "/debug" not in bot._HELP_TEXT
         assert "debug" not in bot._HELP_TEXT.lower()
+
+
+class TestDebugPrompt:
+    """`/debug prompt` — verbatim system-prompt dump for the owner: no LLM
+    call, no conversational side effect, no disk write (DEBUG-03)."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def test_debug_prompt_matches_build_system_prompt_rich_user(self):
+        """A user with tasks, habits, trackers, notes, journal entries and
+        profile memory: the delivered text equals build_system_prompt(user,
+        chat_id) character for character."""
+        cid = 9200
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        user["tasks"] = [{"text": "Ship the report", "due": date.today().isoformat()}]
+        user["habits"] = {"meditation": {"completions": [], "created": date.today().isoformat()}}
+        user["trackers"] = {
+            "weight": {"unit": "kg", "log": [{"ts": bot.datetime.utcnow().isoformat(), "value": 80.5}]}
+        }
+        bot.db_add_note(str(cid), "My secret goal is to write a book")
+        bot.db_add_journal(str(cid), "Felt very productive today")
+        bot.db_add_profile_memory(str(cid), "Prefers direct feedback")
+        expected = bot.build_system_prompt(user, cid)
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        assert _delivered_text(update) == expected
+
+    def test_debug_prompt_empty_user_returns_base_prompt_no_crash(self):
+        """A brand-new user with nothing stored still gets a non-empty base
+        prompt, no exception, delivered over the short text path."""
+        cid = 9201
+        bot.state["users"][str(cid)] = fresh_user()
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        text = _delivered_text(update)
+        assert isinstance(text, str) and len(text) > 0
+        update.message.reply_document.assert_not_awaited()
+
+    def test_debug_prompt_no_llm_call(self):
+        """No LLM client is constructed and no completion is requested when
+        dumping the prompt -- this is a read, not a chat turn."""
+        cid = 9202
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["tasks"] = ["Write tests"]
+        mock_client = _no_llm_client()
+        with as_owner(cid), patch("bot.get_llm_client", return_value=mock_client):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        mock_client.chat.completions.create.assert_not_awaited()
+
+    def test_debug_prompt_long(self):
+        """A prompt over 4000 chars is delivered whole as a document -- never
+        truncated, never split -- and the decoded payload matches
+        build_system_prompt exactly, including Cyrillic note/journal content."""
+        cid = 9203
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        bot.db_add_note(str(cid), "Секретная заметка про план на будущее " * 10)
+        for _ in range(9):
+            bot.db_add_note(str(cid), "English padding note content. " * 10)
+        bot.db_add_journal(str(cid), "Продуктивный день, закончил важный отчёт.")
+        expected = bot.build_system_prompt(user, cid)
+        assert len(expected) > 4000, "fixture must exceed the delivery threshold"
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_document.assert_awaited_once()
+        update.message.reply_text.assert_not_awaited()
+        assert _delivered_text(update) == expected
+
+    def test_debug_prompt_short_uses_reply_text(self):
+        """A prompt at or under the threshold takes the text path, not the
+        document path."""
+        cid = 9204
+        bot.state["users"][str(cid)] = fresh_user()
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        update.message.reply_document.assert_not_awaited()
+
+    def test_debug_prompt_no_history_or_activity_mutation(self):
+        """Dumping the prompt is not a conversation turn: history length and
+        activity_days are unchanged across the call."""
+        cid = 9205
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        user["history"] = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        user["activity_days"] = ["2026-08-01"]
+        history_before = list(user["history"])
+        activity_before = list(user["activity_days"])
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        assert user["history"] == history_before
+        assert user["activity_days"] == activity_before
+
+    def test_debug_prompt_non_owner_rejected_before_assembly(self):
+        """A non-owner is rejected before any prompt is assembled."""
+        cid = 9206
+        with as_owner(999999), patch("bot.build_system_prompt") as mock_build:
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        mock_build.assert_not_called()
 
