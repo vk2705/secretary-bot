@@ -3425,3 +3425,56 @@ class TestReviewFixCR02:
         app.bot.send_message.assert_awaited_once()
         assert "streak_7" in bot.state["users"][str(cid)]["milestones_sent"]
 
+
+class TestReviewFixWR03:
+    """Regression tests for 01-REVIEW.md WR-03: today_focus comparisons must
+    track the simulated /debug clock like every other display comparison
+    (habit_section, deadline badges, etc), while the write side always
+    stamps the real date."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def _with_clock(self, cid, iso, hours_ahead=12):
+        bot.db_set_pref(str(cid), "debug_clock", iso)
+        expires = (bot.datetime.utcnow() + bot.timedelta(hours=hours_ahead)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expires)
+        return bot.get_user(cid)
+
+    def test_build_system_prompt_focus_section_matches_habit_section_clock(self):
+        """Setting a focus for the real "today" and then moving the
+        simulated clock a week forward must retire the focus section,
+        exactly as an expired real-time focus would -- consistent with
+        habit_section right above it in build_system_prompt."""
+        cid = 9954
+        u = fresh_user()
+        u["today_focus"] = {"date": date.today().isoformat(), "text": "Deep work session"}
+        # No override yet -- still shows (control).
+        assert "Deep work session" in bot.build_system_prompt(u)
+
+        u_sim = self._with_clock(cid, (date.today() + timedelta(days=7)).isoformat() + "T09:00:00")
+        u_sim["today_focus"] = {"date": date.today().isoformat(), "text": "Deep work session"}
+        assert "Deep work session" not in bot.build_system_prompt(u_sim)
+
+    def test_today_cmd_read_reflects_simulated_clock_write_stays_real(self):
+        """/today's read-side comparison follows the simulated clock, but the
+        write side (setting a new focus) always stamps the real date -- the
+        durable-write boundary WR-03's fix explicitly preserves."""
+        cid = 9955
+        bot.state["users"][str(cid)] = fresh_user()
+        u = self._with_clock(cid, (date.today() + timedelta(days=3)).isoformat() + "T09:00:00")
+        u["today_focus"] = {"date": date.today().isoformat(), "text": "Old focus"}
+
+        # Read: real-time focus is "expired" from the simulated vantage point.
+        update = _debug_update(cid)
+        run(bot.today_cmd(update, _debug_context([])))
+        text = update.message.reply_text.call_args[0][0]
+        assert "No focus set" in text
+
+        # Write: setting a new focus while the clock is simulated must stamp
+        # the real date, not the simulated one.
+        write_update = _debug_update(cid)
+        write_context = _debug_context(["New", "focus"])
+        run(bot.today_cmd(write_update, write_context))
+        assert bot.state["users"][str(cid)]["today_focus"]["date"] == date.today().isoformat()
+

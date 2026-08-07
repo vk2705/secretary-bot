@@ -1763,7 +1763,10 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
     tasks_str = _tasks_for_prompt(user["tasks"])
 
     focus = user.get("today_focus", {})
-    today_str = date.today().isoformat()
+    # Comparison only -- routed through the simulated clock (when active) for
+    # consistency with habit_section right above (WR-03). The write side in
+    # set_today_focus/today_cmd stays on real time; only reads compare here.
+    today_str = _today(user=user).isoformat()
     focus_section = (
         f"\nToday's focus: {focus['text']}\n"
         if focus.get("date") == today_str and focus.get("text") else ""
@@ -2798,10 +2801,11 @@ async def prioritize_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
-    today_str = date.today().isoformat()
     if not context.args:
+        # Comparison only -- routed through the simulated clock (when active)
+        # for consistency with the rest of the ambient scope (WR-03).
         focus = user.get("today_focus", {})
-        if focus.get("date") == today_str and focus.get("text"):
+        if focus.get("date") == _today(user=user).isoformat() and focus.get("text"):
             await update.message.reply_text(f"🎯 Today's focus: {focus['text']}")
         else:
             await update.message.reply_text(
@@ -2809,7 +2813,8 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     text = " ".join(context.args).strip()
-    user["today_focus"] = {"date": today_str, "text": text}
+    # Write side always stays on real time (durable write -- CR-02/D-P5).
+    user["today_focus"] = {"date": date.today().isoformat(), "text": text}
     save_state(state)
     await update.message.reply_text(f"🎯 Today's focus set: {text}")
 
@@ -3326,8 +3331,10 @@ async def manual_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = get_user(chat_id)
 
-    # Build a mini-dashboard header
-    today_str = date.today().isoformat()
+    # Build a mini-dashboard header. Display-only comparisons (no writes
+    # happen in this function) -- routed through the simulated clock (when
+    # active) for consistency with the rest of the ambient scope (WR-03).
+    today_str = _today(user=user).isoformat()
     lines = []
 
     focus = user.get("today_focus", {})
