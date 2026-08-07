@@ -2895,3 +2895,123 @@ class TestDebugClock:
         assert bot.db_get_pref(str(cid), "debug_clock") is None
         assert str(cid) not in bot.state["users"]
 
+
+class TestDebugClockAmbient:
+    """DEBUG-02's ambient scope (D-01, D-P7): a simulated `now`, once set, is
+    visible to ordinary interaction -- deadline badges, quiet hours, mute
+    evaluation, streaks, habit summaries, /time, /mystats, the dumped system
+    prompt and every job runner -- while every durable-write path stays on
+    the real wall clock. Covers T-1-16 (no fabricated date reaches a durable
+    record), T-1-17 (no fabricated date reaches scheduler arithmetic), T-1-18
+    (no partial refactor leaves a surface on the real clock) and T-1-19 (no
+    behaviour change for a user who never sets a clock)."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def _with_clock(self, cid, iso, hours_ahead=12):
+        """Round-trip a simulated clock through SQLite exactly as /debug clock
+        would, then read it back through get_user() -- the real overlay path,
+        matching plan 01-04's own tests."""
+        bot.db_set_pref(str(cid), "debug_clock", iso)
+        expires = (bot.datetime.utcnow() + bot.timedelta(hours=hours_ahead)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expires)
+        return bot.get_user(cid)
+
+    # ── Task 1: shared helpers (_format_task_line, _habit_streak,
+    #    _habit_summary_lines, _is_muted, _is_quiet_now, _get_streak) ──
+
+    def test_format_task_line_no_override_matches_fixed_expectation(self):
+        """No override -- and no `user` argument at all -- reproduces the
+        exact pre-refactor rendering (additive-change guard, T-1-19)."""
+        task = {"text": "Ship it", "due": date.today().isoformat()}
+        assert bot._format_task_line(task, 1) == "1. Ship it 🔴 DUE TODAY"
+
+    def test_format_task_line_override_moves_due_today_badge(self):
+        """A task due in 7 days renders the due-today badge once the clock is
+        moved 7 days forward, and the plain due-date form otherwise -- the
+        deadline-badge success criterion, paired with a no-override control."""
+        due = (date.today() + timedelta(days=7)).isoformat()
+        task = {"text": "Ship it", "due": due}
+        u_real = fresh_user()
+        assert f"(due {due})" in bot._format_task_line(task, 1, user=u_real)
+
+        cid = 9900
+        u_sim = self._with_clock(cid, due + "T09:00:00")
+        assert "DUE TODAY" in bot._format_task_line(task, 1, user=u_sim)
+
+    def test_is_quiet_now_override_activates_inactive_window(self):
+        """A quiet-hours window that is not active in real time reads as
+        active once the clock is moved inside it -- paired no-override
+        control proves the window really was inactive first."""
+        cid = 9901
+        real_hour = bot.datetime.utcnow().hour
+        quiet_hour = (real_hour + 12) % 24  # 12h away from real now: never overlaps
+        start_str = f"{quiet_hour:02d}:00"
+        end_str = f"{(quiet_hour + 1) % 24:02d}:00"
+
+        u_real = fresh_user(timezone="UTC")
+        u_real["quiet_hours"] = {"start": start_str, "end": end_str}
+        assert bot._is_quiet_now(u_real) is False
+
+        u_sim = self._with_clock(cid, f"2027-06-15T{quiet_hour:02d}:30:00")
+        u_sim["quiet_hours"] = {"start": start_str, "end": end_str}
+        u_sim["timezone"] = "UTC"
+        assert bot._is_quiet_now(u_sim) is True
+
+    def test_is_muted_override_before_and_after_expiry(self):
+        """An override set before a stored mute expiry reads as muted; one set
+        past it reads as unmuted."""
+        cid = 9902
+        u = fresh_user()
+        u["muted_until"] = "2027-06-15T12:00:00"
+
+        before = self._with_clock(cid, "2027-06-15T10:00:00")
+        before["muted_until"] = "2027-06-15T12:00:00"
+        assert bot._is_muted(before) is True
+
+        bot.db_delete_pref(str(cid), "debug_clock")
+        bot.db_delete_pref(str(cid), "debug_clock_expires")
+        after = self._with_clock(cid, "2027-06-15T14:00:00")
+        after["muted_until"] = "2027-06-15T12:00:00"
+        assert bot._is_muted(after) is False
+
+    def test_get_streak_no_override_matches_fixed_expectation(self):
+        u = fresh_user()
+        u["activity_days"] = [date.today().isoformat()]
+        assert bot._get_streak(u) == 1
+
+    def test_get_streak_override_computes_against_simulated_date(self):
+        cid = 9903
+        u = self._with_clock(cid, "2027-06-15T09:00:00")
+        u["activity_days"] = ["2027-06-15", "2027-06-14"]
+        assert bot._get_streak(u) == 2
+        # no override: the same activity_days don't reach into the real streak
+        u_real = fresh_user(activity_days=["2027-06-15", "2027-06-14"])
+        assert bot._get_streak(u_real) == 0
+
+    def test_habit_streak_no_override_matches_fixed_expectation(self):
+        assert bot._habit_streak([date.today().isoformat()]) == 1
+        assert bot._habit_streak([date.today().isoformat()], user=None) == 1
+
+    def test_habit_streak_override_computes_against_simulated_date(self):
+        cid = 9904
+        u = self._with_clock(cid, "2027-06-15T09:00:00")
+        assert bot._habit_streak(["2027-06-15", "2027-06-14"], user=u) == 2
+        assert bot._habit_streak(["2027-06-15", "2027-06-14"]) == 0
+
+    def test_habit_summary_lines_no_override_matches_fixed_expectation(self):
+        habits = {"meditation": {"completions": [date.today().isoformat()]}}
+        lines = bot._habit_summary_lines(habits)
+        assert len(lines) == 1 and "✓" in lines[0]
+
+    def test_habit_summary_lines_override_computes_against_simulated_date(self):
+        cid = 9905
+        u = self._with_clock(cid, "2027-06-15T09:00:00")
+        habits = {"meditation": {"completions": ["2027-06-15"]}}
+        lines = bot._habit_summary_lines(habits, user=u)
+        assert "✓" in lines[0] and "1d streak" in lines[0]
+        # no override: the same stored date doesn't read as done today
+        lines_real = bot._habit_summary_lines(habits)
+        assert "○" in lines_real[0]
+

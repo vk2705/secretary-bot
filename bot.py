@@ -622,7 +622,7 @@ def _get_streak(user: dict) -> int:
     if not days:
         return 0
     streak = 0
-    d = date.today()
+    d = _today(user=user)
     while d.isoformat() in days:
         streak += 1
         d -= timedelta(days=1)
@@ -1426,14 +1426,14 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
 
     if name == "get_habits":
         habits = user.get("habits", {})
-        today = date.today().isoformat()
+        today = _today(user=user).isoformat()
         result = []
         for hname, data in habits.items():
             completions = data.get("completions", [])
             result.append({
                 "name": hname,
                 "done_today": today in completions,
-                "streak": _habit_streak(completions),
+                "streak": _habit_streak(completions, user=user),
                 "total_completions": len(completions),
             })
         return {"habits": result, "count": len(result)}
@@ -1458,12 +1458,12 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         today = date.today().isoformat()
         completions = habits[hname].setdefault("completions", [])
         if today in completions:
-            return {"already_done": True, "name": hname, "streak": _habit_streak(completions)}
+            return {"already_done": True, "name": hname, "streak": _habit_streak(completions, user=user)}
         completions.append(today)
         if len(completions) > 365:
             habits[hname]["completions"] = completions[-365:]
         save_state(state)
-        return {"success": True, "name": hname, "streak": _habit_streak(completions)}
+        return {"success": True, "name": hname, "streak": _habit_streak(completions, user=user)}
 
     if name == "remove_habit":
         hname = (args.get("name") or "").lower().strip()
@@ -1534,13 +1534,13 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
 
 # ─────────────────────── habit helpers ───────────────────────
 
-def _habit_streak(completions: list) -> int:
+def _habit_streak(completions: list, user=None) -> int:
     """Consecutive days ending today or yesterday (so streak survives the day)."""
     days = set(completions)
     if not days:
         return 0
     streak = 0
-    d = date.today()
+    d = _today(user=user)
     if d.isoformat() not in days:
         d -= timedelta(days=1)
     while d.isoformat() in days:
@@ -1549,12 +1549,12 @@ def _habit_streak(completions: list) -> int:
     return streak
 
 
-def _habit_summary_lines(habits: dict) -> list[str]:
-    today = date.today().isoformat()
+def _habit_summary_lines(habits: dict, user=None) -> list[str]:
+    today = _today(user=user).isoformat()
     lines = []
     for name, data in habits.items():
         done = today in data.get("completions", [])
-        streak = _habit_streak(data.get("completions", []))
+        streak = _habit_streak(data.get("completions", []), user=user)
         mark = "✓" if done else "○"
         lines.append(f"  {mark} {name}  ({streak}d streak)")
     return lines
@@ -1568,7 +1568,7 @@ def _is_muted(user: dict) -> bool:
     if not until:
         return False
     try:
-        return datetime.utcnow() < datetime.fromisoformat(until)
+        return _utcnow(user) < datetime.fromisoformat(until)
     except ValueError:
         return False
 
@@ -1584,7 +1584,7 @@ def _is_quiet_now(user: dict) -> bool:
         tz = ZoneInfo(user.get("timezone", "UTC"))
     except (ZoneInfoNotFoundError, KeyError):
         tz = ZoneInfo("UTC")
-    now = datetime.now(tz).time().replace(tzinfo=None)
+    now = _now(tz, user=user).time().replace(tzinfo=None)
     sh, sm = (int(x) for x in start_str.split(":"))
     eh, em = (int(x) for x in end_str.split(":"))
     start_t = dt_time(sh, sm)
@@ -1677,14 +1677,14 @@ def _task_tags(task) -> list:
     return re.findall(r"#(\w+)", _task_text(task).lower())
 
 
-def _format_task_line(task, idx: int) -> str:
+def _format_task_line(task, idx: int, user=None) -> str:
     text = _task_text(task)
     due = _task_due(task)
     if not due:
         return f"{idx}. {text}"
     try:
         due_date = date.fromisoformat(due)
-        days_left = (due_date - date.today()).days
+        days_left = (due_date - _today(user=user)).days
         if days_left < 0:
             badge = f" ⚠️ overdue {-days_left}d"
         elif days_left == 0:
@@ -1749,7 +1749,7 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         if tracker_lines else ""
     )
 
-    habit_lines = _habit_summary_lines(user.get("habits", {}))
+    habit_lines = _habit_summary_lines(user.get("habits", {}), user=user)
     habit_section = (
         "\nToday's habits:\n" + "\n".join(habit_lines) + "\n"
         if habit_lines else ""
@@ -2234,7 +2234,7 @@ async def _run_weekly_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -
     try:
         tasks_str = _tasks_for_prompt(u["tasks"])
         habits_str = "; ".join(
-            f"{n}: {_habit_streak(h.get('completions',[]))}-day streak"
+            f"{n}: {_habit_streak(h.get('completions',[]), user=u)}-day streak"
             for n, h in u.get("habits", {}).items()
         ) or "none"
         week_cutoff = (today - timedelta(days=7)).isoformat()
@@ -2578,13 +2578,13 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No tasks tagged #{tag_filter}.")
             return
         lines = [
-            _format_task_line(t, orig_i + 1) + (f"  ♻️ {t['recur']}" if isinstance(t, dict) and t.get("recur") else "")
+            _format_task_line(t, orig_i + 1, user=user) + (f"  ♻️ {t['recur']}" if isinstance(t, dict) and t.get("recur") else "")
             for orig_i, t in filtered
         ]
         header = f"Tasks tagged #{tag_filter}:"
     else:
         lines = [
-            _format_task_line(t, i + 1) + (f"  ♻️ {t['recur']}" if isinstance(t, dict) and t.get("recur") else "")
+            _format_task_line(t, i + 1, user=user) + (f"  ♻️ {t['recur']}" if isinstance(t, dict) and t.get("recur") else "")
             for i, t in enumerate(tasks)
         ]
         header = "Your tasks:"
@@ -2993,7 +2993,7 @@ async def reflect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     habits = user.get("habits", {})
     habit_lines = []
     for name, h in habits.items():
-        s = _habit_streak(h.get("completions", []))
+        s = _habit_streak(h.get("completions", []), user=user)
         habit_lines.append(f"{name}: {s}-day streak")
     reflect_journal = [r["entry"][:100] for r in db_get_journal(str(chat_id), limit=5)]
     n_done = len(user.get("archived_tasks", []))
@@ -4014,7 +4014,7 @@ async def habit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "No habits yet. Add one with /habit add <name>"
             )
             return
-        lines = _habit_summary_lines(habits)
+        lines = _habit_summary_lines(habits, user=user)
         await update.message.reply_text("Your habits:\n" + "\n".join(lines))
         return
 
@@ -4051,7 +4051,7 @@ async def habit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(completions) > 365:
             habits[name]["completions"] = completions[-365:]
         save_state(state)
-        streak = _habit_streak(completions)
+        streak = _habit_streak(completions, user=user)
         await update.message.reply_text(f"✓ '{name}' done! 🔥 Streak: {streak} day{'s' if streak != 1 else ''}")
 
     elif sub == "remove":
@@ -4075,10 +4075,10 @@ async def habit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No habit named '{name}'. Use /habit list.")
             return
         completions = sorted(habits[name].get("completions", []))
-        today = date.today()
+        today = _today(user=user)
         last_7 = [(today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
         dots = "".join("✅" if d in completions else "❌" for d in last_7)
-        current = _habit_streak(completions)
+        current = _habit_streak(completions, user=user)
         # Longest streak
         longest = 0
         run = 0
@@ -4129,7 +4129,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Last-7-day activity chart
     days_set = set(user.get("activity_days", []))
     week_chart = "".join(
-        "█" if (date.today() - timedelta(days=i)).isoformat() in days_set else "░"
+        "█" if (_today(user=user) - timedelta(days=i)).isoformat() in days_set else "░"
         for i in range(6, -1, -1)
     )
 
@@ -4150,7 +4150,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if mute_status:
         lines.append(mute_status)
-    habit_lines = _habit_summary_lines(user.get("habits", {}))
+    habit_lines = _habit_summary_lines(user.get("habits", {}), user=user)
     if habit_lines:
         lines.append("\nHabits today:")
         lines.extend(habit_lines)
@@ -4397,7 +4397,7 @@ async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for name, data in user.get("habits", {}).items():
         completions = data.get("completions", [])
-        streak = _habit_streak(completions)
+        streak = _habit_streak(completions, user=user)
         total = len(completions)
         parts.append(f"Habit '{name}': {total} completions total, current streak {streak}d")
 
