@@ -2031,6 +2031,167 @@ class TestDebugFire:
         _, kwargs = mock_chat.call_args
         assert kwargs.get("touch_activity") is False
 
+    # ── 01-03 Task 2: DEBUG_JOBS registry + full /debug fire dispatch ──────
+
+    def test_debug_jobs_registry_has_exactly_six_fixed_names(self):
+        """A rename of any registry key must fail this test loudly rather
+        than pass silently."""
+        assert set(bot.DEBUG_JOBS.keys()) == {
+            "checkin_morning", "checkin_evening", "deadline_alert",
+            "habit_reminder", "idle_nudge", "weekly_digest",
+        }
+
+    @pytest.mark.parametrize("job_name", [
+        "checkin_morning", "checkin_evening", "deadline_alert",
+        "habit_reminder", "idle_nudge", "weekly_digest",
+    ])
+    def test_debug_fire_each_registry_job_dispatches_and_confirms(self, job_name):
+        """Each of the six fixed job names dispatches through debug_cmd to
+        its runner and the owner receives a confirmation when it fires."""
+        cid = 9100
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        bot.state["users"][str(cid)]["tasks"] = [
+            {"text": "Ship it", "due": date.today().isoformat()}
+        ]
+        bot.state["users"][str(cid)]["habits"] = {
+            "meditation": {"completions": [], "created": date.today().isoformat()}
+        }
+        bot.state["users"][str(cid)]["activity_days"] = [
+            (date.today() - timedelta(days=5)).isoformat()
+        ]
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        sunday = _dt(2023, 1, 1, 10, 0, tzinfo=_ZI("UTC"))
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", job_name])
+            with patch.object(bot, "chat", AsyncMock(return_value="reply")), \
+                 patch.object(bot, "datetime") as mock_dt:
+                mock_dt.now.return_value = sunday
+                run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "✅" in text
+        assert job_name in text
+
+    def test_debug_fire_runner_suppression_reported_by_name(self):
+        """When a runner returns a suppression reason, the reply names it —
+        never silence, never mistaken for a broken command."""
+        cid = 9101
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "weekly_digest"])
+            with patch.object(bot, "_is_quiet_now", return_value=True):
+                run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "quiet hours" in text
+        assert "✅" not in text
+
+    def test_debug_fire_reminder_2_fires_second_entry(self):
+        """/debug fire reminder 2 fires user['reminders'][1], matching what
+        /remind list numbers as 2 (D-P3)."""
+        cid = 9102
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["reminders"] = [
+            {"id": "r1", "time": "08:00", "message": "First", "once": False},
+            {"id": "r2", "time": "09:00", "message": "Second", "once": False},
+        ]
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "reminder", "2"])
+            run(bot.debug_cmd(update, context))
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "Second" in kwargs["text"]
+        assert "First" not in kwargs["text"]
+
+    @pytest.mark.parametrize("reminder_args", [
+        pytest.param(["fire", "reminder", "0"], id="zero"),
+        pytest.param(["fire", "reminder", "99"], id="out_of_range"),
+        pytest.param(["fire", "reminder", "abc"], id="non_numeric"),
+        pytest.param(["fire", "reminder"], id="bare"),
+    ])
+    def test_debug_fire_reminder_invalid_number_fires_nothing(self, reminder_args):
+        cid = 9103
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["reminders"] = [
+            {"id": "r1", "time": "08:00", "message": "Only one", "once": False},
+        ]
+        with as_owner(cid), patch.object(bot, "_run_reminder", AsyncMock()) as mock_run:
+            update = _debug_update(cid)
+            context = _debug_context(reminder_args)
+            run(bot.debug_cmd(update, context))
+        mock_run.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "Usage" in text or "Invalid number" in text
+
+    def test_debug_fire_reminder_zero_does_not_wrap_to_last_entry(self):
+        """The threat-model concern (T-1-10): a naive `idx = int(n) - 1`
+        against a Python list means /debug fire reminder 0 would silently
+        wrap to index -1 (the LAST reminder) rather than being rejected.
+        This must be rejected, not silently fire the wrong reminder."""
+        cid = 9104
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["reminders"] = [
+            {"id": "r1", "time": "08:00", "message": "Should not fire", "once": False},
+        ]
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "reminder", "0"])
+            run(bot.debug_cmd(update, context))
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_unknown_job_lists_every_registry_key(self):
+        cid = 9105
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "wibble"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        for key in bot.DEBUG_JOBS:
+            assert key in text
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_bare_fire_lists_every_registry_key(self):
+        cid = 9106
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        for key in bot.DEBUG_JOBS:
+            assert key in text
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_annual_reminder_via_deadline_alert_unchanged(self):
+        """Firing an annual reminder's parent behaviour through deadline_alert
+        still matches the annual entry by its %m-%d date (unchanged from
+        01-01), now routed through the DEBUG_JOBS registry."""
+        cid = 9107
+        bot.state["users"][str(cid)] = fresh_user()
+        today_mmdd = date.today().strftime("%m-%d")
+        bot.state["users"][str(cid)]["reminders"] = [
+            {
+                "id": "r1", "time": "09:00", "message": "Anniversary",
+                "once": False, "annual": True, "date": today_mmdd,
+            }
+        ]
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "deadline_alert"])
+            run(bot.debug_cmd(update, context))
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "Anniversary" in kwargs["text"]
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "✅" in text
+
 
 class TestDebugOwnerGate:
     """T-1-01 mitigation: prove the owner gate is a property of the whole

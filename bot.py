@@ -3709,23 +3709,82 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Deliberately not in _post_init's BotFather command list and not in
 # _HELP_TEXT — this surface must stay undiscoverable to non-owners (T-1-01).
 
+# Maps a fixed job name to the zero-extra-argument runner /debug fire invokes
+# for it — the same function object schedule_user_checkins/_reminder/_alerts
+# hand to run_daily, so the debug path and the scheduled path can never
+# diverge (T-1-08). The check-in label is bound here at registry-construction
+# time rather than branched on inside the dispatch. `reminder <n>` is handled
+# separately in _debug_fire since it needs a second argument (the 1-based
+# index from /remind list) to look up which reminder dict to pass.
+DEBUG_JOBS = {
+    "checkin_morning": lambda context, chat_id: _run_checkin(context, chat_id, "morning"),
+    "checkin_evening": lambda context, chat_id: _run_checkin(context, chat_id, "evening"),
+    "deadline_alert": _run_deadline_alert,
+    "habit_reminder": _run_habit_reminder,
+    "idle_nudge": _run_idle_nudge,
+    "weekly_digest": _run_weekly_digest,
+}
+
+
 async def _debug_fire(update: Update, context: ContextTypes.DEFAULT_TYPE, args: list) -> None:
     """`/debug fire <job_name>` — invoke a scheduled job's real body on demand,
     through the same extracted function the scheduler calls, with the real
-    context and chat_id so side effects are identical."""
+    context and chat_id so side effects are identical. `/debug fire reminder
+    <n>` targets a specific reminder by the same 1-based number /remind list
+    shows (D-P3) — never a UUID, and never a nearest-match guess, since firing
+    the wrong job has real side effects. No guard is bypassed: quiet hours,
+    mute, the Sunday gate and the idle threshold all still apply, and the
+    reply names the guard that suppressed the fire instead of returning
+    silence."""
+    chat_id = update.effective_chat.id
+    known = ", ".join(sorted(DEBUG_JOBS.keys())) + ", reminder <n>"
+
     if not args:
         await update.message.reply_text(
-            "Usage: /debug fire <job_name>\nKnown jobs: deadline_alert"
+            f"Usage: /debug fire <job_name>\nKnown jobs: {known}"
         )
         return
+
     job_name = args[0].lower()
-    chat_id = update.effective_chat.id
-    if job_name == "deadline_alert":
-        await _run_deadline_alert(context, chat_id)
-        await update.message.reply_text("✅ Fired deadline_alert.")
+
+    if job_name == "reminder":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /debug fire reminder <number>")
+            return
+        user = get_user(chat_id)
+        try:
+            n = int(args[1])
+            if n < 1:
+                raise ValueError
+            reminder = user.get("reminders", [])[n - 1]
+        except (IndexError, ValueError):
+            await update.message.reply_text(
+                "Invalid number. Use /remind list to see numbers."
+            )
+            return
+        result = await _run_reminder(context, chat_id, reminder)
+        if result is None:
+            await update.message.reply_text(f"✅ Fired reminder {n}.")
+        else:
+            await update.message.reply_text(
+                f"⏸️ Not fired — reminder {n} is suppressed right now: {result}."
+            )
+        return
+
+    runner = DEBUG_JOBS.get(job_name)
+    if runner is None:
+        await update.message.reply_text(
+            f"Unknown job '{job_name}'. Known jobs: {known}"
+        )
+        return
+
+    result = await runner(context, chat_id)
+    if result is None:
+        await update.message.reply_text(f"✅ Fired {job_name}.")
     else:
         await update.message.reply_text(
-            f"Unknown job '{job_name}'. Known jobs: deadline_alert"
+            f"⏸️ Not fired — {job_name} is suppressed right now: {result}. "
+            "This is the real guard, not a debug failure."
         )
 
 
