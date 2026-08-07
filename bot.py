@@ -632,6 +632,11 @@ def _get_streak(user: dict) -> int:
 async def _check_milestones(chat_id: int, app) -> None:
     """Send congratulation messages for newly crossed milestones."""
     user = get_user(chat_id)
+    if _debug_now(user) is not None:
+        # Durable-write path (milestones_sent) + real Telegram send -- never
+        # let a simulated /debug clock create or permanently suppress a real
+        # milestone. See CR-02.
+        return
     sent = user.setdefault("milestones_sent", [])
     msgs = []
 

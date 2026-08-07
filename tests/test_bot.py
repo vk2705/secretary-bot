@@ -3359,3 +3359,55 @@ class TestDebugClockAmbient:
         run(bot.time_cmd(time_update2, _debug_context([])))
         assert str(date.today().year) in time_update2.message.reply_text.call_args[0][0]
 
+
+class TestReviewFixCR02:
+    """Regression tests for 01-REVIEW.md CR-02: an active /debug clock must
+    never durably create or permanently suppress a real streak milestone."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def _with_clock(self, cid, iso, hours_ahead=12):
+        """Round-trip a simulated clock through SQLite exactly as /debug
+        clock would, then read it back through get_user()."""
+        bot.db_set_pref(str(cid), "debug_clock", iso)
+        expires = (bot.datetime.utcnow() + bot.timedelta(hours=hours_ahead)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expires)
+        return bot.get_user(cid)
+
+    def test_cr02_check_milestones_skips_entirely_while_debug_clock_active(self):
+        """An active /debug clock must never create or permanently suppress
+        a real milestone: _check_milestones bails out before touching
+        milestones_sent or sending anything, even when the simulated date
+        would otherwise cross a streak threshold that the real date has not
+        reached yet."""
+        cid = 9951
+        # 10 consecutive real days of activity ending 3 days before "today" --
+        # under real time the current streak is 0 (no activity logged today
+        # or yesterday), but if _get_streak were evaluated against the
+        # simulated date below it would land inside the run and read as 10.
+        days = [(date.today() - timedelta(days=n)).isoformat() for n in range(3, 13)]
+        bot.state["users"][str(cid)] = fresh_user(activity_days=days)
+        u = self._with_clock(cid, (date.today() - timedelta(days=3)).isoformat() + "T09:00:00")
+        assert bot._get_streak(u) >= 7  # confirms the simulated date would cross streak_7
+
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        run(bot._check_milestones(cid, app))
+
+        app.bot.send_message.assert_not_awaited()
+        assert bot.state["users"][str(cid)].get("milestones_sent", []) == []
+
+    def test_check_milestones_still_fires_with_no_debug_clock(self):
+        """Control for the above: with no override active, a genuinely
+        crossed streak_7 still sends the congratulation and records it --
+        proving CR-02's early return doesn't disable real milestones."""
+        cid = 9953
+        days = [(date.today() - timedelta(days=n)).isoformat() for n in range(0, 7)]
+        bot.state["users"][str(cid)] = fresh_user(activity_days=days)
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        run(bot._check_milestones(cid, app))
+        app.bot.send_message.assert_awaited_once()
+        assert "streak_7" in bot.state["users"][str(cid)]["milestones_sent"]
+
