@@ -2921,13 +2921,13 @@ class TestDebugClockAmbient:
     # ── Task 1: shared helpers (_format_task_line, _habit_streak,
     #    _habit_summary_lines, _is_muted, _is_quiet_now, _get_streak) ──
 
-    def test_format_task_line_no_override_matches_fixed_expectation(self):
+    def test_debug_clock_ambient_format_task_line_no_override_matches_fixed_expectation(self):
         """No override -- and no `user` argument at all -- reproduces the
         exact pre-refactor rendering (additive-change guard, T-1-19)."""
         task = {"text": "Ship it", "due": date.today().isoformat()}
         assert bot._format_task_line(task, 1) == "1. Ship it 🔴 DUE TODAY"
 
-    def test_format_task_line_override_moves_due_today_badge(self):
+    def test_debug_clock_ambient_format_task_line_override_moves_due_today_badge(self):
         """A task due in 7 days renders the due-today badge once the clock is
         moved 7 days forward, and the plain due-date form otherwise -- the
         deadline-badge success criterion, paired with a no-override control."""
@@ -2940,7 +2940,7 @@ class TestDebugClockAmbient:
         u_sim = self._with_clock(cid, due + "T09:00:00")
         assert "DUE TODAY" in bot._format_task_line(task, 1, user=u_sim)
 
-    def test_is_quiet_now_override_activates_inactive_window(self):
+    def test_debug_clock_ambient_is_quiet_now_override_activates_inactive_window(self):
         """A quiet-hours window that is not active in real time reads as
         active once the clock is moved inside it -- paired no-override
         control proves the window really was inactive first."""
@@ -2959,7 +2959,7 @@ class TestDebugClockAmbient:
         u_sim["timezone"] = "UTC"
         assert bot._is_quiet_now(u_sim) is True
 
-    def test_is_muted_override_before_and_after_expiry(self):
+    def test_debug_clock_ambient_is_muted_override_before_and_after_expiry(self):
         """An override set before a stored mute expiry reads as muted; one set
         past it reads as unmuted."""
         cid = 9902
@@ -2976,12 +2976,12 @@ class TestDebugClockAmbient:
         after["muted_until"] = "2027-06-15T12:00:00"
         assert bot._is_muted(after) is False
 
-    def test_get_streak_no_override_matches_fixed_expectation(self):
+    def test_debug_clock_ambient_get_streak_no_override_matches_fixed_expectation(self):
         u = fresh_user()
         u["activity_days"] = [date.today().isoformat()]
         assert bot._get_streak(u) == 1
 
-    def test_get_streak_override_computes_against_simulated_date(self):
+    def test_debug_clock_ambient_get_streak_override_computes_against_simulated_date(self):
         cid = 9903
         u = self._with_clock(cid, "2027-06-15T09:00:00")
         u["activity_days"] = ["2027-06-15", "2027-06-14"]
@@ -2990,22 +2990,22 @@ class TestDebugClockAmbient:
         u_real = fresh_user(activity_days=["2027-06-15", "2027-06-14"])
         assert bot._get_streak(u_real) == 0
 
-    def test_habit_streak_no_override_matches_fixed_expectation(self):
+    def test_debug_clock_ambient_habit_streak_no_override_matches_fixed_expectation(self):
         assert bot._habit_streak([date.today().isoformat()]) == 1
         assert bot._habit_streak([date.today().isoformat()], user=None) == 1
 
-    def test_habit_streak_override_computes_against_simulated_date(self):
+    def test_debug_clock_ambient_habit_streak_override_computes_against_simulated_date(self):
         cid = 9904
         u = self._with_clock(cid, "2027-06-15T09:00:00")
         assert bot._habit_streak(["2027-06-15", "2027-06-14"], user=u) == 2
         assert bot._habit_streak(["2027-06-15", "2027-06-14"]) == 0
 
-    def test_habit_summary_lines_no_override_matches_fixed_expectation(self):
+    def test_debug_clock_ambient_habit_summary_lines_no_override_matches_fixed_expectation(self):
         habits = {"meditation": {"completions": [date.today().isoformat()]}}
         lines = bot._habit_summary_lines(habits)
         assert len(lines) == 1 and "✓" in lines[0]
 
-    def test_habit_summary_lines_override_computes_against_simulated_date(self):
+    def test_debug_clock_ambient_habit_summary_lines_override_computes_against_simulated_date(self):
         cid = 9905
         u = self._with_clock(cid, "2027-06-15T09:00:00")
         habits = {"meditation": {"completions": ["2027-06-15"]}}
@@ -3017,7 +3017,7 @@ class TestDebugClockAmbient:
 
     # ── Task 2: job runners, tool branches, command handlers ──
 
-    def test_weekly_digest_runner_sunday_override_does_normal_work(self):
+    def test_debug_clock_ambient_weekly_digest_runner_sunday_override_does_normal_work(self):
         """2027-06-13 is a Sunday: with the clock moved there the runner does
         its normal work instead of reporting the Sunday gate."""
         cid = 9910
@@ -3029,7 +3029,7 @@ class TestDebugClockAmbient:
         assert result is None
         context.bot.send_message.assert_awaited_once()
 
-    def test_weekly_digest_runner_non_sunday_override_reports_gate(self):
+    def test_debug_clock_ambient_weekly_digest_runner_non_sunday_override_reports_gate(self):
         """2027-06-14 is a Monday: the runner reports the Sunday gate instead
         of doing its normal work -- paired with the Sunday case above."""
         cid = 9911
@@ -3041,7 +3041,7 @@ class TestDebugClockAmbient:
         assert result == "not sunday"
         context.bot.send_message.assert_not_awaited()
 
-    def test_deadline_alert_runner_matches_annual_reminder_months_away(self):
+    def test_debug_clock_ambient_deadline_alert_runner_matches_annual_reminder_months_away(self):
         cid = 9912
         bot.state["users"][str(cid)] = fresh_user()
         bot.state["users"][str(cid)]["reminders"] = [
@@ -3056,7 +3056,7 @@ class TestDebugClockAmbient:
         _, kwargs = context.bot.send_message.call_args
         assert "Anniversary" in kwargs["text"]
 
-    def test_deadline_alert_runner_reports_overdue_by_simulated_week(self):
+    def test_debug_clock_ambient_deadline_alert_runner_reports_overdue_by_simulated_week(self):
         cid = 9913
         bot.state["users"][str(cid)] = fresh_user()
         bot.state["users"][str(cid)]["tasks"] = [
@@ -3069,7 +3069,7 @@ class TestDebugClockAmbient:
         _, kwargs = context.bot.send_message.call_args
         assert "Overdue 7d" in kwargs["text"]
 
-    def test_idle_nudge_runner_four_days_past_does_normal_work(self):
+    def test_debug_clock_ambient_idle_nudge_runner_four_days_past_does_normal_work(self):
         cid = 9914
         bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"])
         bot.state["users"][str(cid)]["activity_days"] = ["2027-06-01"]
@@ -3079,7 +3079,7 @@ class TestDebugClockAmbient:
         assert result is None
         context.bot.send_message.assert_awaited_once()
 
-    def test_idle_nudge_runner_one_day_past_reports_not_idle_enough(self):
+    def test_debug_clock_ambient_idle_nudge_runner_one_day_past_reports_not_idle_enough(self):
         cid = 9915
         bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"])
         bot.state["users"][str(cid)]["activity_days"] = ["2027-06-01"]
@@ -3089,7 +3089,7 @@ class TestDebugClockAmbient:
         assert result == "no recent inactivity"
         context.bot.send_message.assert_not_awaited()
 
-    def test_habit_reminder_runner_lists_undone_habit_on_simulated_date(self):
+    def test_debug_clock_ambient_habit_reminder_runner_lists_undone_habit_on_simulated_date(self):
         cid = 9916
         bot.state["users"][str(cid)] = fresh_user(
             habits={"meditation": {"completions": ["2027-06-01"], "created": "2027-06-01"}}
@@ -3101,7 +3101,7 @@ class TestDebugClockAmbient:
         _, kwargs = context.bot.send_message.call_args
         assert "meditation" in kwargs["text"]
 
-    def test_get_current_time_tool_reports_simulated_date(self):
+    def test_debug_clock_ambient_get_current_time_tool_reports_simulated_date(self):
         cid = 9917
         bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
         self._with_clock(cid, "2027-06-15T14:30:00")
@@ -3109,7 +3109,7 @@ class TestDebugClockAmbient:
         assert result["date"] == "2027-06-15"
         assert result["time"] == "14:30"
 
-    def test_get_habits_tool_reports_done_today_on_simulated_date(self):
+    def test_debug_clock_ambient_get_habits_tool_reports_done_today_on_simulated_date(self):
         cid = 9918
         bot.state["users"][str(cid)] = fresh_user(
             habits={"meditation": {"completions": ["2027-06-15"], "created": "2027-06-01"}}
@@ -3120,7 +3120,7 @@ class TestDebugClockAmbient:
         assert habit["done_today"] is True
         assert habit["streak"] == 1
 
-    def test_time_cmd_reports_simulated_date(self):
+    def test_debug_clock_ambient_time_cmd_reports_simulated_date(self):
         cid = 9919
         bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
         self._with_clock(cid, "2027-06-15T14:30:00")
@@ -3130,7 +3130,7 @@ class TestDebugClockAmbient:
         assert "14:30" in text
         assert "2027" in text
 
-    def test_habit_cmd_stats_last_seven_days_uses_simulated_date(self):
+    def test_debug_clock_ambient_habit_cmd_stats_last_seven_days_uses_simulated_date(self):
         cid = 9920
         bot.state["users"][str(cid)] = fresh_user(
             habits={"meditation": {"completions": ["2027-06-15"], "created": "2027-06-01"}}
@@ -3141,7 +3141,7 @@ class TestDebugClockAmbient:
         text = update.message.reply_text.call_args[0][0]
         assert "Current streak: 1 day" in text
 
-    def test_my_stats_seven_day_chart_uses_simulated_date(self):
+    def test_debug_clock_ambient_my_stats_seven_day_chart_uses_simulated_date(self):
         cid = 9921
         bot.state["users"][str(cid)] = fresh_user(activity_days=["2027-06-15"])
         self._with_clock(cid, "2027-06-15T09:00:00")
@@ -3150,7 +3150,7 @@ class TestDebugClockAmbient:
         text = update.message.reply_text.call_args[0][0]
         assert "█" in text  # today's cell in the 7-day chart is filled
 
-    def test_no_override_job_runners_and_commands_unchanged(self):
+    def test_debug_clock_ambient_no_override_job_runners_and_commands_unchanged(self):
         """Control: with no override active, the runners and command handlers
         touched by Task 2 behave exactly as before this plan (T-1-19)."""
         cid = 9922
@@ -3164,7 +3164,7 @@ class TestDebugClockAmbient:
         expected = None if date.today().weekday() == 6 else "not sunday"
         assert result == expected
 
-    def test_once_delay_arithmetic_unaffected_by_active_override(self):
+    def test_debug_clock_ambient_once_delay_arithmetic_unaffected_by_active_override(self):
         """The one-shot reminder delay computation (Table B exclusion, second
         prohibition) produces the same value whether or not an override is
         active -- it must never route through the simulated clock."""
@@ -3174,4 +3174,188 @@ class TestDebugClockAmbient:
         self._with_clock(cid, "2030-01-01T00:00:00")
         with_override = bot._parse_once_delay("30m", "UTC")
         assert no_override == with_override == 1800.0
+
+    # ── Task 3: durable-record guard (no production code changes) ──
+    # Clock set a year ahead -- far enough that a real stored value can
+    # never be mistaken for a simulated one (T-1-16, T-1-17).
+
+    def _assert_real_ts(self, ts_iso, tolerance_seconds=10):
+        stored = bot.datetime.fromisoformat(ts_iso)
+        real_now = bot.datetime.utcnow()
+        assert abs((real_now - stored).total_seconds()) < tolerance_seconds
+
+    def test_debug_clock_ambient_complete_habit_records_real_date_both_paths(self):
+        """A year-ahead clock never reaches habit['completions'] -- neither
+        through the tool dispatcher nor through /habit done, since Table B
+        lists both write paths."""
+        real_today = date.today().isoformat()
+
+        cid = 9930
+        bot.state["users"][str(cid)] = fresh_user(
+            habits={"meditation": {"completions": [], "created": real_today}}
+        )
+        self._with_clock(cid, "2030-01-01T00:00:00")
+        run(bot._execute_tool(cid, "complete_habit", {"name": "meditation"}))
+        assert bot.state["users"][str(cid)]["habits"]["meditation"]["completions"] == [real_today]
+
+        cid2 = 9931
+        bot.state["users"][str(cid2)] = fresh_user(
+            habits={"journaling": {"completions": [], "created": real_today}}
+        )
+        self._with_clock(cid2, "2030-01-01T00:00:00")
+        update = _debug_update(cid2)
+        run(bot.habit_cmd(update, _debug_context(["done", "journaling"])))
+        assert bot.state["users"][str(cid2)]["habits"]["journaling"]["completions"] == [real_today]
+
+    def test_debug_clock_ambient_journal_note_tracker_record_real_timestamp(self):
+        """/journal, /note and both tracker-logging paths (tool + custom
+        command) each stamp the real wall clock, never the simulated one."""
+        cid = 9932
+        bot.state["users"][str(cid)] = fresh_user()
+        self._with_clock(cid, "2030-01-01T00:00:00")
+
+        with patch.object(bot, "chat", AsyncMock(return_value="Nice reflection.")):
+            update = _debug_update(cid)
+            run(bot.journal_cmd(update, _debug_context(["Had", "a", "good", "day"])))
+        journal_rows = bot.db_get_journal(str(cid))
+        assert len(journal_rows) == 1
+        self._assert_real_ts(journal_rows[0]["ts"])
+
+        update = _debug_update(cid)
+        run(bot.note_cmd(update, _debug_context(["Buy", "milk"])))
+        note_rows = bot.db_get_notes(str(cid))
+        assert len(note_rows) == 1
+        self._assert_real_ts(note_rows[0]["ts"])
+
+        bot.state["users"][str(cid)]["trackers"] = {"weight": {"unit": "kg", "log": []}}
+        run(bot._execute_tool(cid, "log_tracker", {"tracker_name": "weight", "value": 80}))
+        log = bot.state["users"][str(cid)]["trackers"]["weight"]["log"]
+        assert len(log) == 1
+        self._assert_real_ts(log[0]["ts"])
+
+        bot.state["users"][str(cid)]["trackers"]["height"] = {"unit": "cm", "log": []}
+        update = _debug_update(cid)
+        update.message.text = "/height 180"
+        run(bot.handle_custom_command(update, _debug_context([])))
+        log2 = bot.state["users"][str(cid)]["trackers"]["height"]["log"]
+        assert len(log2) == 1
+        self._assert_real_ts(log2[0]["ts"])
+
+    def test_debug_clock_ambient_chat_turn_touches_activity_with_real_date(self):
+        """A genuine chat turn (touch_activity=True, the default) adds the
+        real date to activity_days, not the simulated one."""
+        cid = 9933
+        real_today = date.today().isoformat()
+        bot.state["users"][str(cid)] = fresh_user()
+        self._with_clock(cid, "2030-01-01T00:00:00")
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock(message=MagicMock(tool_calls=None, content="Hi there!"))]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        with patch.object(bot, "get_llm_client", return_value=mock_client):
+            run(bot.chat(cid, "hello"))
+        assert bot.state["users"][str(cid)]["activity_days"] == [real_today]
+
+    def test_debug_clock_ambient_task_add_complete_extend_compute_from_real_date(self):
+        """A relative due date, a recurring completion's next-due roll, and
+        an extend's fallback base date all compute from the real date."""
+        cid = 9935
+        real_today = date.today()
+        bot.state["users"][str(cid)] = fresh_user()
+        self._with_clock(cid, "2030-01-01T00:00:00")
+
+        update = _debug_update(cid)
+        run(bot.add_task(update, _debug_context(["Meditate", "every:daily"])))
+        task = bot.state["users"][str(cid)]["tasks"][0]
+        assert task["due"] == real_today.isoformat()
+
+        bot.state["users"][str(cid)]["tasks"] = [
+            {"text": "Water plants", "due": None, "recur": "daily"}
+        ]
+        update = _debug_update(cid)
+        run(bot.done_task(update, _debug_context(["1"])))
+        rolled = bot.state["users"][str(cid)]["tasks"][0]
+        assert rolled["due"] == (real_today + timedelta(days=1)).isoformat()
+        archived = bot.state["users"][str(cid)]["archived_tasks"][-1]
+        self._assert_real_ts(archived["completed_at"])
+
+        bot.state["users"][str(cid)]["tasks"] = ["Plain task"]
+        update = _debug_update(cid)
+        run(bot.extend_cmd(update, _debug_context(["1", "7"])))
+        extended = bot.state["users"][str(cid)]["tasks"][0]
+        assert extended["due"] == (real_today + timedelta(days=7)).isoformat()
+
+    def test_debug_clock_ambient_job_fire_writes_real_timestamp_to_job_log(self):
+        cid = 9936
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        self._with_clock(cid, "2030-01-01T00:00:00")
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Hi!")):
+            run(bot._run_checkin(context, cid, "morning"))
+        last_fired = bot.db_last_job_fired(str(cid), "checkin_morning")
+        assert last_fired is not None
+        self._assert_real_ts(last_fired)
+
+    def test_debug_clock_ambient_mute_cmd_stores_real_hour_ahead_expiry(self):
+        cid = 9937
+        bot.state["users"][str(cid)] = fresh_user()
+        self._with_clock(cid, "2030-01-01T00:00:00")
+        before = bot.datetime.utcnow()
+        update = _debug_update(cid)
+        run(bot.mute_cmd(update, _debug_context(["1h"])))
+        after = bot.datetime.utcnow()
+        until = bot.datetime.fromisoformat(bot.state["users"][str(cid)]["muted_until"])
+        assert before + bot.timedelta(minutes=59) <= until <= after + bot.timedelta(minutes=61)
+
+    def test_debug_clock_ambient_durable_writes_identical_with_and_without_override(self):
+        """Repeating a representative durable write (habit completion) with
+        the clock cleared produces the identical stored value -- proving the
+        clock made no difference to any of them."""
+        real_today = date.today().isoformat()
+        cid_a, cid_b = 9938, 9939
+        bot.state["users"][str(cid_a)] = fresh_user(
+            habits={"meditation": {"completions": [], "created": real_today}}
+        )
+        self._with_clock(cid_a, "2030-01-01T00:00:00")
+        run(bot._execute_tool(cid_a, "complete_habit", {"name": "meditation"}))
+        with_override = bot.state["users"][str(cid_a)]["habits"]["meditation"]["completions"]
+
+        bot.state["users"][str(cid_b)] = fresh_user(
+            habits={"meditation": {"completions": [], "created": real_today}}
+        )
+        run(bot._execute_tool(cid_b, "complete_habit", {"name": "meditation"}))
+        without_override = bot.state["users"][str(cid_b)]["habits"]["meditation"]["completions"]
+
+        assert with_override == without_override == [real_today]
+
+    def test_debug_clock_ambient_set_use_reset_round_trip_restores_real_time_everywhere(self):
+        """Set a clock, confirm several Table A surfaces reflect it, reset
+        via the real /debug clock reset command, and confirm every one of
+        those surfaces returns to real time -- the closest automated
+        analogue to 01-VALIDATION.md's ambient-clock manual walkthrough."""
+        cid = 9940
+        bot.state["users"][str(cid)] = fresh_user(timezone="UTC")
+
+        with as_owner(cid):
+            run(bot.debug_cmd(_debug_update(cid), _debug_context(["clock", "2027-06-15T14:30:00"])))
+
+        u = bot.get_user(cid)
+        assert bot._today(user=u) == date(2027, 6, 15)
+        result = run(bot._execute_tool(cid, "get_current_time", {}))
+        assert result["date"] == "2027-06-15"
+        time_update = _debug_update(cid)
+        run(bot.time_cmd(time_update, _debug_context([])))
+        assert "2027" in time_update.message.reply_text.call_args[0][0]
+
+        with as_owner(cid):
+            run(bot.debug_cmd(_debug_update(cid), _debug_context(["clock", "reset"])))
+
+        u2 = bot.get_user(cid)
+        assert bot._today(user=u2) == date.today()
+        result2 = run(bot._execute_tool(cid, "get_current_time", {}))
+        assert result2["date"] == date.today().isoformat()
+        time_update2 = _debug_update(cid)
+        run(bot.time_cmd(time_update2, _debug_context([])))
+        assert str(date.today().year) in time_update2.message.reply_text.call_args[0][0]
 
