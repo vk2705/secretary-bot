@@ -1854,6 +1854,86 @@ def _parse_local_time(time_str: str, tz_str: str) -> dt_time:
     return dt_time(h, m, tzinfo=tz)
 
 
+async def _run_checkin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: str) -> str | None:
+    """Send the morning or evening check-in message for chat_id, including the
+    stale-tracker nudge and the unanswered-check-in acknowledgement. Shared by
+    the per-user scheduled check-in job (via schedule_user_checkins's thin
+    wrapper) and `/debug fire checkin_morning`/`checkin_evening` so the two
+    paths can never diverge. Passes touch_activity=False to chat() so a
+    proactive check-in is never mistaken for the user having responded.
+    Returns a short reason string when quiet hours or mute suppress the
+    check-in, None once it sent one."""
+    user_now = get_user(chat_id)
+    if _is_quiet_now(user_now):
+        return "quiet hours"
+    if _is_muted(user_now):
+        return "muted"
+    is_morning = (label == "morning")
+    variety_instruction = (
+        "Open with a natural greeting that's noticeably different from how you've opened "
+        "recent check-ins — check the conversation history and don't reuse the same phrasing "
+        "or structure. Where it genuinely fits, weave in something specific and recent — a "
+        "task, a journal entry, a note, or something you remember about the user — so it "
+        "reads as personal rather than templated. Don't force a callback if nothing fits."
+    )
+    if is_morning:
+        prompt = (
+            f"It's morning check-in time. {variety_instruction} "
+            "Then ask what they plan to work on today from their task list. "
+            "Pick 1-2 specific tasks to focus on."
+        )
+    else:
+        prompt = (
+            f"It's evening check-in time. {variety_instruction} "
+            "Ask how their day went and specifically about progress on their tasks. "
+            "If they didn't do much, gently push back and encourage them to do "
+            "at least one small thing."
+        )
+    try:
+        dynamic_prompt = prompt
+        if is_morning:
+            # Append stale-tracker reminder if any tracker hasn't been logged in 2+ days
+            stale = []
+            for tname, tdata in user_now.get("trackers", {}).items():
+                log = tdata.get("log", [])
+                if log:
+                    last_ts = log[-1]["ts"][:10]
+                    try:
+                        if (date.today() - date.fromisoformat(last_ts)).days >= 2:
+                            stale.append(tname)
+                    except ValueError:
+                        pass
+            if stale:
+                dynamic_prompt += (
+                    f" Also mention that these trackers haven't been updated in 2+ days "
+                    f"and nudge the user to log: {', '.join(stale)}."
+                )
+        if user_now.get("pending_checkin"):
+            dynamic_prompt += (
+                " Note: the user did not reply to your last check-in message. "
+                "Briefly acknowledge the silence and vary your wording instead of "
+                "repeating the same question."
+            )
+        reply = await chat(chat_id, dynamic_prompt, touch_activity=False)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Going well", callback_data="ci:well"),
+                InlineKeyboardButton("🔄 Partially", callback_data="ci:partial"),
+            ],
+            [
+                InlineKeyboardButton("❌ Not today", callback_data="ci:skip"),
+                InlineKeyboardButton("💬 Let's talk", callback_data="ci:chat"),
+            ],
+        ])
+        await context.bot.send_message(chat_id=chat_id, text=reply, reply_markup=keyboard)
+        user_now["pending_checkin"] = label
+        save_state(state)
+        db_log_job(str(chat_id), f"checkin_{'morning' if is_morning else 'evening'}")
+    except Exception as e:
+        logger.error("Check-in failed for %s: %s", chat_id, e)
+    return None
+
+
 def schedule_user_checkins(app: Application, chat_id: int) -> None:
     """Schedule (or reschedule) per-user morning/evening check-in jobs."""
     user = get_user(chat_id)
@@ -1869,80 +1949,42 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
             continue
 
         t = _parse_local_time(times.get(label, "08:00" if label == "morning" else "21:00"), tz_str)
-        variety_instruction = (
-            "Open with a natural greeting that's noticeably different from how you've opened "
-            "recent check-ins — check the conversation history and don't reuse the same phrasing "
-            "or structure. Where it genuinely fits, weave in something specific and recent — a "
-            "task, a journal entry, a note, or something you remember about the user — so it "
-            "reads as personal rather than templated. Don't force a callback if nothing fits."
+
+        async def _checkin_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _label=label):
+            await _run_checkin(context, _cid, _label)
+
+        app.job_queue.run_daily(_checkin_wrapper, time=t, name=job_name)
+
+
+async def _run_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reminder: dict) -> str | None:
+    """Send a single reminder's text (with its optional reason) and register a
+    snooze token. Shared by the per-reminder scheduled job (via
+    schedule_user_reminder's thin wrapper) and `/debug fire reminder <n>` so
+    the two paths can never diverge. Returns a short reason string when quiet
+    hours or mute suppress the reminder, None once it sent one."""
+    u = get_user(chat_id)
+    if _is_quiet_now(u):
+        return "quiet hours"
+    if _is_muted(u):
+        return "muted"
+    msg = reminder["message"]
+    reason = reminder.get("reason")
+    try:
+        import time as _time
+        token = f"{chat_id}_{int(_time.monotonic() * 1000) % 10_000_000}"
+        _snooze_cache[token] = msg
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
+        ]])
+        text = f"⏰ Reminder: {msg}"
+        if reason:
+            text += f"\n💡 {reason}"
+        await context.bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=keyboard
         )
-        if label == "morning":
-            prompt = (
-                f"It's morning check-in time. {variety_instruction} "
-                "Then ask what they plan to work on today from their task list. "
-                "Pick 1-2 specific tasks to focus on."
-            )
-        else:
-            prompt = (
-                f"It's evening check-in time. {variety_instruction} "
-                "Ask how their day went and specifically about progress on their tasks. "
-                "If they didn't do much, gently push back and encourage them to do "
-                "at least one small thing."
-            )
-
-        is_morning = (label == "morning")
-
-        async def _job(
-            context: ContextTypes.DEFAULT_TYPE,
-            _cid=chat_id, _prompt=prompt, _morning=is_morning,
-        ):
-            user_now = get_user(_cid)
-            if _is_quiet_now(user_now) or _is_muted(user_now):
-                return
-            try:
-                dynamic_prompt = _prompt
-                if _morning:
-                    # Append stale-tracker reminder if any tracker hasn't been logged in 2+ days
-                    stale = []
-                    for tname, tdata in user_now.get("trackers", {}).items():
-                        log = tdata.get("log", [])
-                        if log:
-                            last_ts = log[-1]["ts"][:10]
-                            try:
-                                if (date.today() - date.fromisoformat(last_ts)).days >= 2:
-                                    stale.append(tname)
-                            except ValueError:
-                                pass
-                    if stale:
-                        dynamic_prompt += (
-                            f" Also mention that these trackers haven't been updated in 2+ days "
-                            f"and nudge the user to log: {', '.join(stale)}."
-                        )
-                if user_now.get("pending_checkin"):
-                    dynamic_prompt += (
-                        " Note: the user did not reply to your last check-in message. "
-                        "Briefly acknowledge the silence and vary your wording instead of "
-                        "repeating the same question."
-                    )
-                reply = await chat(_cid, dynamic_prompt, touch_activity=False)
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Going well", callback_data="ci:well"),
-                        InlineKeyboardButton("🔄 Partially", callback_data="ci:partial"),
-                    ],
-                    [
-                        InlineKeyboardButton("❌ Not today", callback_data="ci:skip"),
-                        InlineKeyboardButton("💬 Let's talk", callback_data="ci:chat"),
-                    ],
-                ])
-                await context.bot.send_message(chat_id=_cid, text=reply, reply_markup=keyboard)
-                user_now["pending_checkin"] = label
-                save_state(state)
-                db_log_job(str(_cid), f"checkin_{'morning' if _morning else 'evening'}")
-            except Exception as e:
-                logger.error("Check-in failed for %s: %s", _cid, e)
-
-        app.job_queue.run_daily(_job, time=t, name=job_name)
+    except Exception as e:
+        logger.error("Reminder failed for %s: %s", chat_id, e)
+    return None
 
 
 def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> None:
@@ -1952,37 +1994,27 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
         job.schedule_removal()
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
 
-    async def _job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=reminder["message"],
-                   _reason=reminder.get("reason")):
-        if _is_quiet_now(get_user(_cid)) or _is_muted(get_user(_cid)):
-            return
-        try:
-            import time as _time
-            token = f"{_cid}_{int(_time.monotonic() * 1000) % 10_000_000}"
-            _snooze_cache[token] = _msg
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
-            ]])
-            text = f"⏰ Reminder: {_msg}"
-            if _reason:
-                text += f"\n💡 {_reason}"
-            await context.bot.send_message(
-                chat_id=_cid, text=text, reply_markup=keyboard
-            )
-        except Exception as e:
-            logger.error("Reminder failed for %s: %s", _cid, e)
+    async def _reminder_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _reminder=reminder):
+        await _run_reminder(context, _cid, _reminder)
 
-    app.job_queue.run_daily(_job, time=t, name=job_name)
+    app.job_queue.run_daily(_reminder_wrapper, time=t, name=job_name)
 
 
-async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
     """Send the 09:00 deadline alert (overdue/due-today/due-soon tasks) plus any
     annual reminders due today for chat_id. Shared by the 09:00 scheduled job
     (via schedule_user_alerts's thin wrapper) and `/debug fire deadline_alert`
-    so the two paths can never diverge."""
+    so the two paths can never diverge. Returns a short reason string when
+    quiet hours or mute suppress the alert, or when nothing was due and no
+    annual reminder matched today; None once it sent at least one message —
+    the same suppression-reason contract as the other five runners
+    (_run_checkin, _run_habit_reminder, _run_idle_nudge, _run_weekly_digest,
+    _run_reminder)."""
     u = get_user(chat_id)
-    if _is_quiet_now(u) or _is_muted(u):
-        return
+    if _is_quiet_now(u):
+        return "quiet hours"
+    if _is_muted(u):
+        return "muted"
     today = date.today()
     alerts = []
     for task in u.get("tasks", []):
@@ -2001,12 +2033,14 @@ async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
                 alerts.append(f"🟡 Due in {days_left}d: {text}")
         except ValueError:
             pass
+    sent = False
     if alerts:
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="📅 Deadline alert:\n" + "\n".join(alerts)
             )
+            sent = True
         except Exception as e:
             logger.error("Deadline alert failed for %s: %s", chat_id, e)
 
@@ -2019,8 +2053,131 @@ async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
                     chat_id=chat_id,
                     text=f"📅 Annual reminder: {r['message']}"
                 )
+                sent = True
             except Exception as e:
                 logger.error("Annual reminder failed for %s: %s", chat_id, e)
+
+    return None if sent else "nothing due"
+
+
+async def _run_habit_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+    """Send the list of not-yet-done-today habits at 20:00. Shared by the
+    scheduled job (via schedule_user_alerts's thin wrapper) and
+    `/debug fire habit_reminder` so the two paths can never diverge. Returns
+    a short reason string when quiet hours or mute suppress the reminder, or
+    when every habit is already done today; None once it sent one."""
+    u = get_user(chat_id)
+    if _is_quiet_now(u):
+        return "quiet hours"
+    if _is_muted(u):
+        return "muted"
+    habits = u.get("habits", {})
+    today_str = date.today().isoformat()
+    undone = [n for n, d in habits.items() if today_str not in d.get("completions", [])]
+    if not undone:
+        return "nothing undone"
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🔔 Habit reminder — not yet done today:\n"
+                + "\n".join(f"  • {n}" for n in undone)
+                + "\nUse /habit done <name> to log them."
+            )
+        )
+    except Exception as e:
+        logger.error("Habit reminder failed for %s: %s", chat_id, e)
+    return None
+
+
+async def _run_idle_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+    """Send an idle nudge at 11:00 if chat_id has been inactive 3+ days.
+    Shared by the scheduled job (via schedule_user_alerts's thin wrapper) and
+    `/debug fire idle_nudge` so the two paths can never diverge. Returns a
+    short reason string when quiet hours or mute suppress the nudge, when the
+    user has no tasks and no habits, or when the last active day is under
+    three days old; None once it sent one."""
+    u = get_user(chat_id)
+    if _is_quiet_now(u):
+        return "quiet hours"
+    if _is_muted(u):
+        return "muted"
+    if not u.get("tasks") and not u.get("habits"):
+        return "no tasks or habits"
+    days = sorted(u.get("activity_days", []))
+    if not days:
+        return "no recent inactivity"
+    last_active = date.fromisoformat(days[-1])
+    if (date.today() - last_active).days < 3:
+        return "no recent inactivity"
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "👋 I haven't heard from you in a few days — just checking in!\n"
+                "How are things going with your goals? "
+                "Use /checkin to start a conversation, or just say hi."
+            )
+        )
+    except Exception as e:
+        logger.error("Idle nudge failed for %s: %s", chat_id, e)
+    return None
+
+
+async def _run_weekly_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+    """Send the weekly digest every Sunday at 10:00. Shared by the scheduled
+    job (via schedule_user_alerts's thin wrapper) and
+    `/debug fire weekly_digest` so the two paths can never diverge. Passes
+    touch_activity=False to chat() for the same reason _run_checkin does.
+    Returns a short reason string when quiet hours or mute suppress the
+    digest, or when today isn't Sunday; None once it sent one."""
+    u = get_user(chat_id)
+    if _is_quiet_now(u):
+        return "quiet hours"
+    if _is_muted(u):
+        return "muted"
+    # Use user's local date for the Sunday check
+    tz = ZoneInfo(u.get("timezone", "UTC"))
+    today = datetime.now(tz).date()
+    if today.weekday() != 6:
+        return "not sunday"
+    try:
+        tasks_str = _tasks_for_prompt(u["tasks"])
+        habits_str = "; ".join(
+            f"{n}: {_habit_streak(h.get('completions',[]))}-day streak"
+            for n, h in u.get("habits", {}).items()
+        ) or "none"
+        week_cutoff = (today - timedelta(days=7)).isoformat()
+        n_done = sum(
+            1 for t in u.get("archived_tasks", [])
+            if (t.get("completed_at") or "")[:10] >= week_cutoff
+        )
+        journal_count = len([
+            r for r in db_get_journal(str(chat_id))
+            if r["ts"][:10] >= week_cutoff
+        ])
+        prompt = (
+            f"Weekly digest for this user:\n"
+            f"Tasks: {tasks_str}\n"
+            f"Habits: {habits_str}\n"
+            f"Tasks completed this week: {n_done} total\n"
+            f"Journal entries this week: {journal_count}\n\n"
+            "Write a brief, warm weekly digest (3-4 sentences): "
+            "acknowledge their progress, highlight one strength, "
+            "suggest one priority for the coming week. Be specific, not generic."
+        )
+        reply = await chat(
+            chat_id, prompt,
+            system="You are a supportive weekly accountability coach.",
+            touch_activity=False,
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📅 Weekly digest:\n\n{reply}"
+        )
+    except Exception as e:
+        logger.error("Weekly digest failed for %s: %s", chat_id, e)
+    return None
 
 
 def schedule_user_alerts(app: Application, chat_id: int) -> None:
@@ -2050,112 +2207,31 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     )
 
     # ── habit reminder at 20:00 ──
-    async def _habit_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        u = get_user(_cid)
-        if _is_quiet_now(u) or _is_muted(u):
-            return
-        habits = u.get("habits", {})
-        today_str = date.today().isoformat()
-        undone = [n for n, d in habits.items() if today_str not in d.get("completions", [])]
-        if undone:
-            try:
-                await context.bot.send_message(
-                    chat_id=_cid,
-                    text=(
-                        "🔔 Habit reminder — not yet done today:\n"
-                        + "\n".join(f"  • {n}" for n in undone)
-                        + "\nUse /habit done <name> to log them."
-                    )
-                )
-            except Exception as e:
-                logger.error("Habit reminder failed for %s: %s", _cid, e)
+    async def _habit_reminder_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        await _run_habit_reminder(context, _cid)
 
     app.job_queue.run_daily(
-        _habit_job,
+        _habit_reminder_wrapper,
         time=_parse_local_time("20:00", tz_str),
         name=f"habit_reminder_{chat_id}",
     )
 
     # ── idle nudge at 11:00 — fires only if user has been inactive 3+ days ──
-    async def _idle_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        u = get_user(_cid)
-        if _is_quiet_now(u) or _is_muted(u):
-            return
-        if not u.get("tasks") and not u.get("habits"):
-            return
-        days = sorted(u.get("activity_days", []))
-        if not days:
-            return
-        last_active = date.fromisoformat(days[-1])
-        if (date.today() - last_active).days < 3:
-            return
-        try:
-            await context.bot.send_message(
-                chat_id=_cid,
-                text=(
-                    "👋 I haven't heard from you in a few days — just checking in!\n"
-                    "How are things going with your goals? "
-                    "Use /checkin to start a conversation, or just say hi."
-                )
-            )
-        except Exception as e:
-            logger.error("Idle nudge failed for %s: %s", _cid, e)
+    async def _idle_nudge_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        await _run_idle_nudge(context, _cid)
 
     app.job_queue.run_daily(
-        _idle_job,
+        _idle_nudge_wrapper,
         time=_parse_local_time("11:00", tz_str),
         name=f"idle_nudge_{chat_id}",
     )
 
     # ── Weekly digest every Sunday at 10:00 ──
-    async def _weekly_digest_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        u = get_user(_cid)
-        if _is_quiet_now(u) or _is_muted(u):
-            return
-        # Use user's local date for the Sunday check
-        tz = ZoneInfo(u.get("timezone", "UTC"))
-        today = datetime.now(tz).date()
-        if today.weekday() != 6:
-            return
-        try:
-            tasks_str = _tasks_for_prompt(u["tasks"])
-            habits_str = "; ".join(
-                f"{n}: {_habit_streak(h.get('completions',[]))}-day streak"
-                for n, h in u.get("habits", {}).items()
-            ) or "none"
-            week_cutoff = (today - timedelta(days=7)).isoformat()
-            n_done = sum(
-                1 for t in u.get("archived_tasks", [])
-                if (t.get("completed_at") or "")[:10] >= week_cutoff
-            )
-            journal_count = len([
-                r for r in db_get_journal(str(_cid))
-                if r["ts"][:10] >= week_cutoff
-            ])
-            prompt = (
-                f"Weekly digest for this user:\n"
-                f"Tasks: {tasks_str}\n"
-                f"Habits: {habits_str}\n"
-                f"Tasks completed this week: {n_done} total\n"
-                f"Journal entries this week: {journal_count}\n\n"
-                "Write a brief, warm weekly digest (3-4 sentences): "
-                "acknowledge their progress, highlight one strength, "
-                "suggest one priority for the coming week. Be specific, not generic."
-            )
-            reply = await chat(
-                _cid, prompt,
-                system="You are a supportive weekly accountability coach.",
-                touch_activity=False,
-            )
-            await context.bot.send_message(
-                chat_id=_cid,
-                text=f"📅 Weekly digest:\n\n{reply}"
-            )
-        except Exception as e:
-            logger.error("Weekly digest failed for %s: %s", _cid, e)
+    async def _weekly_digest_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        await _run_weekly_digest(context, _cid)
 
     app.job_queue.run_daily(
-        _weekly_digest_job,
+        _weekly_digest_wrapper,
         time=_parse_local_time("10:00", tz_str),
         name=f"weekly_digest_{chat_id}",
     )

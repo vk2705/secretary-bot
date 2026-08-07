@@ -42,9 +42,19 @@ for _mod in [
 # Minimal stubs so bot.py top-level imports don't crash.
 _tg = sys.modules["telegram"]
 for _attr in [
-    "Update", "InlineKeyboardMarkup", "InlineKeyboardButton", "BotCommand",
+    "Update", "BotCommand",
 ]:
     setattr(_tg, _attr, MagicMock)
+
+# InlineKeyboardMarkup/InlineKeyboardButton are constructed with a nested-list
+# positional arg (e.g. InlineKeyboardMarkup([[button]])) by the check-in and
+# reminder job bodies. The bare MagicMock class can't stand in directly here:
+# calling MagicMock(some_list) binds that list to Mock's own `spec` kwarg,
+# and a nested list isn't hashable where `spec` introspection expects it —
+# "unhashable type: 'list'". A side_effect that ignores the constructor args
+# and returns a fresh MagicMock instance sidesteps the collision.
+for _attr in ["InlineKeyboardMarkup", "InlineKeyboardButton"]:
+    setattr(_tg, _attr, MagicMock(side_effect=lambda *a, **kw: MagicMock()))
 
 _tgext = sys.modules["telegram.ext"]
 for _attr in [
@@ -1542,6 +1552,23 @@ def _delivered_text(update):
     return args[0]
 
 
+def _capture_run_daily_callbacks(app):
+    """Patch app.job_queue.run_daily to capture every (name -> callback) pair
+    registered during a schedule_user_* call, keyed by job name. Reusable by
+    every wrapper-equivalence test across the six extracted runners
+    (_run_deadline_alert from 01-01; _run_checkin, _run_habit_reminder,
+    _run_idle_nudge, _run_weekly_digest, _run_reminder from 01-03)."""
+    captured = {}
+
+    def _run_daily(callback, time=None, name=None):
+        captured[name] = callback
+        return MagicMock()
+
+    app.job_queue.run_daily.side_effect = _run_daily
+    app.job_queue.get_jobs_by_name.return_value = []
+    return captured
+
+
 class TestDebugFire:
     """Tracer slice: /debug fire deadline_alert produces the identical message
     and side effects as the 09:00 scheduled job, through the shared
@@ -1661,6 +1688,348 @@ class TestDebugFire:
         job_context.bot.send_message.assert_awaited_once()
         _, kwargs = job_context.bot.send_message.call_args
         assert "Renew passport" in kwargs["text"]
+
+    # ── 01-03 Task 1: the five newly-extracted runners ─────────────────────
+
+    def test_debug_fire_checkin_morning_touch_activity_false(self):
+        """_run_checkin passes touch_activity=False to chat() — the Pitfall 3
+        regression guard; a debug-fired check-in must never be mistaken for
+        the user having responded."""
+        cid = 9010
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")) as mock_chat:
+            result = run(bot._run_checkin(_debug_context([]), cid, "morning"))
+        assert result is None
+        mock_chat.assert_awaited_once()
+        _, kwargs = mock_chat.call_args
+        assert kwargs.get("touch_activity") is False
+
+    def test_debug_fire_checkin_pending_and_activity_unchanged(self):
+        """After firing, pending_checkin equals the fired label and
+        activity_days is unchanged."""
+        cid = 9011
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        before_days = list(bot.state["users"][str(cid)]["activity_days"])
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")):
+            run(bot._run_checkin(_debug_context([]), cid, "morning"))
+        user = bot.get_user(cid)
+        assert user["pending_checkin"] == "morning"
+        assert user["activity_days"] == before_days
+
+    def test_debug_fire_checkin_stale_tracker_append(self):
+        """A tracker not logged in 2+ days appends a stale-tracker nudge to
+        the prompt handed to chat()."""
+        cid = 9012
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        stale_ts = (date.today() - timedelta(days=3)).isoformat() + "T00:00:00"
+        bot.state["users"][str(cid)]["trackers"] = {
+            "weight": {"unit": "kg", "log": [{"ts": stale_ts, "value": 80}]}
+        }
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")) as mock_chat:
+            run(bot._run_checkin(_debug_context([]), cid, "morning"))
+        args, _ = mock_chat.call_args
+        prompt = args[1]
+        assert "weight" in prompt
+        assert "2+ days" in prompt
+
+    def test_debug_fire_checkin_evening_no_stale_tracker_append(self):
+        """The stale-tracker nudge is morning-only, matching the pre-extraction
+        closure's `if _morning:` guard."""
+        cid = 90121
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        stale_ts = (date.today() - timedelta(days=5)).isoformat() + "T00:00:00"
+        bot.state["users"][str(cid)]["trackers"] = {
+            "weight": {"unit": "kg", "log": [{"ts": stale_ts, "value": 80}]}
+        }
+        with patch.object(bot, "chat", AsyncMock(return_value="Evening!")) as mock_chat:
+            run(bot._run_checkin(_debug_context([]), cid, "evening"))
+        args, _ = mock_chat.call_args
+        prompt = args[1]
+        assert "2+ days" not in prompt
+
+    def test_debug_fire_checkin_pending_checkin_ack(self):
+        """An unanswered prior check-in appends the silence-acknowledgement
+        instruction to the prompt handed to chat()."""
+        cid = 9013
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True, pending_checkin="evening")
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")) as mock_chat:
+            run(bot._run_checkin(_debug_context([]), cid, "morning"))
+        args, _ = mock_chat.call_args
+        prompt = args[1]
+        assert "did not reply" in prompt
+
+    def test_debug_fire_checkin_sends_inline_keyboard_and_logs_job(self):
+        cid = 9014
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")):
+            run(bot._run_checkin(context, cid, "morning"))
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert kwargs["reply_markup"] is not None
+        assert bot.db_last_job_fired(str(cid), "checkin_morning") is not None
+
+    @pytest.mark.parametrize("runner_name,call_kwargs", [
+        pytest.param("_run_checkin", {"label": "morning"}, id="checkin"),
+        pytest.param("_run_habit_reminder", {}, id="habit_reminder"),
+        pytest.param("_run_idle_nudge", {}, id="idle_nudge"),
+        pytest.param("_run_weekly_digest", {}, id="weekly_digest"),
+        pytest.param("_run_deadline_alert", {}, id="deadline_alert"),
+    ])
+    @pytest.mark.parametrize("guard_attr,expected_reason", [
+        pytest.param("_is_quiet_now", "quiet hours", id="quiet_hours"),
+        pytest.param("_is_muted", "muted", id="muted"),
+    ])
+    def test_debug_fire_runner_guard_suppression(
+        self, runner_name, call_kwargs, guard_attr, expected_reason
+    ):
+        """Every runner returns the guard's reason string and sends nothing
+        when quiet hours or mute suppress it — the guard is real behaviour,
+        never bypassed on the debug path."""
+        cid = 9020
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        context = _debug_context([])
+        runner = getattr(bot, runner_name)
+        with patch.object(bot, guard_attr, return_value=True), \
+             patch.object(bot, "chat", AsyncMock(return_value="x")):
+            if runner_name == "_run_checkin":
+                result = run(runner(context, cid, call_kwargs["label"]))
+            else:
+                result = run(runner(context, cid))
+        assert result == expected_reason
+        context.bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("guard_attr,expected_reason", [
+        pytest.param("_is_quiet_now", "quiet hours", id="quiet_hours"),
+        pytest.param("_is_muted", "muted", id="muted"),
+    ])
+    def test_debug_fire_reminder_guard_suppression(self, guard_attr, expected_reason):
+        cid = 9021
+        bot.state["users"][str(cid)] = fresh_user()
+        reminder = {"id": "r1", "time": "09:00", "message": "Take pills", "once": False}
+        context = _debug_context([])
+        with patch.object(bot, guard_attr, return_value=True):
+            result = run(bot._run_reminder(context, cid, reminder))
+        assert result == expected_reason
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_habit_reminder_all_done(self):
+        cid = 9030
+        today_str = date.today().isoformat()
+        bot.state["users"][str(cid)] = fresh_user(
+            habits={"meditation": {"completions": [today_str], "created": today_str}}
+        )
+        context = _debug_context([])
+        result = run(bot._run_habit_reminder(context, cid))
+        assert result == "nothing undone"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_habit_reminder_lists_undone(self):
+        cid = 9031
+        bot.state["users"][str(cid)] = fresh_user(
+            habits={
+                "meditation": {"completions": [], "created": date.today().isoformat()},
+                "reading": {"completions": [date.today().isoformat()], "created": date.today().isoformat()},
+            }
+        )
+        context = _debug_context([])
+        result = run(bot._run_habit_reminder(context, cid))
+        assert result is None
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "meditation" in kwargs["text"]
+        assert "reading" not in kwargs["text"]
+
+    def test_debug_fire_idle_nudge_no_tasks_or_habits(self):
+        cid = 9040
+        bot.state["users"][str(cid)] = fresh_user()
+        context = _debug_context([])
+        result = run(bot._run_idle_nudge(context, cid))
+        assert result == "no tasks or habits"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_idle_nudge_no_activity_history(self):
+        cid = 9041
+        bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"])
+        context = _debug_context([])
+        result = run(bot._run_idle_nudge(context, cid))
+        assert result == "no recent inactivity"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_idle_nudge_recent_activity(self):
+        cid = 9042
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=["Do a thing"], activity_days=[date.today().isoformat()]
+        )
+        context = _debug_context([])
+        result = run(bot._run_idle_nudge(context, cid))
+        assert result == "no recent inactivity"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_idle_nudge_fires_after_three_days(self):
+        cid = 9043
+        old_day = (date.today() - timedelta(days=5)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"], activity_days=[old_day])
+        context = _debug_context([])
+        result = run(bot._run_idle_nudge(context, cid))
+        assert result is None
+        context.bot.send_message.assert_awaited_once()
+
+    def test_debug_fire_weekly_digest_not_sunday_reason(self):
+        cid = 9050
+        bot.state["users"][str(cid)] = fresh_user()
+        context = _debug_context([])
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        monday = _dt(2023, 1, 2, 10, 0, tzinfo=_ZI("UTC"))
+        assert monday.weekday() != 6
+        with patch.object(bot, "datetime") as mock_dt:
+            mock_dt.now.return_value = monday
+            result = run(bot._run_weekly_digest(context, cid))
+        assert result == "not sunday"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_weekly_digest_sunday_touch_activity_false(self):
+        cid = 9051
+        bot.state["users"][str(cid)] = fresh_user()
+        context = _debug_context([])
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        sunday = _dt(2023, 1, 1, 10, 0, tzinfo=_ZI("UTC"))
+        assert sunday.weekday() == 6
+        with patch.object(bot, "datetime") as mock_dt, \
+             patch.object(bot, "chat", AsyncMock(return_value="Great week!")) as mock_chat:
+            mock_dt.now.return_value = sunday
+            result = run(bot._run_weekly_digest(context, cid))
+        assert result is None
+        mock_chat.assert_awaited_once()
+        _, kwargs = mock_chat.call_args
+        assert kwargs.get("touch_activity") is False
+        context.bot.send_message.assert_awaited_once()
+
+    def test_debug_fire_reminder_sends_text_and_registers_snooze(self):
+        cid = 9060
+        bot.state["users"][str(cid)] = fresh_user()
+        reminder = {"id": "r1", "time": "09:00", "message": "Take pills", "once": False}
+        context = _debug_context([])
+        result = run(bot._run_reminder(context, cid, reminder))
+        assert result is None
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "Take pills" in kwargs["text"]
+        assert kwargs["reply_markup"] is not None
+
+    def test_debug_fire_reminder_with_reason_line(self):
+        cid = 9061
+        bot.state["users"][str(cid)] = fresh_user()
+        reminder = {
+            "id": "r2", "time": "09:00", "message": "Take pills",
+            "reason": "doctor's orders", "once": False,
+        }
+        context = _debug_context([])
+        run(bot._run_reminder(context, cid, reminder))
+        _, kwargs = context.bot.send_message.call_args
+        assert "doctor's orders" in kwargs["text"]
+
+    def test_debug_fire_deadline_alert_nothing_due_reason(self):
+        """_run_deadline_alert also carries the shared suppression-reason
+        contract (Rule 2 deviation, see 01-03-SUMMARY.md): "nothing due" when
+        no task is close and no annual reminder matched today."""
+        cid = 9062
+        bot.state["users"][str(cid)] = fresh_user()
+        context = _debug_context([])
+        result = run(bot._run_deadline_alert(context, cid))
+        assert result == "nothing due"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_scheduled_checkin_matches_debug_path(self):
+        """schedule_user_checkins registers checkin_morning_{chat_id} and
+        checkin_evening_{chat_id} as run_daily jobs; awaiting either callback
+        produces the same effects as _run_checkin, because both call the same
+        extracted function."""
+        cid = 9070
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_checkins(app, cid)
+        assert f"checkin_morning_{cid}" in captured
+        assert f"checkin_evening_{cid}" in captured
+        job_context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")) as mock_chat:
+            run(captured[f"checkin_morning_{cid}"](job_context))
+        job_context.bot.send_message.assert_awaited_once()
+        mock_chat.assert_awaited_once()
+        _, kwargs = mock_chat.call_args
+        assert kwargs.get("touch_activity") is False
+        assert bot.get_user(cid)["pending_checkin"] == "morning"
+
+    def test_scheduled_reminder_matches_debug_path(self):
+        cid = 9071
+        bot.state["users"][str(cid)] = fresh_user()
+        reminder = {"id": "r3", "time": "09:00", "message": "Stretch", "once": False}
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_reminder(app, cid, reminder)
+        job_name = f"reminder_{cid}_{reminder['id']}"
+        assert job_name in captured
+        job_context = _debug_context([])
+        run(captured[job_name](job_context))
+        job_context.bot.send_message.assert_awaited_once()
+        _, kwargs = job_context.bot.send_message.call_args
+        assert "Stretch" in kwargs["text"]
+
+    def test_scheduled_habit_reminder_matches_debug_path(self):
+        cid = 9072
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True,
+            habits={"meditation": {"completions": [], "created": date.today().isoformat()}},
+        )
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_alerts(app, cid)
+        job_name = f"habit_reminder_{cid}"
+        assert job_name in captured
+        job_context = _debug_context([])
+        run(captured[job_name](job_context))
+        job_context.bot.send_message.assert_awaited_once()
+        _, kwargs = job_context.bot.send_message.call_args
+        assert "meditation" in kwargs["text"]
+
+    def test_scheduled_idle_nudge_matches_debug_path(self):
+        cid = 9073
+        old_day = (date.today() - timedelta(days=5)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True, tasks=["Do a thing"], activity_days=[old_day]
+        )
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_alerts(app, cid)
+        job_name = f"idle_nudge_{cid}"
+        assert job_name in captured
+        job_context = _debug_context([])
+        run(captured[job_name](job_context))
+        job_context.bot.send_message.assert_awaited_once()
+
+    def test_scheduled_weekly_digest_matches_debug_path(self):
+        cid = 9074
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_alerts(app, cid)
+        job_name = f"weekly_digest_{cid}"
+        assert job_name in captured
+        job_context = _debug_context([])
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        sunday = _dt(2023, 1, 1, 10, 0, tzinfo=_ZI("UTC"))
+        with patch.object(bot, "datetime") as mock_dt, \
+             patch.object(bot, "chat", AsyncMock(return_value="Great week!")) as mock_chat:
+            mock_dt.now.return_value = sunday
+            run(captured[job_name](job_context))
+        job_context.bot.send_message.assert_awaited_once()
+        mock_chat.assert_awaited_once()
+        _, kwargs = mock_chat.call_args
+        assert kwargs.get("touch_activity") is False
 
 
 class TestDebugOwnerGate:
