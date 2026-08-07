@@ -1567,19 +1567,26 @@ def _habit_summary_lines(habits: dict, user=None) -> list[str]:
 
 # ─────────────────────── quiet hours ───────────────────────
 
-def _is_muted(user: dict) -> bool:
-    """Return True if the user has an active /mute in effect."""
+def _is_muted(user: dict, *, simulate: bool = True) -> bool:
+    """Return True if the user has an active /mute in effect. `simulate`
+    controls whether an active /debug clock override is honored: True (the
+    default, used by /debug fire) evaluates against the simulated now;
+    False (used by the real schedule_user_* job wrappers) always evaluates
+    against the real wall clock, so a forgotten debug-clock override can
+    never suppress or wrongly fire a real scheduled job (CR-01)."""
     until = user.get("muted_until", "")
     if not until:
         return False
     try:
-        return _utcnow(user) < datetime.fromisoformat(until)
+        now = _utcnow(user) if simulate else datetime.utcnow()
+        return now < datetime.fromisoformat(until)
     except ValueError:
         return False
 
 
-def _is_quiet_now(user: dict) -> bool:
-    """Return True if current local time falls within the user's quiet window."""
+def _is_quiet_now(user: dict, *, simulate: bool = True) -> bool:
+    """Return True if current local time falls within the user's quiet
+    window. See `_is_muted`'s docstring for what `simulate` controls."""
     qh = user.get("quiet_hours", {})
     start_str = qh.get("start")
     end_str = qh.get("end")
@@ -1589,7 +1596,7 @@ def _is_quiet_now(user: dict) -> bool:
         tz = ZoneInfo(user.get("timezone", "UTC"))
     except (ZoneInfoNotFoundError, KeyError):
         tz = ZoneInfo("UTC")
-    now = _now(tz, user=user).time().replace(tzinfo=None)
+    now = (_now(tz, user=user) if simulate else datetime.now(tz)).time().replace(tzinfo=None)
     sh, sm = (int(x) for x in start_str.split(":"))
     eh, em = (int(x) for x in end_str.split(":"))
     start_t = dt_time(sh, sm)
@@ -1952,7 +1959,9 @@ def _parse_local_time(time_str: str, tz_str: str) -> dt_time:
     return dt_time(h, m, tzinfo=tz)
 
 
-async def _run_checkin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: str) -> str | None:
+async def _run_checkin(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: str, *, simulate: bool = True
+) -> str | None:
     """Send the morning or evening check-in message for chat_id, including the
     stale-tracker nudge and the unanswered-check-in acknowledgement. Shared by
     the per-user scheduled check-in job (via schedule_user_checkins's thin
@@ -1960,12 +1969,22 @@ async def _run_checkin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: 
     paths can never diverge. Passes touch_activity=False to chat() so a
     proactive check-in is never mistaken for the user having responded.
     Returns a short reason string when quiet hours or mute suppress the
-    check-in, None once it sent one."""
+    check-in, None once it sent one. `simulate` (default True, as used by
+    /debug fire) controls whether the guards *and* this runner's own
+    date/time reads (the stale-tracker check below) honor an active /debug
+    clock override; the real scheduled wrapper always passes simulate=False
+    so the real job is provably never affected by it (CR-01)."""
     user_now = get_user(chat_id)
-    if _is_quiet_now(user_now):
+    if _is_quiet_now(user_now, simulate=simulate):
         return "quiet hours"
-    if _is_muted(user_now):
+    if _is_muted(user_now, simulate=simulate):
         return "muted"
+    # Real-time-only user handle for this runner's own date reads below --
+    # None makes `_today`/`_now` ignore any active /debug clock override
+    # (see docstring, CR-01). `user_now` itself keeps flowing through the
+    # rest of the function unchanged since it's still needed for real data
+    # (trackers, pending_checkin, etc.), not just time.
+    time_user = user_now if simulate else None
     is_morning = (label == "morning")
     variety_instruction = (
         "Open with a natural greeting that's noticeably different from how you've opened "
@@ -1997,7 +2016,7 @@ async def _run_checkin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: 
                 if log:
                     last_ts = log[-1]["ts"][:10]
                     try:
-                        if (_today(user=user_now) - date.fromisoformat(last_ts)).days >= 2:
+                        if (_today(user=time_user) - date.fromisoformat(last_ts)).days >= 2:
                             stale.append(tname)
                     except ValueError:
                         pass
@@ -2049,21 +2068,24 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
         t = _parse_local_time(times.get(label, "08:00" if label == "morning" else "21:00"), tz_str)
 
         async def _checkin_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _label=label):
-            await _run_checkin(context, _cid, _label)
+            await _run_checkin(context, _cid, _label, simulate=False)
 
         app.job_queue.run_daily(_checkin_wrapper, time=t, name=job_name)
 
 
-async def _run_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, reminder: dict) -> str | None:
+async def _run_reminder(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, reminder: dict, *, simulate: bool = True
+) -> str | None:
     """Send a single reminder's text (with its optional reason) and register a
     snooze token. Shared by the per-reminder scheduled job (via
     schedule_user_reminder's thin wrapper) and `/debug fire reminder <n>` so
     the two paths can never diverge. Returns a short reason string when quiet
-    hours or mute suppress the reminder, None once it sent one."""
+    hours or mute suppress the reminder, None once it sent one. See
+    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
-    if _is_quiet_now(u):
+    if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
-    if _is_muted(u):
+    if _is_muted(u, simulate=simulate):
         return "muted"
     msg = reminder["message"]
     reason = reminder.get("reason")
@@ -2093,12 +2115,14 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
 
     async def _reminder_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _reminder=reminder):
-        await _run_reminder(context, _cid, _reminder)
+        await _run_reminder(context, _cid, _reminder, simulate=False)
 
     app.job_queue.run_daily(_reminder_wrapper, time=t, name=job_name)
 
 
-async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+async def _run_deadline_alert(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
+) -> str | None:
     """Send the 09:00 deadline alert (overdue/due-today/due-soon tasks) plus any
     annual reminders due today for chat_id. Shared by the 09:00 scheduled job
     (via schedule_user_alerts's thin wrapper) and `/debug fire deadline_alert`
@@ -2107,13 +2131,17 @@ async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     annual reminder matched today; None once it sent at least one message —
     the same suppression-reason contract as the other five runners
     (_run_checkin, _run_habit_reminder, _run_idle_nudge, _run_weekly_digest,
-    _run_reminder)."""
+    _run_reminder). See `_run_checkin`'s docstring for what `simulate`
+    controls (CR-01)."""
     u = get_user(chat_id)
-    if _is_quiet_now(u):
+    if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
-    if _is_muted(u):
+    if _is_muted(u, simulate=simulate):
         return "muted"
-    today = _today(user=u)
+    # Real-time-only when simulate=False (real scheduled job) so overdue/
+    # due-today badges are provably computed against the real date, not a
+    # forgotten /debug clock override -- see `_run_checkin`'s docstring.
+    today = _today(user=(u if simulate else None))
     alerts = []
     for task in u.get("tasks", []):
         due = _task_due(task)
@@ -2158,19 +2186,23 @@ async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     return None if sent else "nothing due"
 
 
-async def _run_habit_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+async def _run_habit_reminder(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
+) -> str | None:
     """Send the list of not-yet-done-today habits at 20:00. Shared by the
     scheduled job (via schedule_user_alerts's thin wrapper) and
     `/debug fire habit_reminder` so the two paths can never diverge. Returns
     a short reason string when quiet hours or mute suppress the reminder, or
-    when every habit is already done today; None once it sent one."""
+    when every habit is already done today; None once it sent one. See
+    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
-    if _is_quiet_now(u):
+    if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
-    if _is_muted(u):
+    if _is_muted(u, simulate=simulate):
         return "muted"
     habits = u.get("habits", {})
-    today_str = _today(user=u).isoformat()
+    # Real-time-only when simulate=False -- see `_run_deadline_alert`.
+    today_str = _today(user=(u if simulate else None)).isoformat()
     undone = [n for n, d in habits.items() if today_str not in d.get("completions", [])]
     if not undone:
         return "nothing undone"
@@ -2188,17 +2220,20 @@ async def _run_habit_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     return None
 
 
-async def _run_idle_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+async def _run_idle_nudge(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
+) -> str | None:
     """Send an idle nudge at 11:00 if chat_id has been inactive 3+ days.
     Shared by the scheduled job (via schedule_user_alerts's thin wrapper) and
     `/debug fire idle_nudge` so the two paths can never diverge. Returns a
     short reason string when quiet hours or mute suppress the nudge, when the
     user has no tasks and no habits, or when the last active day is under
-    three days old; None once it sent one."""
+    three days old; None once it sent one. See `_run_checkin`'s docstring for
+    what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
-    if _is_quiet_now(u):
+    if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
-    if _is_muted(u):
+    if _is_muted(u, simulate=simulate):
         return "muted"
     if not u.get("tasks") and not u.get("habits"):
         return "no tasks or habits"
@@ -2206,7 +2241,8 @@ async def _run_idle_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> s
     if not days:
         return "no recent inactivity"
     last_active = date.fromisoformat(days[-1])
-    if (_today(user=u) - last_active).days < 3:
+    # Real-time-only when simulate=False -- see `_run_deadline_alert`.
+    if (_today(user=(u if simulate else None)) - last_active).days < 3:
         return "no recent inactivity"
     try:
         await context.bot.send_message(
@@ -2222,21 +2258,25 @@ async def _run_idle_nudge(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> s
     return None
 
 
-async def _run_weekly_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
+async def _run_weekly_digest(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
+) -> str | None:
     """Send the weekly digest every Sunday at 10:00. Shared by the scheduled
     job (via schedule_user_alerts's thin wrapper) and
     `/debug fire weekly_digest` so the two paths can never diverge. Passes
     touch_activity=False to chat() for the same reason _run_checkin does.
     Returns a short reason string when quiet hours or mute suppress the
-    digest, or when today isn't Sunday; None once it sent one."""
+    digest, or when today isn't Sunday; None once it sent one. See
+    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
-    if _is_quiet_now(u):
+    if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
-    if _is_muted(u):
+    if _is_muted(u, simulate=simulate):
         return "muted"
-    # Use user's local date for the Sunday check
+    # Use user's local date for the Sunday check. Real-time-only when
+    # simulate=False -- see `_run_deadline_alert`.
     tz = ZoneInfo(u.get("timezone", "UTC"))
-    today = _now(tz, user=u).date()
+    today = _now(tz, user=(u if simulate else None)).date()
     if today.weekday() != 6:
         return "not sunday"
     try:
@@ -2296,7 +2336,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
 
     # ── deadline alert at 09:00 ──
     async def _deadline_alert_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        await _run_deadline_alert(context, _cid)
+        await _run_deadline_alert(context, _cid, simulate=False)
 
     app.job_queue.run_daily(
         _deadline_alert_wrapper,
@@ -2306,7 +2346,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
 
     # ── habit reminder at 20:00 ──
     async def _habit_reminder_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        await _run_habit_reminder(context, _cid)
+        await _run_habit_reminder(context, _cid, simulate=False)
 
     app.job_queue.run_daily(
         _habit_reminder_wrapper,
@@ -2316,7 +2356,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
 
     # ── idle nudge at 11:00 — fires only if user has been inactive 3+ days ──
     async def _idle_nudge_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        await _run_idle_nudge(context, _cid)
+        await _run_idle_nudge(context, _cid, simulate=False)
 
     app.job_queue.run_daily(
         _idle_nudge_wrapper,
@@ -2326,7 +2366,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
 
     # ── Weekly digest every Sunday at 10:00 ──
     async def _weekly_digest_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        await _run_weekly_digest(context, _cid)
+        await _run_weekly_digest(context, _cid, simulate=False)
 
     app.job_queue.run_daily(
         _weekly_digest_wrapper,

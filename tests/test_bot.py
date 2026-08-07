@@ -3478,3 +3478,83 @@ class TestReviewFixWR03:
         run(bot.today_cmd(write_update, write_context))
         assert bot.state["users"][str(cid)]["today_focus"]["date"] == date.today().isoformat()
 
+
+class TestReviewFixCR01:
+    """Regression tests for 01-REVIEW.md CR-01: the ambient /debug clock must
+    never leak into the REAL scheduled-job guard evaluation -- only /debug
+    fire's own simulated evaluation may honor an active override."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def _with_clock(self, cid, iso, hours_ahead=12):
+        """Round-trip a simulated clock through SQLite exactly as /debug
+        clock would, then read it back through get_user()."""
+        bot.db_set_pref(str(cid), "debug_clock", iso)
+        expires = (bot.datetime.utcnow() + bot.timedelta(hours=hours_ahead)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock_expires", expires)
+        return bot.get_user(cid)
+
+    def test_real_scheduled_deadline_alert_ignores_active_debug_clock(self):
+        """A /debug clock override placed inside real quiet hours must not
+        suppress the REAL scheduled deadline_alert job -- only /debug fire's
+        own simulated evaluation should honor it."""
+        cid = 9950
+        real_hour = bot.datetime.utcnow().hour
+        quiet_hour = (real_hour + 12) % 24  # 12h away from real now: never overlaps
+        start_str = f"{quiet_hour:02d}:00"
+        end_str = f"{(quiet_hour + 1) % 24:02d}:00"
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True,
+            timezone="UTC",
+            quiet_hours={"start": start_str, "end": end_str},
+            tasks=[{"text": "Ship it", "due": date.today().isoformat()}],
+        )
+        # Move the simulated clock inside the quiet window that real time
+        # never falls inside (by construction above).
+        self._with_clock(cid, f"2027-06-15T{quiet_hour:02d}:30:00")
+
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_alerts(app, cid)
+        job_context = _debug_context([])
+        result = run(captured[f"deadline_alert_{cid}"](job_context))
+        assert result is None  # real job fired -- provably not suppressed
+        job_context.bot.send_message.assert_awaited_once()
+
+        # /debug fire, by contrast, is expected to honor the simulated
+        # quiet-hours override and report the suppression by name.
+        debug_context = _debug_context([])
+        debug_result = run(bot._run_deadline_alert(debug_context, cid))
+        assert debug_result == "quiet hours"
+        debug_context.bot.send_message.assert_not_awaited()
+
+    def test_real_scheduled_checkin_ignores_active_debug_clock_mute(self):
+        """Same guarantee as above, exercised through _is_muted and the
+        checkin wrapper: a debug-clock override that lands inside a stored
+        mute window must not suppress the real scheduled check-in."""
+        cid = 9952
+        # muted_until is safely in the past relative to real "now" (so the
+        # real evaluation is never muted), but the simulated clock below is
+        # set to a moment before it (so the simulated evaluation is muted).
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True,
+            muted_until="2020-06-15T23:00:00",
+        )
+        self._with_clock(cid, "2020-06-15T12:00:00")
+
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")):
+            bot.schedule_user_checkins(app, cid)
+            job_context = _debug_context([])
+            result = run(captured[f"checkin_morning_{cid}"](job_context))
+        assert result is None  # real job fired -- provably not suppressed
+        job_context.bot.send_message.assert_awaited_once()
+
+        debug_context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Morning!")):
+            debug_result = run(bot._run_checkin(debug_context, cid, "morning"))
+        assert debug_result == "muted"
+        debug_context.bot.send_message.assert_not_awaited()
+
