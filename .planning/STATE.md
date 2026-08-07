@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 01
 current_phase_name: debug-and-dry-run
 status: executing
-stopped_at: Completed 01-04-PLAN.md
-last_updated: "2026-08-07T21:06:00.108Z"
+stopped_at: Completed 01-05-PLAN.md
+last_updated: "2026-08-07T21:26:03.833Z"
 last_activity: 2026-08-07
 last_activity_desc: Phase 01 execution started
 progress:
   total_phases: 1
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 5
-  completed_plans: 4
+  completed_plans: 5
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-01)
 ## Current Position
 
 Phase: 01 (debug-and-dry-run) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-08-07 — Phase 01 execution started
 
-Progress: [████████░░] 80%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [████████░░] 80%
 |------|----------|-------|-------|
 | Phase 01-debug-and-dry-run P02 | 10min | 2 tasks | 2 files |
 | Phase 01 P04 | 15min | 2 tasks | 2 files |
+| Phase 01 P05 | 20min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 01-02: /debug prompt delivers build_system_prompt verbatim via reply_text (<=4000 chars) or in-memory BytesIO reply_document (>4000 chars), never touching disk or the LLM.
 - [Phase ?]: Debug clock storage lives in SQLite user_prefs, overlaid onto the user dict by get_user() exactly as timezone is, so it survives a state.json overwrite/restore and is excluded from /export by construction (01-04)
 - [Phase ?]: Debug clock expiry is judged against the real datetime.utcnow(), never the override itself, so a simulated clock can never extend its own life; bounded to 12 hours (01-04)
+- [Phase ?]: TestDebugClockAmbient test methods prefixed test_debug_clock_ambient_* (not just class-named) so the plan's -k debug_clock_ambient selector actually collects them
+- [Phase ?]: Read/write clock boundary (D-P7) enforced: compare-and-display sites route through the override, durable-write sites stay on the real wall clock, verified by a dedicated durable-record guard
 
 ### Pending Todos
 
@@ -108,6 +111,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-08-07T21:06:00.080Z
-Stopped at: Completed 01-04-PLAN.md
+Last session: 2026-08-07T21:26:03.810Z
+Stopped at: Completed 01-05-PLAN.md
 Resume file: None
