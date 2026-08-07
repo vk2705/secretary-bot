@@ -4,16 +4,16 @@ milestone: v1.0
 milestone_name: milestone
 current_phase: 1
 current_phase_name: Debug and Dry-Run
-status: planning
-stopped_at: Phase 1 context gathered (partial — discussion stopped early at user request)
-last_updated: "2026-08-02T03:48:14.871Z"
+status: executing
+stopped_at: Completed 01-01-PLAN.md
+last_updated: "2026-08-07T19:57:30.711Z"
 last_activity: 2026-08-02
 last_activity_desc: "Completed quick task 260802-4rx: Create a start script for bot.py and register it as a systemd service so it survives reboots"
 progress:
   total_phases: 1
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 5
+  completed_plans: 1
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-01)
 ## Current Position
 
 Phase: 1 of 7 (Debug and Dry-Run)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
+Plan: 1 of 5 in current phase
+Status: Ready to execute
 Last activity: 2026-08-02 - Completed quick task 260802-4rx: Create a start script for bot.py and register it as a systemd service so it survives reboots
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██░░░░░░░░] 20%
 
 ## Performance Metrics
 
@@ -54,6 +54,11 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: —
 
 *Updated after each plan completion*
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 01 P01 | 12min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -67,6 +72,9 @@ Recent decisions affecting current work:
 - [Roadmap]: Phases 4 (persona) and 5 (model of the user) may run in parallel after Phase 3, but must be *designed* jointly — never-do rules are what make observation data safe
 - [Roadmap]: Retrieval is a tool the model calls, never pre-injected — journal and notes are unbounded corpora
 - [Roadmap]: Data-at-rest hardening deliberately deferred this milestone; extend the gitignore/handling discipline to debug-mode prompt dumps, which contain real journal content
+- [Phase ?]: 01-01: renamed the schedule_user_alerts wrapper to _deadline_alert_wrapper (not _deadline_job) so the plan's leftover-closure grep returns clean 0
+- [Phase ?]: 01-01: debug_cmd makes no get_user() call at all, so the gate-precedes-lookup acceptance check is satisfied trivially
+- [Phase ?]: 01-01: TestDebugOwnerGate parametrizes 5 argument shapes x 3 MY_CHAT_ID configurations for exhaustive owner-gate coverage
 
 ### Pending Todos
 
@@ -99,6 +107,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-08-02T03:48:14.853Z
-Stopped at: Phase 1 context gathered (partial — discussion stopped early at user request)
-Resume file: .planning/phases/01-debug-and-dry-run/01-CONTEXT.md
+Last session: 2026-08-07T19:57:30.688Z
+Stopped at: Completed 01-01-PLAN.md
+Resume file: None

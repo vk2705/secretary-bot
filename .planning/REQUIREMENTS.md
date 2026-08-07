@@ -9,7 +9,7 @@ Requirements for Milestone A ("the bot that knows you"). Each maps to roadmap ph
 
 ### Debug & Observability
 
-- [ ] **DEBUG-01**: User can trigger any scheduled job on demand, without waiting for its scheduled time
+- [x] **DEBUG-01**: User can trigger any scheduled job on demand, without waiting for its scheduled time
 - [ ] **DEBUG-02**: User can simulate a different "now" to test time-dependent behavior (deadlines, quiet hours, annual reminders)
 - [ ] **DEBUG-03**: User can inspect the exact assembled system prompt for a given context, without sending a real message
 
@@ -99,7 +99,7 @@ Populated during roadmap creation (2026-08-01).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DEBUG-01 | Phase 1 | Pending |
+| DEBUG-01 | Phase 1 | Complete |
 | DEBUG-02 | Phase 1 | Pending |
 | DEBUG-03 | Phase 1 | Pending |
 | RETR-01 | Phase 2 | Pending |
@@ -134,6 +134,7 @@ Populated during roadmap creation (2026-08-01).
 | CONV-05 | Phase 3 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 33 total
 - Mapped to phases: 33 ✓
 - Unmapped: 0
