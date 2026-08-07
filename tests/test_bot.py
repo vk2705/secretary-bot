@@ -2724,3 +2724,174 @@ class TestDebugPrompt:
             run(bot.debug_cmd(update2, context2))
         assert _delivered_text(update1) == _delivered_text(update2)
 
+
+def _reset_context():
+    """MagicMock context for reset_cmd: job_queue.jobs()/get_jobs_by_name()
+    both return an empty list so the cancel-then-reschedule loops in
+    reset_cmd and schedule_user_checkins/_alerts iterate cleanly."""
+    context = MagicMock()
+    context.application.job_queue.jobs.return_value = []
+    context.application.job_queue.get_jobs_by_name.return_value = []
+    return context
+
+
+class TestDebugClock:
+    """`/debug clock <ISO> | reset | (status)` -- DEBUG-02. Covers T-1-01
+    (owner gate), T-1-03 (bounded expiry, echoed at set time), T-1-12
+    (malformed input never raises and stores nothing), T-1-14 (excluded
+    from export), and T-1-15 (cleared by /reset)."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def test_debug_clock_set_echoes_instant_and_expiry(self):
+        cid = 9800
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "2027-03-05T09:30"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "2027-03-05T09:30" in text
+        assert "Expires" in text
+        user = bot.get_user(cid)
+        assert user["debug_clock"] == "2027-03-05T09:30"
+
+    def test_debug_clock_set_takes_effect_immediately_same_process(self):
+        cid = 9801
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "2027-03-05T09:30"])
+            run(bot.debug_cmd(update, context))
+        user = bot.get_user(cid)
+        assert bot._today(user=user) == date(2027, 3, 5)
+
+    def test_debug_clock_date_only_stored_as_midnight_local(self):
+        cid = 9802
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "2027-03-05"])
+            run(bot.debug_cmd(update, context))
+        user = bot.get_user(cid)
+        dt = bot._debug_now(user)
+        assert (dt.hour, dt.minute) == (0, 0)
+        assert bot._today(user=user) == date(2027, 3, 5)
+
+    def test_debug_clock_status_reports_active_override(self):
+        cid = 9803
+        with as_owner(cid):
+            run(bot.debug_cmd(_debug_update(cid), _debug_context(["clock", "2027-03-05T09:30"])))
+            status_update = _debug_update(cid)
+            run(bot.debug_cmd(status_update, _debug_context(["clock"])))
+        text = status_update.message.reply_text.call_args[0][0]
+        assert "2027-03-05T09:30" in text
+        assert "Expires" in text
+
+    def test_debug_clock_status_reports_none_active(self):
+        cid = 9804
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock"])
+            run(bot.debug_cmd(update, context))
+        text = update.message.reply_text.call_args[0][0]
+        assert "No simulated clock" in text
+
+    def test_debug_clock_reset_clears_prefs_and_confirms(self):
+        cid = 9805
+        with as_owner(cid):
+            run(bot.debug_cmd(_debug_update(cid), _debug_context(["clock", "2027-03-05T09:30"])))
+            reset_update = _debug_update(cid)
+            run(bot.debug_cmd(reset_update, _debug_context(["clock", "reset"])))
+        reset_update.message.reply_text.assert_awaited_once()
+        assert bot.db_get_pref(str(cid), "debug_clock") is None
+        assert bot.db_get_pref(str(cid), "debug_clock_expires") is None
+        user = bot.get_user(cid)
+        assert bot._today(user=user) == date.today()
+
+    def test_debug_clock_reset_when_nothing_set_is_harmless(self):
+        cid = 9806
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "reset"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+
+    @pytest.mark.parametrize("bad_input", ["notadate", "2027-13-45", ""])
+    def test_debug_clock_malformed_input_stores_nothing(self, bad_input):
+        cid = 9807
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", bad_input])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "Usage" in text
+        assert bot.db_get_pref(str(cid), "debug_clock") is None
+        assert bot.db_get_pref(str(cid), "debug_clock_expires") is None
+
+    def test_debug_clock_expiry_is_twelve_hours_ahead(self):
+        cid = 9808
+        before = bot.datetime.utcnow()
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "2027-03-05T09:30"])
+            run(bot.debug_cmd(update, context))
+        after = bot.datetime.utcnow()
+        expires = bot.datetime.fromisoformat(bot.db_get_pref(str(cid), "debug_clock_expires"))
+        assert before + bot.timedelta(hours=11) <= expires <= after + bot.timedelta(hours=13)
+
+    def test_debug_clock_survives_simulated_restart(self):
+        """Simulate a bot restart by wiping the in-memory state dict; the
+        override must still be readable through get_user()'s SQLite overlay."""
+        cid = 9809
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "2027-03-05T09:30"])
+            run(bot.debug_cmd(update, context))
+        bot.state["users"] = {}
+        user = bot.get_user(cid)
+        assert user["debug_clock"] == "2027-03-05T09:30"
+        assert bot._today(user=user) == date(2027, 3, 5)
+
+    def test_debug_clock_reset_via_account_wipe_clears_prefs(self):
+        """/reset (the account wipe, not /debug clock reset) also clears both
+        debug clock prefs -- a wipe must never leave a live simulated clock
+        behind (T-1-15)."""
+        cid = 9810
+        with as_owner(cid):
+            run(bot.debug_cmd(_debug_update(cid), _debug_context(["clock", "2027-03-05T09:30"])))
+        assert bot.db_get_pref(str(cid), "debug_clock") == "2027-03-05T09:30"
+
+        reset_update = _debug_update(cid)
+        run(bot.reset_cmd(reset_update, _reset_context()))
+
+        assert bot.db_get_pref(str(cid), "debug_clock") is None
+        assert bot.db_get_pref(str(cid), "debug_clock_expires") is None
+        user = bot.get_user(cid)
+        assert user["debug_clock"] == ""
+
+    def test_debug_clock_excluded_from_export(self):
+        cid = 9811
+        with as_owner(cid):
+            run(bot.debug_cmd(_debug_update(cid), _debug_context(["clock", "2027-03-05T09:30"])))
+        export_update = _debug_update(cid)
+        export_context = MagicMock()
+        run(bot.export_data(export_update, export_context))
+        export_update.message.reply_document.assert_awaited_once()
+        _, kwargs = export_update.message.reply_document.call_args
+        doc = kwargs["document"]
+        doc.seek(0)
+        payload = json.loads(doc.read().decode("utf-8"))
+        assert "debug_clock" not in payload
+        assert "debug_clock_expires" not in payload
+
+    def test_debug_clock_non_owner_rejected_before_parse_or_store(self):
+        cid = 9812
+        with as_owner(999999):
+            update = _debug_update(cid)
+            context = _debug_context(["clock", "2027-03-05T09:30"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        assert bot.db_get_pref(str(cid), "debug_clock") is None
+        assert str(cid) not in bot.state["users"]
+

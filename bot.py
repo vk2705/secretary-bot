@@ -2758,7 +2758,13 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "activity_days": [],
         "archived_tasks": [],
         "quiet_hours": {"start": None, "end": None},
+        "debug_clock": "",
+        "debug_clock_expires": "",
     })
+    # A simulated clock is emphatically not something a wipe should keep
+    # (T-1-15) -- unlike timezone, which is deliberately preserved above.
+    db_delete_pref(str(chat_id), "debug_clock")
+    db_delete_pref(str(chat_id), "debug_clock_expires")
     # Cancel all scheduled jobs
     schedule_user_checkins(context.application, chat_id)
     schedule_user_alerts(context.application, chat_id)
@@ -3878,6 +3884,67 @@ async def _debug_fire(update: Update, context: ContextTypes.DEFAULT_TYPE, args: 
         )
 
 
+async def _debug_clock(update: Update, context: ContextTypes.DEFAULT_TYPE, args: list) -> None:
+    """`/debug clock <ISO> | reset | (status)` — set, inspect or clear a
+    persistent, bounded, per-account simulated "now" (DEBUG-02, D-01). Dual-
+    writes exactly as the set_timezone tool does: the in-memory user-dict key
+    so the current process sees it immediately, and the SQLite pref so it
+    survives a restart. The expiry is real-wall-clock bound to twelve hours
+    ahead of `datetime.utcnow()` so a forgotten override cannot silently skew
+    this account's real deadline badges and quiet hours forever (T-1-03) —
+    resolution against that expiry happens in `_debug_now`."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+
+    if not args:
+        override = user.get("debug_clock")
+        if not override:
+            await update.message.reply_text(
+                "No simulated clock is set. Real time is in effect."
+            )
+            return
+        expires = user.get("debug_clock_expires", "")
+        await update.message.reply_text(
+            f"🕐 Simulated clock: {override}\n"
+            f"Expires (UTC): {expires}\n"
+            "Real scheduled jobs keep firing on the real wall clock while this is active."
+        )
+        return
+
+    if args[0].lower() == "reset":
+        db_delete_pref(str(chat_id), "debug_clock")
+        db_delete_pref(str(chat_id), "debug_clock_expires")
+        user["debug_clock"] = ""
+        user["debug_clock_expires"] = ""
+        save_state(state)
+        await update.message.reply_text("🕐 Simulated clock cleared. Real time is in effect.")
+        return
+
+    raw = args[0].strip()
+    try:
+        datetime.fromisoformat(raw)  # validate (V5); matches duedate_cmd's convention
+    except ValueError:
+        await update.message.reply_text(
+            "Usage: /debug clock <ISO instant>\n"
+            "Accepted forms: YYYY-MM-DD or YYYY-MM-DDTHH:MM\n"
+            "Or: /debug clock reset"
+        )
+        return
+
+    expires_iso = (datetime.utcnow() + timedelta(hours=12)).isoformat()
+    user["debug_clock"] = raw
+    user["debug_clock_expires"] = expires_iso
+    db_set_pref(str(chat_id), "debug_clock", raw)
+    db_set_pref(str(chat_id), "debug_clock_expires", expires_iso)
+    save_state(state)
+    await update.message.reply_text(
+        f"🕐 Simulated clock set to {raw}.\n"
+        f"Expires (UTC): {expires_iso} — after this it auto-resets to real time.\n"
+        "Real scheduled jobs keep firing on the real wall clock while this is active. "
+        "Use /debug clock reset to clear it early."
+    )
+
+
 async def _debug_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/debug prompt` — dump build_system_prompt(user, chat_id) verbatim to the
     owner. This is a read, not a chat turn: no LLM client is constructed, no
@@ -3925,7 +3992,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if sub == "fire":
         await _debug_fire(update, context, args[1:])
     elif sub == "clock":
-        await update.message.reply_text("/debug clock: not implemented yet.")
+        await _debug_clock(update, context, args[1:])
     elif sub == "prompt":
         await _debug_prompt(update, context)
     else:
