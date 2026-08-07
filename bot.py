@@ -3902,12 +3902,15 @@ async def _debug_clock(update: Update, context: ContextTypes.DEFAULT_TYPE, args:
     user = get_user(chat_id)
 
     if not args:
-        override = user.get("debug_clock")
-        if not override:
+        # Resolve through _debug_now (not a raw field read) so an expired
+        # override is reported as absent, matching every other code path
+        # that honors the clock (WR-02).
+        if _debug_now(user) is None:
             await update.message.reply_text(
                 "No simulated clock is set. Real time is in effect."
             )
             return
+        override = user.get("debug_clock")
         expires = user.get("debug_clock_expires", "")
         await update.message.reply_text(
             f"🕐 Simulated clock: {override}\n"

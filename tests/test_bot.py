@@ -2787,6 +2787,20 @@ class TestDebugClock:
         assert "2027-03-05T09:30" in text
         assert "Expires" in text
 
+    def test_debug_clock_status_reports_expired_override_as_absent(self):
+        """WR-02: an expired override must not be reported as active -- the
+        no-args branch resolves through _debug_now, not a raw field read."""
+        cid = 9808
+        expired = (bot.datetime.utcnow() - bot.timedelta(hours=1)).isoformat()
+        bot.db_set_pref(str(cid), "debug_clock", "2020-01-01T00:00")
+        bot.db_set_pref(str(cid), "debug_clock_expires", expired)
+        with as_owner(cid):
+            update = _debug_update(cid)
+            run(bot.debug_cmd(update, _debug_context(["clock"])))
+        text = update.message.reply_text.call_args[0][0]
+        assert "No simulated clock" in text
+        assert "2020-01-01T00:00" not in text
+
     def test_debug_clock_status_reports_none_active(self):
         cid = 9804
         with as_owner(cid):
