@@ -1475,3 +1475,166 @@ class TestNaturalLanguageNewTools:
             f"Expected get_streak, got: {tools_called}\nReply: {reply}"
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10: Debug command — owner-gated /debug fire|clock|prompt (Phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _debug_update(chat_id):
+    """MagicMock Update: effective_chat.id is chat_id; message.reply_text and
+    message.reply_document are AsyncMocks. Shared by every /debug test across
+    plans 01-01 through 01-05."""
+    update = MagicMock()
+    update.effective_chat.id = chat_id
+    update.message.reply_text = AsyncMock()
+    update.message.reply_document = AsyncMock()
+    return update
+
+
+def _debug_context(args):
+    """MagicMock context: .args is the given list; bot.send_message is an
+    AsyncMock. Shared by every /debug test across plans 01-01 through 01-05."""
+    context = MagicMock()
+    context.args = list(args)
+    context.bot.send_message = AsyncMock()
+    return context
+
+
+class as_owner:
+    """Context manager: sets bot.MY_CHAT_ID to str(chat_id) for the duration of
+    the `with` block and restores the previous value on exit."""
+
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self._prev = None
+
+    def __enter__(self):
+        self._prev = bot.MY_CHAT_ID
+        bot.MY_CHAT_ID = str(self.chat_id)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        bot.MY_CHAT_ID = self._prev
+        return False
+
+
+class TestDebugFire:
+    """Tracer slice: /debug fire deadline_alert produces the identical message
+    and side effects as the 09:00 scheduled job, through the shared
+    _run_deadline_alert extraction (D-P1, D-P2, D-P4)."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def test_debug_fire_deadline_alert_due_today(self):
+        cid = 9001
+        bot.state["users"][str(cid)] = fresh_user()
+        bot.state["users"][str(cid)]["tasks"] = [
+            {"text": "Ship the report", "due": date.today().isoformat()}
+        ]
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "deadline_alert"])
+            run(bot.debug_cmd(update, context))
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "Due TODAY" in kwargs["text"]
+        assert "Ship the report" in kwargs["text"]
+        update.message.reply_text.assert_awaited_once()
+
+    def test_debug_fire_deadline_alert_annual_reminder(self):
+        cid = 9002
+        bot.state["users"][str(cid)] = fresh_user()
+        today_mmdd = date.today().strftime("%m-%d")
+        bot.state["users"][str(cid)]["reminders"] = [
+            {
+                "id": "r1", "time": "09:00", "message": "Anniversary",
+                "once": False, "annual": True, "date": today_mmdd,
+            }
+        ]
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "deadline_alert"])
+            run(bot.debug_cmd(update, context))
+        context.bot.send_message.assert_awaited_once()
+        _, kwargs = context.bot.send_message.call_args
+        assert "Anniversary" in kwargs["text"]
+
+    def test_debug_owner_gate_non_owner_rejected(self):
+        """Non-owner chat_id gets 'Admin only.' and no send_message."""
+        cid = 9003
+        bot.state["users"][str(cid)] = fresh_user()
+        with as_owner(999999):  # someone else is configured as owner
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "deadline_alert"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_owner_gate_unset_my_chat_id_rejects_developer_too(self):
+        """MY_CHAT_ID unset fails closed — rejects even the developer's own id."""
+        cid = 9004
+        bot.state["users"][str(cid)] = fresh_user()
+        prev = bot.MY_CHAT_ID
+        bot.MY_CHAT_ID = None
+        try:
+            update = _debug_update(cid)
+            context = _debug_context(["fire", "deadline_alert"])
+            run(bot.debug_cmd(update, context))
+        finally:
+            bot.MY_CHAT_ID = prev
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_no_args_shows_usage(self):
+        cid = 9005
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context([])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "fire" in text and "clock" in text and "prompt" in text
+
+    def test_debug_unknown_subcommand(self):
+        cid = 9006
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["wibble"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "Unknown subcommand" in text
+        context.bot.send_message.assert_not_awaited()
+
+    def test_scheduled_deadline_alert_matches_debug_path(self):
+        """schedule_user_alerts registers deadline_alert_{chat_id} as a
+        run_daily job; awaiting that job's callback produces the same
+        send_message call the /debug path produces, because both call the
+        same extracted _run_deadline_alert."""
+        cid = 9007
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        bot.state["users"][str(cid)]["tasks"] = [
+            {"text": "Renew passport", "due": date.today().isoformat()}
+        ]
+
+        captured = {}
+        app = MagicMock()
+
+        def _run_daily(callback, time=None, name=None):
+            if name == f"deadline_alert_{cid}":
+                captured["callback"] = callback
+            return MagicMock()
+
+        app.job_queue.run_daily.side_effect = _run_daily
+        app.job_queue.get_jobs_by_name.return_value = []
+
+        bot.schedule_user_alerts(app, cid)
+        assert "callback" in captured, "deadline_alert job was not registered"
+
+        job_context = _debug_context([])
+        run(captured["callback"](job_context))
+        job_context.bot.send_message.assert_awaited_once()
+        _, kwargs = job_context.bot.send_message.call_args
+        assert "Renew passport" in kwargs["text"]
+

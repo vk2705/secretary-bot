@@ -1975,6 +1975,54 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
     app.job_queue.run_daily(_job, time=t, name=job_name)
 
 
+async def _run_deadline_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Send the 09:00 deadline alert (overdue/due-today/due-soon tasks) plus any
+    annual reminders due today for chat_id. Shared by the 09:00 scheduled job
+    (via schedule_user_alerts's thin wrapper) and `/debug fire deadline_alert`
+    so the two paths can never diverge."""
+    u = get_user(chat_id)
+    if _is_quiet_now(u) or _is_muted(u):
+        return
+    today = date.today()
+    alerts = []
+    for task in u.get("tasks", []):
+        due = _task_due(task)
+        if not due:
+            continue
+        try:
+            due_date = date.fromisoformat(due)
+            days_left = (due_date - today).days
+            text = _task_text(task)
+            if days_left < 0:
+                alerts.append(f"⚠️ Overdue {-days_left}d: {text}")
+            elif days_left == 0:
+                alerts.append(f"🔴 Due TODAY: {text}")
+            elif days_left <= 3:
+                alerts.append(f"🟡 Due in {days_left}d: {text}")
+        except ValueError:
+            pass
+    if alerts:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📅 Deadline alert:\n" + "\n".join(alerts)
+            )
+        except Exception as e:
+            logger.error("Deadline alert failed for %s: %s", chat_id, e)
+
+    # Fire annual reminders whose MM-DD matches today
+    today_mmdd = today.strftime("%m-%d")
+    for r in u.get("reminders", []):
+        if r.get("annual") and r.get("date") == today_mmdd:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📅 Annual reminder: {r['message']}"
+                )
+            except Exception as e:
+                logger.error("Annual reminder failed for %s: %s", chat_id, e)
+
+
 def schedule_user_alerts(app: Application, chat_id: int) -> None:
     """Schedule daily deadline alert (09:00) and habit reminder (20:00) jobs."""
     user = get_user(chat_id)
@@ -1992,51 +2040,11 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
         return
 
     # ── deadline alert at 09:00 ──
-    async def _deadline_job(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
-        u = get_user(_cid)
-        if _is_quiet_now(u) or _is_muted(u):
-            return
-        today = date.today()
-        alerts = []
-        for task in u.get("tasks", []):
-            due = _task_due(task)
-            if not due:
-                continue
-            try:
-                due_date = date.fromisoformat(due)
-                days_left = (due_date - today).days
-                text = _task_text(task)
-                if days_left < 0:
-                    alerts.append(f"⚠️ Overdue {-days_left}d: {text}")
-                elif days_left == 0:
-                    alerts.append(f"🔴 Due TODAY: {text}")
-                elif days_left <= 3:
-                    alerts.append(f"🟡 Due in {days_left}d: {text}")
-            except ValueError:
-                pass
-        if alerts:
-            try:
-                await context.bot.send_message(
-                    chat_id=_cid,
-                    text="📅 Deadline alert:\n" + "\n".join(alerts)
-                )
-            except Exception as e:
-                logger.error("Deadline alert failed for %s: %s", _cid, e)
-
-        # Fire annual reminders whose MM-DD matches today
-        today_mmdd = today.strftime("%m-%d")
-        for r in u.get("reminders", []):
-            if r.get("annual") and r.get("date") == today_mmdd:
-                try:
-                    await context.bot.send_message(
-                        chat_id=_cid,
-                        text=f"📅 Annual reminder: {r['message']}"
-                    )
-                except Exception as e:
-                    logger.error("Annual reminder failed for %s: %s", _cid, e)
+    async def _deadline_alert_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        await _run_deadline_alert(context, _cid)
 
     app.job_queue.run_daily(
-        _deadline_job,
+        _deadline_alert_wrapper,
         time=_parse_local_time("09:00", tz_str),
         name=f"deadline_alert_{chat_id}",
     )
@@ -3620,6 +3628,60 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─────────────────────── handlers: debug (owner-only) ───────────────────────
+
+# Deliberately not in _post_init's BotFather command list and not in
+# _HELP_TEXT — this surface must stay undiscoverable to non-owners (T-1-01).
+
+async def _debug_fire(update: Update, context: ContextTypes.DEFAULT_TYPE, args: list) -> None:
+    """`/debug fire <job_name>` — invoke a scheduled job's real body on demand,
+    through the same extracted function the scheduler calls, with the real
+    context and chat_id so side effects are identical."""
+    if not args:
+        await update.message.reply_text(
+            "Usage: /debug fire <job_name>\nKnown jobs: deadline_alert"
+        )
+        return
+    job_name = args[0].lower()
+    chat_id = update.effective_chat.id
+    if job_name == "deadline_alert":
+        await _run_deadline_alert(context, chat_id)
+        await update.message.reply_text("✅ Fired deadline_alert.")
+    else:
+        await update.message.reply_text(
+            f"Unknown job '{job_name}'. Known jobs: deadline_alert"
+        )
+
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/debug fire|clock|prompt — owner-only debug surface (DEBUG-01/02/03).
+    Fails closed: rejects every caller, including the developer, when
+    MY_CHAT_ID is unset or empty (broadcast_cmd's owner-gate spelling)."""
+    chat_id = update.effective_chat.id
+    if not MY_CHAT_ID or str(chat_id) != MY_CHAT_ID:
+        await update.message.reply_text("Admin only.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /debug <fire|clock|prompt> [args]"
+        )
+        return
+
+    sub = args[0].lower()
+    if sub == "fire":
+        await _debug_fire(update, context, args[1:])
+    elif sub == "clock":
+        await update.message.reply_text("/debug clock: not implemented yet.")
+    elif sub == "prompt":
+        await update.message.reply_text("/debug prompt: not implemented yet.")
+    else:
+        await update.message.reply_text(
+            "Unknown subcommand. Use fire, clock, or prompt."
+        )
+
+
 # ─────────────────────── handlers: habits ───────────────────────
 
 async def habit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4208,6 +4270,7 @@ def main():
     app.add_handler(CommandHandler("export", export_data))
     app.add_handler(CommandHandler("streak", streak_cmd))
     app.add_handler(CommandHandler("adminstats", admin_stats))
+    app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("habit", habit_cmd))
     app.add_handler(CommandHandler("mystats", my_stats))
     app.add_handler(CommandHandler("pomodoro", pomodoro_cmd))
