@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 01
 current_phase_name: debug-and-dry-run
 status: executing
-stopped_at: Completed 01-02-PLAN.md
-last_updated: "2026-08-07T20:55:56.211Z"
+stopped_at: Completed 01-04-PLAN.md
+last_updated: "2026-08-07T21:06:00.108Z"
 last_activity: 2026-08-07
 last_activity_desc: Phase 01 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 5
-  completed_plans: 3
+  completed_plans: 4
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-01)
 ## Current Position
 
 Phase: 01 (debug-and-dry-run) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Last activity: 2026-08-07 — Phase 01 execution started
 
-Progress: [████░░░░░░] 40%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
@@ -59,6 +59,7 @@ Progress: [████░░░░░░] 40%
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 01-debug-and-dry-run P02 | 10min | 2 tasks | 2 files |
+| Phase 01 P04 | 15min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,8 @@ Recent decisions affecting current work:
 - [Roadmap]: Retrieval is a tool the model calls, never pre-injected — journal and notes are unbounded corpora
 - [Roadmap]: Data-at-rest hardening deliberately deferred this milestone; extend the gitignore/handling discipline to debug-mode prompt dumps, which contain real journal content
 - [Phase ?]: 01-02: /debug prompt delivers build_system_prompt verbatim via reply_text (<=4000 chars) or in-memory BytesIO reply_document (>4000 chars), never touching disk or the LLM.
+- [Phase ?]: Debug clock storage lives in SQLite user_prefs, overlaid onto the user dict by get_user() exactly as timezone is, so it survives a state.json overwrite/restore and is excluded from /export by construction (01-04)
+- [Phase ?]: Debug clock expiry is judged against the real datetime.utcnow(), never the override itself, so a simulated clock can never extend its own life; bounded to 12 hours (01-04)
 
 ### Pending Todos
 
@@ -105,6 +108,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-08-07T20:07:18.663Z
-Stopped at: Completed 01-02-PLAN.md
+Last session: 2026-08-07T21:06:00.080Z
+Stopped at: Completed 01-04-PLAN.md
 Resume file: None
