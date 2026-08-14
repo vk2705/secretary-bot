@@ -1,5 +1,3 @@
-<!-- GSD:project-start source:PROJECT.md -->
-
 ## Project
 
 **Secretary Bot**
@@ -18,10 +16,6 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - **Scale**: one user today. Do not engineer for more.
 - **Working style**: ideas are discussed and agreed before any code is written.
 - **Privacy**: the bot holds a personal journal and a behavioural model of a real person. Live secrets and user data (`env`, `mcp_remote.env`, `state.json`, `bot_memory.db`) are gitignored and must never enter planning artifacts. Data-at-rest hardening (encryption of journal/observations, stronger key handling) is explicitly deferred — accepted as proportionate to a single-user personal server for this milestone, to be revisited if the user base grows.
-
-<!-- GSD:project-end -->
-
-<!-- GSD:stack-start source:codebase/STACK.md -->
 
 ## Technology Stack
 
@@ -96,9 +90,6 @@ Today it serves one user (the author). It may serve more later, but it is not be
 | Telegram | `api.telegram.org` | Bot polling/updates, sending messages | `TELEGRAM_TOKEN` |
 | OpenAI | `https://api.openai.com/v1` | LLM requests, function calling | `OPENAI_API_KEY` (sk-...) |
 | Groq | `https://api.groq.com/openai/v1` | LLM requests, free tier | `GROQ_API_KEY` (gsk_...) |
-<!-- GSD:stack-end -->
-
-<!-- GSD:conventions-start source:CONVENTIONS.md -->
 
 ## Conventions
 
@@ -179,10 +170,6 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - Single-file architecture uses functions and dicts, not classes
 - User state: dict with known schema (defined in `_new_user()`)
 - No ORM or data models; direct SQLite and JSON manipulation
-
-<!-- GSD:conventions-end -->
-
-<!-- GSD:architecture-start source:ARCHITECTURE.md -->
 
 ## Architecture
 
@@ -335,34 +322,6 @@ Today it serves one user (the author). It may serve more later, but it is not be
 
 ## Cross-Cutting Concerns
 
-<!-- GSD:architecture-end -->
-
-<!-- GSD:skills-start source:skills/ -->
-
 ## Project Skills
 
 No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
-<!-- GSD:skills-end -->
-
-<!-- GSD:workflow-start source:GSD defaults -->
-
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-<!-- GSD:profile-start -->
-
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->
