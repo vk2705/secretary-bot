@@ -3653,6 +3653,28 @@ async def _debug_fire(update: Update, context: ContextTypes.DEFAULT_TYPE, args: 
         )
 
 
+async def _debug_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/debug prompt` — dump the exact system prompt the owner's next message
+    would be answered with. No LLM call, no conversation turn, no disk write,
+    no logging (T-1-02): the payload carries real journal/notes/profile
+    content and must never land anywhere but the owner's own chat."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    prompt = build_system_prompt(user, chat_id)
+
+    if len(prompt) <= 4000:
+        await update.message.reply_text(prompt)
+    else:
+        data_bytes = prompt.encode("utf-8")
+        bio = BytesIO(data_bytes)
+        bio.name = "system_prompt.txt"
+        await update.message.reply_document(
+            document=bio,
+            filename="system_prompt.txt",
+            caption=f"System prompt ({len(prompt)} chars).",
+        )
+
+
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/debug fire|clock|prompt — owner-only debug surface (DEBUG-01/02/03).
     Fails closed: rejects every caller, including the developer, when
@@ -3675,7 +3697,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif sub == "clock":
         await update.message.reply_text("/debug clock: not implemented yet.")
     elif sub == "prompt":
-        await update.message.reply_text("/debug prompt: not implemented yet.")
+        await _debug_prompt(update, context)
     else:
         await update.message.reply_text(
             "Unknown subcommand. Use fire, clock, or prompt."

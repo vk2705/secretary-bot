@@ -1723,3 +1723,275 @@ class TestDebugOwnerGate:
         assert "/debug" not in bot._HELP_TEXT
         assert "debug" not in bot._HELP_TEXT.lower()
 
+
+class TestDebugPrompt:
+    """`/debug prompt` dumps build_system_prompt(user, chat_id) verbatim, with
+    no LLM call and no conversational side effect (DEBUG-03, plan 01-02)."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def _delivered_text(self, update):
+        """Extract the delivered prompt string from whichever path fired:
+        reply_text's sole positional arg, or reply_document's BytesIO payload
+        decoded as UTF-8. Asserts exactly one of the two paths was used."""
+        text_used = update.message.reply_text.await_count > 0
+        doc_used = update.message.reply_document.await_count > 0
+        assert text_used != doc_used, "expected exactly one delivery path"
+        if text_used:
+            update.message.reply_text.assert_awaited_once()
+            return update.message.reply_text.call_args[0][0]
+        update.message.reply_document.assert_awaited_once()
+        _, kwargs = update.message.reply_document.call_args
+        return kwargs["document"].getvalue().decode("utf-8")
+
+    # ── Task 1: verbatim dump, no LLM call, no disk write ──────────────────
+
+    def test_debug_prompt_matches_build_system_prompt_full_user(self):
+        cid = 9200
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        user["context"] = "Loves rock climbing"
+        user["trackers"] = {
+            "weight": {"unit": "kg", "log": [{"ts": "2026-08-14T08:00:00", "value": 70.0}]}
+        }
+        user["habits"] = {"meditation": {"completions": [], "created": "2026-08-01"}}
+        bot.db_add_note(str(cid), "Buy a birthday gift")
+        bot.db_add_journal(str(cid), "Shipped the debug tracer today")
+        bot.db_add_profile_memory(str(cid), "Works as a nurse")
+        bot.db_add_episodic_memory(str(cid), "Mentioned feeling stressed about exams")
+        expected = bot.build_system_prompt(user, cid)
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        assert self._delivered_text(update) == expected
+
+    def test_debug_prompt_no_llm_call(self):
+        cid = 9201
+        bot.state["users"][str(cid)] = fresh_user()
+        with patch.object(bot, "get_llm_client") as mock_get_client:
+            mock_get_client.return_value.chat.completions.create = AsyncMock()
+            with as_owner(cid):
+                update = _debug_update(cid)
+                context = _debug_context(["prompt"])
+                run(bot.debug_cmd(update, context))
+        mock_get_client.assert_not_called()
+        mock_get_client.return_value.chat.completions.create.assert_not_awaited()
+        delivered = self._delivered_text(update)
+        assert isinstance(delivered, str) and len(delivered) > 0
+
+    def test_debug_prompt_long(self):
+        cid = 9202
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        bot.db_add_note(str(cid), "Смешанный русский текст в заметке")
+        bot.db_add_note(str(cid), "Кириллица в заметке сегодня " + "x" * 4200)
+        expected = bot.build_system_prompt(user, cid)
+        assert len(expected) > 4000
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_document.assert_awaited_once()
+        update.message.reply_text.assert_not_awaited()
+        _, kwargs = update.message.reply_document.call_args
+        assert kwargs["document"].getvalue().decode("utf-8") == expected
+
+    def test_debug_prompt_short_uses_reply_text(self):
+        cid = 9203
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        expected = bot.build_system_prompt(user, cid)
+        assert len(expected) <= 4000
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once_with(expected)
+        update.message.reply_document.assert_not_awaited()
+
+    def test_debug_prompt_history_and_activity_unchanged(self):
+        cid = 9204
+        bot.state["users"][str(cid)] = fresh_user(
+            history=[{"role": "user", "content": "hi"}],
+            activity_days=["2026-08-01"],
+        )
+        user = bot.state["users"][str(cid)]
+        history_len_before = len(user["history"])
+        activity_before = list(user["activity_days"])
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        assert len(user["history"]) == history_len_before
+        assert user["activity_days"] == activity_before
+
+    def test_debug_prompt_non_owner_rejected_before_assembly(self):
+        cid = 9205
+        with patch.object(bot, "build_system_prompt") as mock_build:
+            with as_owner(999999):
+                update = _debug_update(cid)
+                context = _debug_context(["prompt"])
+                run(bot.debug_cmd(update, context))
+            mock_build.assert_not_called()
+        update.message.reply_text.assert_awaited_once_with("Admin only.")
+        assert str(cid) not in bot.state["users"]
+
+    # ── Task 2: empty-state and content-fidelity edges ──────────────────────
+
+    _SECTION_MARKERS = [
+        "About this user:",
+        "Recent tracker readings:",
+        "Today's habits:",
+        "Today's focus:",
+        "User's recent notes:",
+        "Permanent user facts:",
+        "Recent observations (last 30 days):",
+        "Recent journal entries:",
+        "Always respond exclusively in",
+    ]
+
+    def test_debug_prompt_empty_user_has_no_optional_sections(self):
+        cid = 9206
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        expected = bot.build_system_prompt(user, cid)
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        delivered = self._delivered_text(update)
+        assert delivered == expected
+        assert isinstance(delivered, str) and len(delivered) > 0
+        for marker in self._SECTION_MARKERS:
+            assert marker not in delivered
+
+    def _assert_section_round_trip(self, cid, marker, seed):
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        seed(cid, user)
+        expected = bot.build_system_prompt(user, cid)
+        assert marker in expected
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        assert self._delivered_text(update) == expected
+
+    def test_debug_prompt_context_section_appears_when_seeded(self):
+        self._assert_section_round_trip(
+            9207, "About this user:",
+            lambda cid, user: user.__setitem__("context", "Loves rock climbing"),
+        )
+
+    def test_debug_prompt_trackers_section_appears_when_seeded(self):
+        def seed(cid, user):
+            user["trackers"] = {
+                "weight": {"unit": "kg", "log": [{"ts": "2026-08-14T08:00:00", "value": 70.0}]}
+            }
+        self._assert_section_round_trip(9208, "Recent tracker readings:", seed)
+
+    def test_debug_prompt_habits_section_appears_when_seeded(self):
+        def seed(cid, user):
+            user["habits"] = {"meditation": {"completions": [], "created": "2026-08-01"}}
+        self._assert_section_round_trip(9209, "Today's habits:", seed)
+
+    def test_debug_prompt_today_focus_section_appears_when_seeded(self):
+        def seed(cid, user):
+            user["today_focus"] = {"date": date.today().isoformat(), "text": "Ship the debug plan"}
+        self._assert_section_round_trip(9210, "Today's focus:", seed)
+
+    def test_debug_prompt_notes_section_appears_when_seeded(self):
+        def seed(cid, user):
+            bot.db_add_note(str(cid), "Buy a birthday gift")
+        self._assert_section_round_trip(9211, "User's recent notes:", seed)
+
+    def test_debug_prompt_profile_memory_section_appears_when_seeded(self):
+        def seed(cid, user):
+            bot.db_add_profile_memory(str(cid), "Works as a nurse")
+        self._assert_section_round_trip(9212, "Permanent user facts:", seed)
+
+    def test_debug_prompt_episodic_memory_section_appears_when_seeded(self):
+        def seed(cid, user):
+            bot.db_add_episodic_memory(str(cid), "Mentioned feeling stressed about exams")
+        self._assert_section_round_trip(9213, "Recent observations (last 30 days):", seed)
+
+    def test_debug_prompt_journal_section_appears_when_seeded(self):
+        def seed(cid, user):
+            bot.db_add_journal(str(cid), "Shipped the debug tracer today")
+        self._assert_section_round_trip(9214, "Recent journal entries:", seed)
+
+    def test_debug_prompt_language_instruction_appears_when_seeded(self):
+        def seed(cid, user):
+            user["language"] = "Russian"
+        self._assert_section_round_trip(9215, "Always respond exclusively in", seed)
+
+    def test_debug_prompt_emoji_and_cyrillic_note_round_trip(self):
+        cid = 9216
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        bot.db_add_note(str(cid), "🎉 celebrate the milestone")
+        bot.db_add_note(str(cid), "Смешанный mixed текст с emoji 🚀")
+        bot.db_add_note(str(cid), "x" * 4500)  # push the dump past the threshold
+        expected = bot.build_system_prompt(user, cid)
+        assert len(expected) > 4000
+        with as_owner(cid):
+            update = _debug_update(cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_document.assert_awaited_once()
+        delivered = update.message.reply_document.call_args[1]["document"].getvalue().decode("utf-8")
+        assert delivered == expected
+        assert "🎉 celebrate the milestone" in delivered
+        assert "Смешанный mixed текст с emoji 🚀" in delivered
+
+    def test_debug_prompt_threshold_boundary_text_vs_document(self):
+        probe_cid = 9217
+        bot.state["users"][str(probe_cid)] = fresh_user()
+        probe_user = bot.state["users"][str(probe_cid)]
+        bot.db_add_note(str(probe_cid), "x")
+        probe_len = len(bot.build_system_prompt(probe_user, probe_cid))
+        # probe_len = (fixed prompt + one-char note "x"); solve for the note
+        # length N that lands the total exactly on the 4000-char threshold.
+        note_len_at_threshold = 4001 - probe_len
+
+        at_cid = 9218
+        bot.state["users"][str(at_cid)] = fresh_user()
+        at_user = bot.state["users"][str(at_cid)]
+        bot.db_add_note(str(at_cid), "a" * note_len_at_threshold)
+        at_prompt = bot.build_system_prompt(at_user, at_cid)
+        assert len(at_prompt) == 4000
+        with as_owner(at_cid):
+            update = _debug_update(at_cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_text.assert_awaited_once_with(at_prompt)
+        update.message.reply_document.assert_not_awaited()
+
+        over_cid = 9219
+        bot.state["users"][str(over_cid)] = fresh_user()
+        over_user = bot.state["users"][str(over_cid)]
+        bot.db_add_note(str(over_cid), "a" * (note_len_at_threshold + 1))
+        over_prompt = bot.build_system_prompt(over_user, over_cid)
+        assert len(over_prompt) == 4001
+        with as_owner(over_cid):
+            update = _debug_update(over_cid)
+            context = _debug_context(["prompt"])
+            run(bot.debug_cmd(update, context))
+        update.message.reply_document.assert_awaited_once()
+        update.message.reply_text.assert_not_awaited()
+
+    def test_debug_prompt_deterministic_across_calls(self):
+        cid = 9220
+        bot.state["users"][str(cid)] = fresh_user()
+        user = bot.state["users"][str(cid)]
+        user["context"] = "Loves rock climbing"
+        bot.db_add_note(str(cid), "Buy a birthday gift")
+        with as_owner(cid):
+            update1 = _debug_update(cid)
+            run(bot.debug_cmd(update1, _debug_context(["prompt"])))
+            update2 = _debug_update(cid)
+            run(bot.debug_cmd(update2, _debug_context(["prompt"])))
+        assert self._delivered_text(update1) == self._delivered_text(update2)
+
