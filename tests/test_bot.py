@@ -1925,7 +1925,9 @@ class TestDebugFire:
         prompt = args[1]
         assert "did not reply" in prompt
 
-    def test_debug_fire_checkin_sends_inline_keyboard_and_logs_job(self):
+    def test_debug_fire_checkin_sends_plain_text_and_logs_job(self):
+        """Check-ins are plain text with no buttons (buttons underscored the
+        mechanical feel) -- users respond in natural language instead."""
         cid = 9014
         bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
         context = _debug_context([])
@@ -1933,7 +1935,7 @@ class TestDebugFire:
             run(bot._run_checkin(context, cid, "morning"))
         context.bot.send_message.assert_awaited_once()
         _, kwargs = context.bot.send_message.call_args
-        assert kwargs["reply_markup"] is not None
+        assert kwargs.get("reply_markup") is None
         assert bot.db_last_job_fired(str(cid), "checkin_morning") is not None
 
     @pytest.mark.parametrize("runner_name,call_kwargs", [
@@ -2075,18 +2077,28 @@ class TestDebugFire:
         context.bot.send_message.assert_awaited_once()
 
     def test_debug_fire_reminder_sends_text_and_registers_snooze(self):
+        """The reminder is now delivered through the LLM (chat()) so wording
+        varies instead of a frozen template -- verify the raw message reaches
+        the prompt handed to chat(), and that the (mocked) reply is sent with
+        the snooze button attached."""
         cid = 9060
         bot.state["users"][str(cid)] = fresh_user()
         reminder = {"id": "r1", "time": "09:00", "message": "Take pills", "once": False}
         context = _debug_context([])
-        result = run(bot._run_reminder(context, cid, reminder))
+        with patch.object(bot, "chat", AsyncMock(return_value="Time for your pills!")) as mock_chat:
+            result = run(bot._run_reminder(context, cid, reminder))
         assert result is None
+        args, kwargs = mock_chat.call_args
+        assert "Take pills" in args[1]
+        assert kwargs.get("touch_activity") is False
         context.bot.send_message.assert_awaited_once()
         _, kwargs = context.bot.send_message.call_args
-        assert "Take pills" in kwargs["text"]
+        assert kwargs["text"] == "Time for your pills!"
         assert kwargs["reply_markup"] is not None
 
     def test_debug_fire_reminder_with_reason_line(self):
+        """A stored reason is passed into the LLM prompt so it can be woven
+        into the message, rather than appended as a static line."""
         cid = 9061
         bot.state["users"][str(cid)] = fresh_user()
         reminder = {
@@ -2094,9 +2106,10 @@ class TestDebugFire:
             "reason": "doctor's orders", "once": False,
         }
         context = _debug_context([])
-        run(bot._run_reminder(context, cid, reminder))
-        _, kwargs = context.bot.send_message.call_args
-        assert "doctor's orders" in kwargs["text"]
+        with patch.object(bot, "chat", AsyncMock(return_value="ok")) as mock_chat:
+            run(bot._run_reminder(context, cid, reminder))
+        args, _ = mock_chat.call_args
+        assert "doctor's orders" in args[1]
 
     def test_debug_fire_deadline_alert_nothing_due_reason(self):
         """_run_deadline_alert also carries the shared suppression-reason
@@ -2127,10 +2140,11 @@ class TestDebugFire:
         context = _debug_context([])
         context.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
         runner = getattr(bot, runner_name)
-        if runner_name == "_run_reminder":
-            result = run(runner(context, cid, call_kwargs["reminder"]))
-        else:
-            result = run(runner(context, cid))
+        with patch.object(bot, "chat", AsyncMock(return_value="ok")):
+            if runner_name == "_run_reminder":
+                result = run(runner(context, cid, call_kwargs["reminder"]))
+            else:
+                result = run(runner(context, cid))
         assert result == "send failed"
 
     def test_wr01_weekly_digest_reports_send_failed_on_genuine_exception(self):
@@ -2176,7 +2190,7 @@ class TestDebugFire:
         bot.state["users"][str(cid)] = fresh_user(
             reminders=[{"id": "r1", "time": "09:00", "message": "Take pills", "once": False}]
         )
-        with as_owner(cid):
+        with as_owner(cid), patch.object(bot, "chat", AsyncMock(return_value="ok")):
             update = _debug_update(cid)
             context = _debug_context(["fire", "reminder", "1"])
             context.bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
@@ -2216,10 +2230,13 @@ class TestDebugFire:
         job_name = f"reminder_{cid}_{reminder['id']}"
         assert job_name in captured
         job_context = _debug_context([])
-        run(captured[job_name](job_context))
+        with patch.object(bot, "chat", AsyncMock(return_value="Time to stretch!")) as mock_chat:
+            run(captured[job_name](job_context))
+        args, _ = mock_chat.call_args
+        assert "Stretch" in args[1]
         job_context.bot.send_message.assert_awaited_once()
         _, kwargs = job_context.bot.send_message.call_args
-        assert "Stretch" in kwargs["text"]
+        assert kwargs["text"] == "Time to stretch!"
 
     def test_scheduled_habit_reminder_matches_debug_path(self):
         cid = 9072

@@ -71,7 +71,7 @@ def _get_fernet() -> Fernet:
 # Rate limiting: max AI calls per hour per user (backed by SQLite)
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
-_snooze_cache: dict[str, str] = {}  # token → reminder message
+_snooze_cache: dict[str, dict] = {}  # token → {"message": ..., "reason": ...}
 _app = None  # set in main(); used by tool executor to schedule reminders
 
 
@@ -1270,13 +1270,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 return {"error": "Scheduler not available"}
             db_log_reminder(chat_id, None, message, reason, "once", None)
             async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message, _reason=reason):
-                try:
-                    text = f"⏰ Reminder: {_msg}"
-                    if _reason:
-                        text += f"\n💡 {_reason}"
-                    await ctx.bot.send_message(chat_id=_cid, text=text)
-                except Exception as e:
-                    logger.error("One-time reminder failed: %s", e)
+                await _run_reminder(ctx, _cid, {"message": _msg, "reason": _reason}, simulate=False)
             _app.job_queue.run_once(_once_job, when=delay_minutes * 60,
                                     name=f"once_{chat_id}_{uuid.uuid4()}")
             return {"success": True, "once_in_minutes": delay_minutes, "message": message}
@@ -1297,13 +1291,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 return {"error": f"Time {time_str} is in the past or invalid"}
             db_log_reminder(chat_id, None, message, reason, "once", time_str)
             async def _once_time_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message, _reason=reason):
-                try:
-                    text = f"⏰ Reminder: {_msg}"
-                    if _reason:
-                        text += f"\n💡 {_reason}"
-                    await ctx.bot.send_message(chat_id=_cid, text=text)
-                except Exception as e:
-                    logger.error("One-time reminder failed: %s", e)
+                await _run_reminder(ctx, _cid, {"message": _msg, "reason": _reason}, simulate=False)
             _app.job_queue.run_once(_once_time_job, when=delay,
                                     name=f"once_{chat_id}_{uuid.uuid4()}")
             return {"success": True, "once_at": time_str, "message": message}
@@ -1997,15 +1985,19 @@ async def _run_checkin(
     if is_morning:
         prompt = (
             f"It's morning check-in time. {variety_instruction} "
-            "Then ask what they plan to work on today from their task list. "
-            "Pick 1-2 specific tasks to focus on."
+            "Then ask what they plan to work on today from their task list -- pick 1-2 "
+            "specific tasks. Push for a concrete commitment, not a vague intention: get "
+            "them to say what exactly they'll do and roughly when today they'll do it "
+            "(implementation intentions work far better than 'I'll get to it')."
         )
     else:
         prompt = (
             f"It's evening check-in time. {variety_instruction} "
             "Ask how their day went and specifically about progress on their tasks. "
             "If they didn't do much, gently push back and encourage them to do "
-            "at least one small thing."
+            "at least one small thing. Then, separately, ask what they plan to do "
+            "tomorrow -- again pushing for a specific action and a specific time, not "
+            "just a vague plan."
         )
     try:
         dynamic_prompt = prompt
@@ -2033,17 +2025,7 @@ async def _run_checkin(
                 "repeating the same question."
             )
         reply = await chat(chat_id, dynamic_prompt, touch_activity=False)
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Going well", callback_data="ci:well"),
-                InlineKeyboardButton("🔄 Partially", callback_data="ci:partial"),
-            ],
-            [
-                InlineKeyboardButton("❌ Not today", callback_data="ci:skip"),
-                InlineKeyboardButton("💬 Let's talk", callback_data="ci:chat"),
-            ],
-        ])
-        await context.bot.send_message(chat_id=chat_id, text=reply, reply_markup=keyboard)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
         user_now["pending_checkin"] = label
         save_state(state)
         db_log_job(str(chat_id), f"checkin_{'morning' if is_morning else 'evening'}")
@@ -2078,13 +2060,15 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
 async def _run_reminder(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, reminder: dict, *, simulate: bool = True
 ) -> str | None:
-    """Send a single reminder's text (with its optional reason) and register a
-    snooze token. Shared by the per-reminder scheduled job (via
-    schedule_user_reminder's thin wrapper) and `/debug fire reminder <n>` so
-    the two paths can never diverge. Returns a short reason string when quiet
-    hours or mute suppress the reminder, or when the send itself raised
-    ("send failed" -- WR-01); None once it sent one. See `_run_checkin`'s
-    docstring for what `simulate` controls (CR-01)."""
+    """Deliver a single reminder through the LLM (so wording varies and can
+    surface *why* it matters from memory/context, instead of a frozen static
+    string) and register a snooze token. Shared by the per-reminder scheduled
+    job (via schedule_user_reminder's thin wrapper), the once/delay-based
+    jobs created inline in add_reminder, the snooze re-fire, and `/debug fire
+    reminder <n>` so none of these paths can diverge. Returns a short reason
+    string when quiet hours or mute suppress the reminder, or when the send
+    itself raised ("send failed" -- WR-01); None once it sent one. See
+    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
@@ -2093,17 +2077,26 @@ async def _run_reminder(
     msg = reminder["message"]
     reason = reminder.get("reason")
     try:
+        prompt = (
+            f"A scheduled reminder is firing now: \"{msg}\"."
+            + (f" Why it matters, as recorded: {reason}." if reason else
+               " No reason was recorded for it -- if you know from memory or "
+               "conversation history why this matters to the user, weave it in "
+               "briefly; otherwise just deliver the reminder.")
+            + " Deliver it as a short, natural nudge -- vary the phrasing and "
+              "opening from your recent messages (check conversation history), "
+              "don't reuse the same template every time. One to two sentences, "
+              "not a lecture."
+        )
+        reply = await chat(chat_id, prompt, touch_activity=False)
         import time as _time
         token = f"{chat_id}_{int(_time.monotonic() * 1000) % 10_000_000}"
-        _snooze_cache[token] = msg
+        _snooze_cache[token] = {"message": msg, "reason": reason}
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
         ]])
-        text = f"⏰ Reminder: {msg}"
-        if reason:
-            text += f"\n💡 {reason}"
         await context.bot.send_message(
-            chat_id=chat_id, text=text, reply_markup=keyboard
+            chat_id=chat_id, text=reply, reply_markup=keyboard
         )
     except Exception as e:
         logger.error("Reminder failed for %s: %s", chat_id, e)
@@ -4507,61 +4500,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # token is everything between first and last underscore segment
         minutes = int(parts[-1])
         token = "_".join(parts[1:-1])
-        msg_text = _snooze_cache.pop(token, None)
+        snoozed = _snooze_cache.pop(token, None)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        if not msg_text:
+        if not snoozed:
             await context.bot.send_message(chat_id=chat_id, text="⚠️ Snooze expired.")
             return
 
-        async def _snooze_fire(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _m=msg_text):
-            await ctx.bot.send_message(chat_id=_cid, text=f"⏰ (Snoozed) {_m}")
+        async def _snooze_fire(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _r=snoozed):
+            await _run_reminder(ctx, _cid, _r, simulate=False)
 
         context.application.job_queue.run_once(_snooze_fire, when=minutes * 60)
         await context.bot.send_message(
             chat_id=chat_id, text=f"⏱ Snoozed {minutes} min. I'll remind you again."
         )
-        return
-
-    if not query.data.startswith("ci:"):
-        return
-
-    mood = query.data.split(":")[1]
-    prompts = {
-        "well": (
-            "The user tapped 'Going well' after a check-in message. "
-            "Acknowledge briefly and ask what specific task they're tackling next."
-        ),
-        "partial": (
-            "The user tapped 'Partially done' after a check-in. "
-            "Acknowledge the progress warmly, then ask what got in the way and "
-            "encourage one concrete next step."
-        ),
-        "skip": (
-            "The user tapped 'Not today' after a check-in. "
-            "Be understanding — don't lecture — but ask what got in the way "
-            "and suggest the smallest possible step they could still do."
-        ),
-        "chat": (
-            "The user wants to talk after a check-in. "
-            "Open the conversation warmly — ask what's on their mind."
-        ),
-    }
-    prompt = prompts.get(mood, "User responded to a check-in.")
-
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    if is_rate_limited(chat_id):
-        await context.bot.send_message(chat_id=chat_id, text="Hourly limit reached. Talk to me later!")
-        return
-
-    reply = await chat(chat_id, prompt)
-    await context.bot.send_message(chat_id=chat_id, text=reply)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

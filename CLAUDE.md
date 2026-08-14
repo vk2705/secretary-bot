@@ -101,7 +101,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 | Function | Purpose |
 |---|---|
 | `get_user(chat_id)` | Init or load user; forward-fills missing keys |
-| `chat(chat_id, msg, touch_activity=True)` | Tool-call loop (up to 5 rounds) → final text reply; stores exchange in history. `touch_activity=False` (used by proactive/automated sends — check-ins, weekly digest, missed-checkin catch-up) skips marking the day active and skips clearing `pending_checkin`, so a bot-initiated nudge is never counted as the user having responded |
+| `chat(chat_id, msg, touch_activity=True)` | Tool-call loop (up to 5 rounds) → final text reply; stores exchange in history. `touch_activity=False` (used by proactive/automated sends — check-ins, weekly digest, missed-checkin catch-up, reminder fires) skips marking the day active and skips clearing `pending_checkin`, so a bot-initiated nudge is never counted as the user having responded |
 | `build_system_prompt(user)` | Injects context, tracker readings, habits, task deadlines, profile/episodic memory |
 | `get_llm_client(user)` | Returns `AsyncOpenAI` with user or bot key; Groq auto-detected by `gsk_` prefix |
 | `get_model(user)` | User model → Groq default → OpenAI default |
@@ -159,9 +159,9 @@ Jobs are **in-memory only** — `restore_all_jobs()` recreates them from state o
 
 `/addtracker weight kg` creates the `/weight` command. A `MessageHandler(filters.COMMAND, handle_custom_command)` is registered **last** after all named `CommandHandler`s — it catches anything else and routes to the matching user tracker. Subcommands: `<value>`, `stats`, `history [n]`, `chart [n]`.
 
-### Check-in inline keyboard
+### Reminder snooze button
 
-Check-in messages include a 4-button `InlineKeyboardMarkup`. Tapping calls `handle_callback` (registered via `CallbackQueryHandler`), which removes the keyboard and triggers a contextual AI follow-up.
+Reminder messages (daily, one-time, and delay-based) include a single "🔁 Snooze 30 min" `InlineKeyboardButton`. Tapping it calls `handle_callback` (registered via `CallbackQueryHandler`), which re-fires the same reminder through `_run_reminder` after the delay. Check-in messages are plain text with no buttons — users respond in natural language.
 
 ### Registration order in `main()`
 
