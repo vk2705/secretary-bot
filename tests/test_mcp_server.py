@@ -56,6 +56,24 @@ if "timezonefinder" in sys.modules and not hasattr(sys.modules["timezonefinder"]
 os.environ.setdefault("TELEGRAM_TOKEN", "TEST_TOKEN")
 os.environ.setdefault("OPENAI_API_KEY", "TEST_KEY")
 
+# SAFETY NET, not just a convenience: mcp_server.py's STATE_FILE/DB_FILE
+# default to the real production files next to mcp_server.py whenever
+# BOT_STATE_FILE/BOT_DB_FILE aren't set — and importlib.reload(mcp_server)
+# (used below to exercise both transport branches) re-evaluates those
+# defaults from scratch every time. A test that reloads without calling
+# _fresh_db() again straight after would silently point back at the real
+# state.json/bot_memory.db. This happened once already and clobbered the
+# real bot's state.json. Setting these two env vars before mcp_server is
+# ever imported means a bare reload can now only ever fall back to this
+# session-wide throwaway file, never production — _fresh_db() still gives
+# each test its own file on top of this for isolation between tests.
+_session_state = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+_session_state.close()
+_session_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_session_db.close()
+os.environ["BOT_STATE_FILE"] = _session_state.name
+os.environ["BOT_DB_FILE"] = _session_db.name
+
 _real_exists = os.path.exists
 
 
@@ -75,9 +93,9 @@ from mcp.shared.auth import OAuthClientInformationFull  # noqa: E402
 
 def _fresh_db():
     """Point both bot.py and mcp_server.py at the same brand-new temp DB and
-    temp state.json — without repointing STATE_FILE too, any test touching
-    tasks/habits/trackers (_load()/_save()) would silently hit the real
-    production state.json next to mcp_server.py."""
+    temp state.json — never the real production files, see the
+    BOT_STATE_FILE/BOT_DB_FILE env-var safety net set above this module's
+    imports, which this only adds *per-test* isolation on top of."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     bot.DB_FILE = tmp.name
@@ -620,3 +638,37 @@ class TestTransportScopedRegistration:
         assert "someone else's" not in own_text
         assert own_text == spoofed_text
         assert "someone else's" not in spoofed_text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The incident: a bare importlib.reload(mcp_server), with no _fresh_db()
+# follow-up, silently re-resolved STATE_FILE/DB_FILE back to the real
+# production files next to mcp_server.py and clobbered the live bot's
+# state.json. Fixed by setting BOT_STATE_FILE/BOT_DB_FILE once, before this
+# module ever imports mcp_server (see the top of this file) — this test
+# proves that safety net actually holds under the exact failure shape.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestReloadNeverFallsBackToProductionFiles:
+    def teardown_method(self):
+        os.environ.pop("MCP_TRANSPORT", None)
+        importlib.reload(mcp_server)
+        _fresh_db()
+
+    def _real_production_paths(self):
+        real_dir = Path(mcp_server.__file__).resolve().parent
+        return real_dir / "state.json", real_dir / "bot_memory.db"
+
+    def test_bare_reload_with_no_followup_stays_off_production_state_json(self):
+        real_state, real_db = self._real_production_paths()
+        # deliberately mimic the exact bug: reload and do nothing else
+        os.environ["MCP_TRANSPORT"] = "remote"
+        importlib.reload(mcp_server)
+        assert mcp_server.STATE_FILE.resolve() != real_state
+        assert mcp_server.DB_FILE.resolve() != real_db
+
+    def test_bare_reload_resolves_to_the_session_wide_env_var_paths(self):
+        os.environ["MCP_TRANSPORT"] = "remote"
+        importlib.reload(mcp_server)
+        assert str(mcp_server.STATE_FILE) == os.environ["BOT_STATE_FILE"]
+        assert str(mcp_server.DB_FILE) == os.environ["BOT_DB_FILE"]
