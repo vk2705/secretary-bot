@@ -3657,3 +3657,92 @@ class TestReviewFixCR01:
         assert debug_result == "muted"
         debug_context.bot.send_message.assert_not_awaited()
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11: MCP link-code primitive — /link + db_create_link_code
+# (Milestone B / AUTH-02 groundwork; consumed by mcp_server.py's OAuth
+# provider, which is out of this test file's scope.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDbCreateLinkCode:
+    def setup_method(self):
+        _fresh_db()
+
+    def test_returns_8_char_hex_code(self):
+        code = bot.db_create_link_code("1")
+        assert len(code) == 8
+        int(code, 16)  # raises if not hex
+
+    def test_codes_are_unique(self):
+        codes = {bot.db_create_link_code("1") for _ in range(20)}
+        assert len(codes) == 20
+
+    def test_row_persisted_with_chat_id_and_expiry(self):
+        before = bot.datetime.utcnow()
+        code = bot.db_create_link_code("42")
+        with bot._db() as con:
+            row = con.execute(
+                "SELECT * FROM mcp_link_codes WHERE code=?", (code,)
+            ).fetchone()
+        assert row is not None
+        assert row["chat_id"] == "42"
+        assert row["used_at"] is None
+        created = bot.datetime.fromisoformat(row["created_at"])
+        expires = bot.datetime.fromisoformat(row["expires_at"])
+        assert created >= before
+        assert (expires - created) == bot.timedelta(minutes=10)
+
+    def test_custom_ttl(self):
+        code = bot.db_create_link_code("1", ttl_minutes=1)
+        with bot._db() as con:
+            row = con.execute(
+                "SELECT created_at, expires_at FROM mcp_link_codes WHERE code=?", (code,)
+            ).fetchone()
+        created = bot.datetime.fromisoformat(row["created_at"])
+        expires = bot.datetime.fromisoformat(row["expires_at"])
+        assert (expires - created) == bot.timedelta(minutes=1)
+
+
+class TestLinkCmd:
+    def setup_method(self):
+        _fresh_db()
+
+    def _update_and_context(self, chat_id=123):
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+        return update, context
+
+    def test_creates_link_code_row_for_this_chat(self):
+        update, context = self._update_and_context(chat_id=555)
+        run(bot.link_cmd(update, context))
+        with bot._db() as con:
+            rows = con.execute(
+                "SELECT chat_id FROM mcp_link_codes"
+            ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["chat_id"] == "555"
+
+    def test_replies_with_bare_code_when_domain_unset(self):
+        update, context = self._update_and_context()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MCP_REMOTE_DOMAIN", None)
+            run(bot.link_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "link code" in reply.lower()
+        assert "http" not in reply
+
+    def test_replies_with_full_url_when_domain_set(self):
+        update, context = self._update_and_context()
+        with patch.dict(os.environ, {"MCP_REMOTE_DOMAIN": "mcp-sbot.alteon.help"}):
+            run(bot.link_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "https://mcp-sbot.alteon.help/link/" in reply
+        # the code embedded in the URL must be the one actually stored
+        with bot._db() as con:
+            code = con.execute("SELECT code FROM mcp_link_codes").fetchone()["code"]
+        assert code in reply

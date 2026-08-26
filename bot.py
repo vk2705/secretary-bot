@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import sqlite3
+import secrets
 import uuid
 import calendar
 import tempfile
@@ -157,11 +158,77 @@ def _init_db() -> None:
                 created_at     TEXT    NOT NULL,
                 removed_at     TEXT
             );
+            -- One-time codes proving a Telegram account requested an MCP Google link
+            -- (Milestone B / AUTH-02). 10-minute TTL, single-use, consumed by mcp_server.py.
+            CREATE TABLE IF NOT EXISTS mcp_link_codes (
+                code       TEXT PRIMARY KEY,
+                chat_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at    TEXT
+            );
+            -- Verified Google identity -> Telegram chat_id, established once via
+            -- mcp_link_codes. Read/written by mcp_server.py's OAuth provider.
+            CREATE TABLE IF NOT EXISTS mcp_identity (
+                google_sub TEXT PRIMARY KEY,
+                email      TEXT,
+                chat_id    TEXT NOT NULL,
+                linked_at  TEXT NOT NULL
+            );
+            -- Dynamically registered OAuth clients (claude.ai etc.) against our
+            -- own thin Authorization Server. Owned entirely by mcp_server.py.
+            CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+                client_id  TEXT PRIMARY KEY,
+                info_json  TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            -- In-flight claude.ai /authorize requests, parked while we round-trip
+            -- through Google to establish identity. Single-use, short TTL.
+            CREATE TABLE IF NOT EXISTS mcp_pending_authorize (
+                state                 TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                scopes                TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                redirect_uri_explicit INTEGER NOT NULL,
+                resource              TEXT,
+                client_state          TEXT,
+                created_at            TEXT NOT NULL,
+                expires_at            REAL NOT NULL
+            );
+            -- Our own short-lived authorization codes, minted after a completed
+            -- Google login resolves to a bound chat_id.
+            CREATE TABLE IF NOT EXISTS mcp_auth_codes (
+                code                  TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                chat_id               TEXT NOT NULL,
+                scopes                TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                redirect_uri_explicit INTEGER NOT NULL,
+                resource              TEXT,
+                expires_at            REAL NOT NULL,
+                created_at            TEXT NOT NULL
+            );
+            -- Issued access/refresh tokens, stored as sha256 hashes only —
+            -- never the plaintext token, mirroring how api_keys are never
+            -- stored in plaintext.
+            CREATE TABLE IF NOT EXISTS mcp_tokens (
+                token_hash TEXT PRIMARY KEY,
+                kind       TEXT NOT NULL,   -- 'access' | 'refresh'
+                client_id  TEXT NOT NULL,
+                chat_id    TEXT NOT NULL,
+                scopes     TEXT NOT NULL,
+                expires_at REAL,            -- NULL = no expiry (refresh tokens)
+                created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_notes_chat        ON notes(chat_id);
             CREATE INDEX IF NOT EXISTS idx_journal_chat      ON journal(chat_id);
             CREATE INDEX IF NOT EXISTS idx_profile_chat      ON profile_memory(chat_id);
             CREATE INDEX IF NOT EXISTS idx_episodic_chat     ON episodic_memory(chat_id);
             CREATE INDEX IF NOT EXISTS idx_reminder_log_chat ON reminder_log(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_mcp_identity_chat ON mcp_identity(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_mcp_tokens_chat   ON mcp_tokens(chat_id);
         """)
     # one-time migration of notes/journal still living in state.json
     if os.path.exists(STATE_FILE):
@@ -206,6 +273,23 @@ def _init_db() -> None:
                     json.dump(s, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("Key migration failed: %s", e)
+
+
+# ── MCP link-code helpers (Milestone B / AUTH-02) ──
+
+def db_create_link_code(chat_id: str, ttl_minutes: int = 10) -> str:
+    """Create a one-time code proving this Telegram account requested an MCP
+    Google link. Consumed by mcp_server.py's OAuth provider, which owns the
+    verification and (google_sub -> chat_id) binding — this only proves the
+    Telegram side of the handshake."""
+    code = secrets.token_hex(4)
+    now = datetime.utcnow()
+    with _db() as con:
+        con.execute(
+            "INSERT INTO mcp_link_codes(code, chat_id, created_at, expires_at) VALUES(?,?,?,?)",
+            (code, str(chat_id), now.isoformat(), (now + timedelta(minutes=ttl_minutes)).isoformat())
+        )
+    return code
 
 
 # ── notes helpers ──
@@ -2571,6 +2655,7 @@ _HELP_TEXT = (
     "  /pomodoro [min]  /export  /clear\n"
     "  /reset  — wipe all data\n"
     "  /feedback <text>  — send feedback to bot admin\n"
+    "  /link  — connect this account to Claude via Google sign-in\n"
     "  (Send export JSON to import)\n"
 )
 
@@ -3165,6 +3250,27 @@ async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Feedback send failed: %s", e)
         await update.message.reply_text("⚠️ Could not deliver feedback right now.")
+
+
+async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/link — one-time code + URL to connect this Telegram account to the
+    remote MCP server via Google sign-in (Milestone B / AUTH-01/02)."""
+    chat_id = update.effective_chat.id
+    code = db_create_link_code(chat_id)
+    domain = os.environ.get("MCP_REMOTE_DOMAIN")
+    if domain:
+        url = f"https://{domain}/link/{code}"
+        await update.message.reply_text(
+            "🔗 Tap to connect Claude to your data:\n"
+            f"{url}\n\n"
+            "Signs you in with Google. One-time use, expires in 10 minutes."
+        )
+    else:
+        await update.message.reply_text(
+            f"🔗 Your one-time link code: {code}\n"
+            "(MCP_REMOTE_DOMAIN isn't set for this bot, so no direct link — "
+            "expires in 10 minutes.)"
+        )
 
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4585,6 +4691,7 @@ def main():
     app.add_handler(CommandHandler("compress", compress_history))
     app.add_handler(CommandHandler("time", time_cmd))
     app.add_handler(CommandHandler("feedback", feedback_cmd))
+    app.add_handler(CommandHandler("link", link_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("duedate", duedate_cmd))
     app.add_handler(CommandHandler("extend", extend_cmd))
