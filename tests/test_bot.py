@@ -363,6 +363,51 @@ class TestBuildSystemPrompt:
         prompt = bot.build_system_prompt(u)
         assert 'Address the user as "Sir"' in prompt
 
+    def test_new_user_without_honorific_gets_asked(self):
+        """Regression: a brand-new user who never types /start (just starts
+        chatting, e.g. via console.py) must still get asked — the ask can't
+        live only in start()'s hardcoded onboarding text."""
+        u = fresh_user()  # no context, no tasks, no activity_days -> _is_new_user() True
+        prompt = bot.build_system_prompt(u)
+        assert "ask naturally" in prompt
+        assert "how should I address you" in prompt
+
+    def test_established_user_without_honorific_not_pestered(self):
+        u = fresh_user(context="I'm a developer", tasks=["Ship the feature"])
+        prompt = bot.build_system_prompt(u)
+        assert "ask naturally" not in prompt
+        assert "Address the user as" not in prompt
+
+    def test_honorific_set_suppresses_the_ask_even_for_new_user(self):
+        u = fresh_user(honorific="Sir")  # still "new" by the tasks/context/activity heuristic
+        prompt = bot.build_system_prompt(u)
+        assert "ask naturally" not in prompt
+        assert 'Address the user as "Sir"' in prompt
+
+
+class TestIsNewUser:
+    def test_fresh_user_is_new(self):
+        assert bot._is_new_user(fresh_user()) is True
+
+    def test_user_with_context_not_new(self):
+        assert bot._is_new_user(fresh_user(context="I'm a developer")) is False
+
+    def test_user_with_tasks_not_new(self):
+        assert bot._is_new_user(fresh_user(tasks=["Buy milk"])) is False
+
+    def test_user_with_multiple_activity_days_not_new(self):
+        assert bot._is_new_user(fresh_user(activity_days=["2026-01-01", "2026-01-02"])) is False
+
+    def test_shared_by_start_and_system_prompt(self):
+        """start()'s is_new and build_system_prompt()'s honorific-ask must
+        use the literal same function, not two copies of the heuristic that
+        could silently drift apart."""
+        import inspect
+        start_src = inspect.getsource(bot.start)
+        prompt_src = inspect.getsource(bot.build_system_prompt)
+        assert "_is_new_user(user)" in start_src
+        assert "_is_new_user(user)" in prompt_src
+
 
 class TestPersonaTools:
     def test_set_persona_saves_character(self):

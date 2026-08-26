@@ -660,6 +660,14 @@ def get_user(chat_id: int) -> dict:
     return u
 
 
+def _is_new_user(user: dict) -> bool:
+    """True for an account that hasn't meaningfully engaged yet — no context
+    set, no tasks, at most one recorded activity day. Shared by start()'s
+    onboarding message and build_system_prompt()'s honorific-ask instruction,
+    so the two can never silently diverge on what "new" means."""
+    return not user["context"] and not user["tasks"] and len(user.get("activity_days", [])) <= 1
+
+
 # ─────────────────────── rate limiting ───────────────────────
 
 def is_rate_limited(chat_id: int) -> bool:
@@ -1999,10 +2007,22 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
             f"Adopt the voice of {persona} in *how* you phrase replies — word choice, tone, small "
             "mannerisms. This is decoration on your phrasing only.\n"
         )
-    honorific_instruction = (
-        f'Address the user as "{honorific}" where it fits naturally, not forced into every sentence.\n'
-        if honorific else ""
-    )
+    if honorific:
+        honorific_instruction = (
+            f'Address the user as "{honorific}" where it fits naturally, not forced into every sentence.\n'
+        )
+    elif _is_new_user(user):
+        # /start's onboarding text asks this too, but plenty of users never
+        # type /start — they just start talking. Without this, a brand-new
+        # user chatting freely would never get asked at all.
+        honorific_instruction = (
+            "This user hasn't said how they'd like to be addressed yet. Early in this "
+            "conversation — within your first reply or two, not necessarily the very first — "
+            "ask naturally (e.g. 'and how should I address you?'), then call set_honorific once "
+            "they answer. One question, not an interrogation; if they ignore it, drop it.\n"
+        )
+    else:
+        honorific_instruction = ""
 
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
@@ -2772,7 +2792,7 @@ _HELP_TEXT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     save_state(state)
-    is_new = not user["context"] and not user["tasks"] and len(user.get("activity_days", [])) <= 1
+    is_new = _is_new_user(user)
     if is_new:
         await update.message.reply_text(
             "Good day. Jeeves, at your service — your personal secretary and accountability "
