@@ -41,6 +41,57 @@ export $(grep -v '^#' env | xargs) && python -m pytest tests/test_bot.py -v -k n
 
 The test file stubs out `telegram`, `telegram.ext`, and `timezonefinder` at import time so `bot.py` can be imported without a running Telegram app. `bot.STATE_FILE` and `bot.DB_FILE` are both redirected to temp files at import time (so the suite never touches the real `state.json`/`bot_memory.db`), and each test additionally gets a fresh SQLite temp file via an autouse `isolate_db` fixture.
 
+## `console.py` — Telegram-free back door
+
+A local debug console that drives `bot.py`'s **real** handlers without Telegram,
+against a **throwaway sandbox** copy of the data. Built for walking through a
+brand-new user's first session (onboarding, free-text conversation) repeatedly.
+
+```bash
+sandbox              # ~/bin/sandbox — sources env, uses the venv, works from any cwd
+
+sandbox --keep             # reuse sandbox instead of wiping it
+sandbox --chat-id 424242   # pretend to be another user
+sandbox --owner            # this chat_id becomes MY_CHAT_ID → /debug, /adminstats work
+sandbox --seed-from-live   # copy real state.json/bot_memory.db into a fresh sandbox
+sandbox -v                 # show INFO logging (tool calls, LLM HTTP)
+
+# equivalent, from the repo:
+export $(grep -v '^#' env | xargs) && python3 console.py
+```
+
+At the prompt, `/command` runs the real command handler, anything else goes
+through `chat()` to the **real LLM** with full tool-use, and `:`-prefixed words
+are console meta-commands (`:help`, `:state`, `:jobs`, `:commands`, `:reset`,
+`:chat <id>`, `:verbose`, `:quit`).
+
+How it stays honest and contained:
+
+- **Sandbox by default** — `bot.STATE_FILE`/`bot.DB_FILE` are repointed at
+  `/tmp/secretary-bot-console/` *before* `import bot`, because `state =
+  load_state()` runs at bot.py's module bottom. The real `state.json` /
+  `bot_memory.db` are never opened. Deleting the sandbox dir gives you a virgin
+  user; `--keep` preserves it between runs.
+- **Runs under the venv, always** — dependencies live in `venv/`, but a bare
+  `python3 console.py` picks up `/usr/bin/python3` (no `openai`) and dies at
+  bot.py's import line. `_reexec_in_venv()` transparently `os.execv`s into
+  `venv/bin/python3` when started outside a virtualenv, guarded against
+  looping; `~/bin/sandbox` names that interpreter directly, the way
+  `start_bot.sh` does.
+- **Zero changes to `bot.py`** — the console is purely additive. It stubs
+  `telegram`/`timezonefinder` and fakes `Update`/`context` the same way
+  `tests/test_bot.py` does, deliberately keeping that trick recognisably
+  identical in both places.
+- **Command list is derived, not copied** — `_discover_commands()` parses
+  `main()`'s `CommandHandler(...)` registrations out of bot.py's source with
+  `ast`, so the console can never drift out of sync with the real command set.
+  Unknown `/commands` fall through to `handle_custom_command`, matching
+  `main()`'s handler precedence.
+- **Jobs are recorded, not run** — `_FakeJobQueue` logs what `schedule_user_*`
+  tried to schedule (inspect with `:jobs`) instead of firing it. To actually
+  execute a job body, use the owner-gated `/debug fire <job>`, which works here
+  under `--owner`.
+
 ## Environment (`env` file)
 
 | Variable | Required | Purpose |
