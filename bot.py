@@ -580,6 +580,12 @@ def _new_user(**overrides) -> dict:
         "pending_checkin": None,
         "debug_clock": "",
         "debug_clock_expires": "",
+        # Persona is a Milestone A / Phase 4 concept, landed early and minimally
+        # (see project memory: onboarding + persona, Milestone B side-quest).
+        # Full Phase 4 (pressure dial, never-do rules, drift resistance) is not
+        # this — just a character voice, always on, defaulting to Jeeves.
+        "persona": "Jeeves",
+        "honorific": "",
     }
     base.update(overrides)
     return base
@@ -807,6 +813,50 @@ TOOLS = [
                     },
                 },
                 "required": ["enabled"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_persona",
+            "description": (
+                "Change the character/voice the bot speaks in — e.g. the user says 'talk like "
+                "Yoda', 'be more like Rambo', 'stop doing the butler thing', 'talk normally'. "
+                "Pass the character name/description as given; for 'talk normally' or 'no persona', "
+                "pass 'plain' — every future message adopts that voice's word choice, tone and "
+                "mannerisms while staying substantively helpful."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character": {
+                        "type": "string",
+                        "description": "Character/style name or short description, e.g. 'Yoda', 'Jeeves', 'plain'.",
+                    }
+                },
+                "required": ["character"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_honorific",
+            "description": (
+                "Save how the user wants to be addressed — e.g. 'call me Sir', 'I'm a Miss', "
+                "'just use my name, Alex'. Pass exactly the form of address to use, or an empty "
+                "string if the user asks to drop it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "form": {
+                        "type": "string",
+                        "description": "The form of address to use, e.g. 'Sir', 'Miss', 'Alex'. Empty string to clear.",
+                    }
+                },
+                "required": ["form"],
             },
         },
     },
@@ -1235,6 +1285,20 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 "timezone": tz,
             }
         return {"success": True, "enabled": False}
+
+    if name == "set_persona":
+        character = (args.get("character") or "").strip()
+        if not character:
+            return {"error": "character is required"}
+        user["persona"] = character
+        save_state(state)
+        return {"success": True, "persona": character}
+
+    if name == "set_honorific":
+        form = (args.get("form") or "").strip()
+        user["honorific"] = form
+        save_state(state)
+        return {"success": True, "honorific": form}
 
     if name == "get_current_time":
         try:
@@ -1888,6 +1952,26 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         if lang else ""
     )
 
+    _mcp_domain = os.environ.get("MCP_REMOTE_DOMAIN")
+    if _mcp_domain:
+        connect_claude_instruction = (
+            "10b. When asked how to connect you to Claude (Claude Desktop, Claude Code, or claude.ai), "
+            "explain both steps, in order:\n"
+            "  1) In claude.ai: Settings → Connectors → Add custom connector, paste this URL exactly: "
+            f"https://{_mcp_domain}/mcp — no client ID or secret needed, it registers itself. Click Connect.\n"
+            "  2) That opens Google sign-in. Before or during that, send /link here in Telegram, tap the "
+            "link it replies with, and sign in with the *same* Google account — that's what binds Google "
+            "to this Telegram account (one-time, expires in 10 minutes). If they connect in claude.ai "
+            "before ever running /link, they'll get a clear error telling them to /link first and retry.\n"
+            "  After both are done, Claude can access their tasks/habits/notes/journal directly.\n"
+        )
+    else:
+        connect_claude_instruction = (
+            "10b. If asked how to connect you to Claude: the remote MCP server isn't configured on this "
+            "deployment right now, so only Claude Desktop/Code (local, stdio) can connect, not claude.ai. "
+            "Say so plainly rather than describing a link that won't work.\n"
+        )
+
     tz_str = user.get("timezone", "UTC")
     try:
         from zoneinfo import ZoneInfo as _ZI
@@ -1900,9 +1984,33 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         _utc_label = tz_str
     tz_section = f"\nThe user's timezone is {tz_str} ({_utc_label}).\n"
 
+    # Persona: Milestone A / Phase 4 concept, landed early and minimally as a
+    # user request during Milestone B — see project memory. This is deliberately
+    # NOT the full Phase 4 (no pressure dial, no never-do rules, no drift-testing
+    # across 50+ turns) — just a character voice, always on, default Jeeves.
+    # Set only via set_persona/set_honorific (talking to the bot), never a
+    # settings screen or slash command, matching PROJECT.md's stated constraint.
+    persona = (user.get("persona") or "Jeeves").strip()
+    honorific = (user.get("honorific") or "").strip()
+    if persona.lower() in ("plain", "none", "off"):
+        persona_instruction = ""
+    else:
+        persona_instruction = (
+            f"Adopt the voice of {persona} in *how* you phrase replies — word choice, tone, small "
+            "mannerisms. This is decoration on your phrasing only.\n"
+        )
+    honorific_instruction = (
+        f'Address the user as "{honorific}" where it fits naturally, not forced into every sentence.\n'
+        if honorific else ""
+    )
+
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
+        "0. Literal requests always win over voice: an exact word, an exact number, an exact "
+        "format, a direct factual answer — output exactly that, nothing added, nothing in "
+        "character. Persona is for ordinary conversation, never for a literal request.\n"
+        f"{persona_instruction}{honorific_instruction}"
         "1. Be a helpful, direct assistant.\n"
         "2. Proactively hold the user accountable for their goals and tasks.\n"
         "3. During check-ins, ask about specific tasks from their task list.\n"
@@ -1917,6 +2025,7 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "call create_tracker first, then log_tracker to log the initial value if provided.\n"
         "10. When asked what you can do or how to use you, explain concisely: tasks, trackers, "
         "reminders, habits, journal, check-ins, and that the user can speak naturally.\n"
+        f"{connect_claude_instruction}"
         "11. Silently call save_memory whenever the user shares a personal fact, decision, plan, "
         "or reflection that is worth remembering for future conversations. "
         "Choose the right type: 'profile' for permanent facts about the user (name, job, allergies, preferences), "
@@ -2666,28 +2775,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_new = not user["context"] and not user["tasks"] and len(user.get("activity_days", [])) <= 1
     if is_new:
         await update.message.reply_text(
-            "👋 Welcome to Secretary Bot!\n\n"
-            "I'm your AI-powered personal secretary and accountability coach. "
-            "You can talk to me in plain language — I'll understand and act.\n\n"
-            "🧠 What I can do:\n"
+            "Good day. Jeeves, at your service — your personal secretary and accountability "
+            "coach, for as long as you'll have me. You may speak to me in plain language "
+            "throughout; I shall understand and act accordingly.\n\n"
+            "🧠 A brief accounting of my duties:\n"
             "  • Tasks — add, complete, set deadlines, tag with #hashtags\n"
-            "  • Trackers — create and log anything: weight, steps, mood, sleep…\n"
+            "  • Trackers — anything you'd care to log: weight, steps, mood, sleep…\n"
             "  • Reminders — daily or one-time, in any language\n"
-            "  • Habits — track daily habits with streaks\n"
-            "  • Journal — save reflections, get AI insights\n"
-            "  • Check-ins — morning/evening accountability messages\n"
-            "  • …and more — just ask!\n\n"
-            "Let's get set up in 4 steps:\n\n"
-            "1️⃣ Tell me about yourself:\n"
+            "  • Habits — tracked, with streaks\n"
+            "  • Journal — reflections, with a considered word or two in reply\n"
+            "  • Check-ins — a morning and evening word, if you subscribe\n"
+            "  • …and rather more besides — simply ask\n\n"
+            "Before we begin — how shall I address you? \"Sir\", \"Madam\", your given name, "
+            "or something else entirely — your call. And should this manner of speech not suit, "
+            "say so; I can just as easily be Yoda, or considerably less formal company. "
+            "Either preference, once stated, holds until you say otherwise.\n\n"
+            "Four small matters, whenever convenient:\n\n"
+            "1️⃣ A word about yourself:\n"
             "   /setcontext I'm a developer working on fitness and learning Spanish\n\n"
-            "2️⃣ Set your timezone — easiest: 📍 share your location\n"
-            "   (tap the 📎 attachment icon → Location)\n"
-            "   Or: /settimezone Asia/Jerusalem\n\n"
-            "3️⃣ Add your first goal:\n"
+            "2️⃣ Your timezone — simplest by 📍 sharing your location\n"
+            "   (the 📎 attachment icon → Location)\n"
+            "   or: /settimezone Asia/Jerusalem\n\n"
+            "3️⃣ A first goal:\n"
             "   /addtask Exercise 3× per week\n\n"
-            "4️⃣ Enable daily check-ins:\n"
+            "4️⃣ Daily check-ins, should you want them:\n"
             "   /subscribe\n\n"
-            "Or just start chatting — say something like:\n"
+            "And should you wish Claude to see this account's data directly, /link will "
+            "explain how.\n\n"
+            "Or simply begin — try:\n"
             "  \"Add a tracker for my daily steps\"\n"
             "  \"Remind me to drink water every day at 10:00\"\n"
             "  \"What time is it?\""

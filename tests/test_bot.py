@@ -313,6 +313,92 @@ class TestBuildSystemPrompt:
         prompt = bot.build_system_prompt(u)
         assert "Old focus" not in prompt
 
+    def test_connect_claude_instruction_uses_real_domain_when_configured(self):
+        u = fresh_user()
+        with patch.dict(os.environ, {"MCP_REMOTE_DOMAIN": "mcp-sbot.alteon.help"}):
+            prompt = bot.build_system_prompt(u)
+        assert "https://mcp-sbot.alteon.help/mcp" in prompt
+        assert "/link" in prompt
+        assert "no client ID or secret needed" in prompt
+
+    def test_connect_claude_instruction_admits_remote_unavailable_when_domain_unset(self):
+        u = fresh_user()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MCP_REMOTE_DOMAIN", None)
+            prompt = bot.build_system_prompt(u)
+        assert "isn't configured on this deployment" in prompt
+        assert "https://" not in prompt.split("connect you to Claude")[-1].split("\n")[0]
+
+    def test_persona_defaults_to_jeeves(self):
+        u = fresh_user()
+        prompt = bot.build_system_prompt(u)
+        assert "voice of Jeeves" in prompt
+
+    def test_persona_reflects_custom_character(self):
+        u = fresh_user(persona="Yoda")
+        prompt = bot.build_system_prompt(u)
+        assert "voice of Yoda" in prompt
+        assert "Jeeves" not in prompt
+
+    def test_persona_plain_disables_the_instruction_entirely(self):
+        u = fresh_user(persona="plain")
+        prompt = bot.build_system_prompt(u)
+        assert "Adopt the voice" not in prompt
+
+    def test_literal_compliance_rule_always_present(self):
+        """The override that lets literal requests win over persona voice is
+        not itself conditional on persona being set — it's rule 0, always."""
+        for persona in ("Jeeves", "Yoda", "plain"):
+            u = fresh_user(persona=persona)
+            prompt = bot.build_system_prompt(u)
+            assert "Literal requests always win over voice" in prompt
+
+    def test_no_honorific_by_default(self):
+        u = fresh_user()
+        prompt = bot.build_system_prompt(u)
+        assert "Address the user as" not in prompt
+
+    def test_honorific_injected_when_set(self):
+        u = fresh_user(honorific="Sir")
+        prompt = bot.build_system_prompt(u)
+        assert 'Address the user as "Sir"' in prompt
+
+
+class TestPersonaTools:
+    def test_set_persona_saves_character(self):
+        cid = 9801
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_persona", {"character": "Rambo"}))
+        assert result["success"] is True
+        assert result["persona"] == "Rambo"
+        assert bot.state["users"][str(cid)]["persona"] == "Rambo"
+
+    def test_set_persona_requires_character(self):
+        cid = 9802
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_persona", {"character": ""}))
+        assert "error" in result
+
+    def test_set_honorific_saves_form(self):
+        cid = 9803
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_honorific", {"form": "Madam"}))
+        assert result["success"] is True
+        assert result["honorific"] == "Madam"
+        assert bot.state["users"][str(cid)]["honorific"] == "Madam"
+
+    def test_set_honorific_empty_string_clears_it(self):
+        cid = 9804
+        bot.state["users"][str(cid)] = fresh_user(honorific="Sir")
+        result = run(bot._execute_tool(cid, "set_honorific", {"form": ""}))
+        assert result["success"] is True
+        assert bot.state["users"][str(cid)]["honorific"] == ""
+
+    def test_new_user_defaults_to_jeeves_persona_and_no_honorific(self):
+        u = bot._new_user()
+        assert u["persona"] == "Jeeves"
+        assert u["honorific"] == ""
+
 
 class TestRateLimit:
     def setup_method(self):
