@@ -777,16 +777,15 @@ TOOLS = [
         "function": {
             "name": "set_timezone",
             "description": (
-                "Save the user's timezone. Always convert city/country names to a valid IANA "
-                "timezone name (e.g. 'Jerusalem' → 'Asia/Jerusalem', 'Moscow' → 'Europe/Moscow', "
-                "'New York' → 'America/New_York'). Also accepts UTC offsets like 'UTC+3'."
+                "Save the user's timezone. Always convert city/country names to IANA form "
+                "('Moscow' → 'Europe/Moscow'). Also accepts offsets like 'UTC+3'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "timezone": {
                         "type": "string",
-                        "description": "IANA timezone name (e.g. 'Asia/Jerusalem') or UTC offset (e.g. 'UTC+3').",
+                        "description": "IANA name (e.g. 'Asia/Jerusalem') or offset (e.g. 'UTC+3').",
                     }
                 },
                 "required": ["timezone"],
@@ -798,27 +797,15 @@ TOOLS = [
         "function": {
             "name": "set_checkins",
             "description": (
-                "Enable or disable daily morning/evening check-ins and alerts for the user. "
-                "Call with enabled=true when the user asks for morning/evening check-ins, "
-                "daily plans, accountability prompts, or 'subscribe'. "
-                "Call with enabled=false to stop them. "
-                "Optionally set morning/evening times (HH:MM 24h)."
+                "Enable/disable daily morning+evening check-ins and alerts. enabled=true for "
+                "check-ins, daily plans, accountability prompts or 'subscribe'; false to stop."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "True to enable daily check-ins, false to disable.",
-                    },
-                    "morning": {
-                        "type": "string",
-                        "description": "Morning check-in time HH:MM (optional, default 08:00).",
-                    },
-                    "evening": {
-                        "type": "string",
-                        "description": "Evening check-in time HH:MM (optional, default 21:00).",
-                    },
+                    "enabled": {"type": "boolean", "description": "True to enable, false to disable."},
+                    "morning": {"type": "string", "description": "HH:MM, default 08:00."},
+                    "evening": {"type": "string", "description": "HH:MM, default 21:00."},
                 },
                 "required": ["enabled"],
             },
@@ -829,11 +816,9 @@ TOOLS = [
         "function": {
             "name": "set_persona",
             "description": (
-                "Change the character/voice the bot speaks in — e.g. the user says 'talk like "
-                "Yoda', 'be more like Rambo', 'stop doing the butler thing', 'talk normally'. "
-                "Pass the character name/description as given; for 'talk normally' or 'no persona', "
-                "pass 'plain' — every future message adopts that voice's word choice, tone and "
-                "mannerisms while staying substantively helpful."
+                "Change the voice the bot speaks in — 'talk like Yoda', 'stop the butler thing', "
+                "'talk normally'. Pass the character as given, or 'plain' for no persona. "
+                "All later messages adopt that voice while staying substantively helpful."
             ),
             "parameters": {
                 "type": "object",
@@ -852,16 +837,15 @@ TOOLS = [
         "function": {
             "name": "set_honorific",
             "description": (
-                "Save how the user wants to be addressed — e.g. 'call me Sir', 'I'm a Miss', "
-                "'just use my name, Alex'. Pass exactly the form of address to use, or an empty "
-                "string if the user asks to drop it."
+                "Save how the user wants to be addressed ('call me Sir', 'just use my name, Alex'). "
+                "Pass the exact form, or an empty string to drop it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "form": {
                         "type": "string",
-                        "description": "The form of address to use, e.g. 'Sir', 'Miss', 'Alex'. Empty string to clear.",
+                        "description": "e.g. 'Sir', 'Miss', 'Alex'. Empty string clears it.",
                     }
                 },
                 "required": ["form"],
@@ -934,13 +918,9 @@ TOOLS = [
         "function": {
             "name": "add_reminder",
             "description": (
-                "Schedule a single reminder. For relative time ('in 5 minutes', 'in 2 hours') use "
-                "delay_minutes — this always fires once. For a specific clock time use time. "
-                "Clock-time reminders default to daily recurring (once=false). "
-                "Set once=true ONLY when the user explicitly says 'one time', 'just today', or similar. "
-                "When the user lists several times in one message (e.g. 'at 13:30, 17:30 and 21:30'), "
-                "call this tool once per time and use the SAME once value for all of them — never mix "
-                "daily and one-time within a single request."
+                "Schedule one reminder. Relative ('in 5 minutes') → delay_minutes, always one-off. "
+                "Clock time → time, daily unless the user explicitly says one-time. "
+                "For several times in one message, call once per time with the SAME once value."
             ),
             "parameters": {
                 "type": "object",
@@ -948,19 +928,19 @@ TOOLS = [
                     "message": {"type": "string", "description": "The reminder message."},
                     "reason": {
                         "type": "string",
-                        "description": "Why this reminder matters to the user, if known from context or memory (e.g. 'to keep your leg mobile', 'you wanted to learn Kubernetes for work'). Included when the reminder fires. Omit if unknown — don't invent one.",
+                        "description": "Why it matters to the user, if known (e.g. 'to keep your leg mobile'). Shown when it fires. Omit rather than invent.",
                     },
                     "delay_minutes": {
                         "type": "integer",
-                        "description": "Fire once after this many minutes from now. Use for relative requests like 'in 5 minutes'. When set, time and once are ignored.",
+                        "description": "Fire once N minutes from now. Overrides time and once.",
                     },
                     "time": {
                         "type": "string",
-                        "description": "Time in HH:MM (24h) local time, e.g. '09:30'. Required when delay_minutes is not set.",
+                        "description": "Local HH:MM (24h). Required unless delay_minutes is set.",
                     },
                     "once": {
                         "type": "boolean",
-                        "description": "False (default) = repeat daily. True = fire only once; use ONLY when user explicitly requests a one-time reminder.",
+                        "description": "Default false = daily. True only on explicit one-time request.",
                     },
                 },
                 "required": ["message"],
@@ -971,13 +951,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_reminders",
-            "description": "List the user's active reminders with their numbers and reasons, so a specific one can be targeted with remove_reminder. Call this first if the user refers to a reminder by description rather than number. Set include_history=true to also see past (removed) reminders.",
+            "description": "List active reminders with numbers and reasons, so remove_reminder can target one. Call first when the user names a reminder by description rather than number.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "include_history": {
                         "type": "boolean",
-                        "description": "Also include past/removed reminders from the reminder history. Default false.",
+                        "description": "Also include past/removed reminders. Default false.",
                     },
                 },
                 "required": [],
@@ -1020,12 +1000,8 @@ TOOLS = [
         "function": {
             "name": "save_memory",
             "description": (
-                "Silently save anything worth remembering: facts the user shares about themselves, "
-                "decisions, observations, plans, or reflections. "
-                "Use type='profile' for stable facts about the user (name, goals, preferences), "
-                "'episodic' for time-bound events worth recalling for ~30 days, "
-                "'note' for general facts/plans/short info, 'journal' for reflections/day summaries. "
-                "Call this automatically whenever the user shares something meaningful — no need for an explicit command."
+                "Silently save anything worth remembering — facts, decisions, plans, reflections. "
+                "Call automatically whenever the user shares something meaningful; no command needed."
             ),
             "parameters": {
                 "type": "object",
@@ -1034,7 +1010,7 @@ TOOLS = [
                     "type": {
                         "type": "string",
                         "enum": ["profile", "episodic", "note", "journal"],
-                        "description": "'profile' for stable user facts, 'episodic' for time-bound events, 'note' for facts/plans, 'journal' for reflections.",
+                        "description": "profile=stable user facts; episodic=time-bound events (~30d); note=facts/plans; journal=reflections.",
                     },
                 },
                 "required": ["text"],
@@ -1062,18 +1038,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_tracker",
-            "description": "Create a new custom tracker for the user (e.g. steps, weight, mood, sleep). Use this when the user asks to track something new that doesn't exist yet.",
+            "description": "Create a new custom tracker (steps, weight, mood, sleep…) when the user asks to track something that doesn't exist yet.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Tracker name, letters only, lowercase (e.g. 'steps', 'weight', 'mood').",
-                    },
-                    "unit": {
-                        "type": "string",
-                        "description": "Optional unit label (e.g. 'kg', 'km', 'hours'). Leave empty if not applicable.",
-                    },
+                    "name": {"type": "string", "description": "Lowercase letters only, e.g. 'steps'."},
+                    "unit": {"type": "string", "description": "Optional unit, e.g. 'kg'. Empty if none."},
                 },
                 "required": ["name"],
             },
