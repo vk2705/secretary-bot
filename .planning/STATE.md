@@ -5,10 +5,10 @@ milestone_name: milestone
 current_phase: 01
 current_phase_name: debug-and-dry-run
 status: executing
-stopped_at: Plan 01-02 (/debug prompt) complete
-last_updated: "2026-08-14T00:00:00.000Z"
-last_activity: 2026-08-14
-last_activity_desc: Plan 01-02 (/debug prompt) executed and verified
+stopped_at: Plan 01-03 Tasks 1-2 complete (code + automated tests); Task 3 blocking human-verify checkpoint not yet run
+last_updated: "2026-08-26T00:00:00.000Z"
+last_activity: 2026-08-26
+last_activity_desc: Plan 01-03 Tasks 1-2 (extract remaining job bodies, DEBUG_JOBS registry, all seven /debug fire targets) executed and verified; DEBUG-01 not yet complete pending owner's live-bot verification
 progress:
   total_phases: 1
   completed_phases: 0
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-01)
 ## Current Position
 
 Phase: 01 (debug-and-dry-run) — EXECUTING
-Plan: 2 of 5 complete (01-01 tracer slice, 01-02 /debug prompt)
+Plan: 2 of 5 complete (01-01 tracer slice, 01-02 /debug prompt); 01-03 code+tests done, awaiting owner's manual verification (Task 3)
 Status: Executing Phase 01
-Last activity: 2026-08-14 — Plan 01-02 (/debug prompt) executed and verified
+Last activity: 2026-08-26 — Plan 01-03 Tasks 1-2 executed and verified; Task 3 (live-bot checkpoint) needs the owner
 
-Progress: [████░░░░░░] 40%
+Progress: [████░░░░░░] 40% (01-03 will complete once Task 3 is confirmed)
 
 ## Performance Metrics
 
@@ -99,6 +99,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-08-14T00:00:00.000Z
-Stopped at: Plan 01-02 (/debug prompt) complete; plan 01-03 (extract remaining job bodies, DEBUG_JOBS registry) is next
-Resume file: .planning/phases/01-debug-and-dry-run/01-03-PLAN.md
+Last session: 2026-08-26T00:00:00.000Z
+Stopped at: Plan 01-03 Tasks 1-2 (extraction + DEBUG_JOBS + all seven fire targets) complete and green; Task 3 is a blocking checkpoint:human-verify step that needs the owner to deploy and test against the live bot on Telegram (see 01-03-SUMMARY.md "Task 3: NOT RUN")
+Resume file: .planning/phases/01-debug-and-dry-run/01-03-PLAN.md (Task 3), then 01-04-PLAN.md
