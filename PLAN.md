@@ -241,6 +241,17 @@ Shows real-time rate limit status: messages used this hour, messages remaining, 
 - `_execute_tool add_task` returns a warning (not silent success) when `due_date` is invalid
 - `mute_status` in `/mystats` no longer has a spurious leading newline
 
+## Backlog (ideas — not yet implemented, pending discussion)
+
+### 59. Capture user complaints about bot mistakes 🔲 proposed
+When a user expresses dissatisfaction with something the bot did — e.g. they wrote in Russian but the bot answered in English, or gave wrong/ignored info — that complaint currently just sits in `history` and gets lost. It should be captured somewhere durable so recurring failure patterns (like language mismatches) can actually get reviewed and fixed instead of silently repeating.
+
+Open questions to settle before implementing:
+- How to detect "the user is complaining about the bot" — a dedicated tool the LLM calls when it recognizes dissatisfaction, vs. a keyword/heuristic pass over messages?
+- What to store per complaint: chat_id, timestamp, the user's message, what the bot did (e.g. last assistant reply + language used), and a rough category (e.g. `wrong_language`, `wrong_info`, `ignored_instruction`).
+- Where it lives — new SQLite table (e.g. `complaints`), similar to `notes`/`journal`.
+- Whether/how it surfaces — an admin command to review recent complaints (e.g. `/complaints`), or just a raw table queried manually for now.
+
 ## Implementation order
 
 1. [x] Write PLAN.md
