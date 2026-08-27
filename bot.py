@@ -2028,6 +2028,62 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
     )
 
 
+# ─────────────────────── tool selection ───────────────────────
+# The full TOOLS schema is ~2400 tokens and is re-sent on every request in the
+# tool-call loop, so a two-round turn pays for it twice. After round 1 the model
+# has already chosen its tools, and the only ones it still plausibly needs are
+# the ones it just called plus their natural follow-ups (get_reminders →
+# remove_reminder, create_tracker → log_tracker). Narrowing rounds 2+ to that
+# set leaves round 1 — the round that actually decides what gets called —
+# completely untouched.
+
+# Every tool that CHANGES something stays available in all rounds. An earlier
+# attempt narrowed rounds 2+ to the caller's own domain group, which broke a
+# real cross-domain request: "look at my reminders and create a task from them"
+# called get_reminders in round 1, found add_task withheld in round 2, and
+# duplicated the reminder instead — silently doing the wrong thing rather than
+# failing. A round-2 request is by nature the "now act on it" half of a turn,
+# so which action it needs cannot be predicted from what it read first.
+_WRITE_TOOLS = frozenset({
+    "add_task", "complete_task", "remove_task", "set_today_focus",
+    "add_reminder", "remove_reminder",
+    "log_tracker", "create_tracker",
+    "add_habit", "complete_habit", "remove_habit",
+    "add_note", "remove_note",
+    "add_journal_entry", "save_memory",
+    "set_timezone", "set_checkins", "set_persona", "set_honorific",
+    "get_current_time",  # resolving relative dates is a prerequisite for many writes
+})
+
+# Read-only lookups, by contrast, are what a first round is FOR. Once the model
+# has the data in the transcript it has no reason to re-fetch it, so these are
+# the ones worth withholding later — with the group rule below keeping a
+# read-then-read chain (get_reminders → get_reminders(include_history)) intact.
+_TOOL_GROUPS = (
+    {"get_tasks", "add_task", "complete_task", "remove_task", "set_today_focus"},
+    {"get_reminders", "add_reminder", "remove_reminder"},
+    {"get_trackers", "create_tracker", "log_tracker"},
+    {"get_habits", "add_habit", "complete_habit", "remove_habit"},
+    {"get_notes", "add_note", "remove_note"},
+    {"get_journal", "add_journal_entry"},
+)
+
+
+def _tools_for_round(called: set[str]) -> list:
+    """Return the tool schemas to send once the model has already called
+    `called`. Keeps every write tool plus the read tools it has shown interest
+    in; falls back to the full list when nothing is known, so a caller that
+    somehow reaches a later round with no recorded calls is never left with
+    fewer tools than it started with."""
+    if not called:
+        return TOOLS
+    keep = set(called) | _WRITE_TOOLS
+    for group in _TOOL_GROUPS:
+        if called & group:
+            keep |= group
+    return [t for t in TOOLS if t["function"]["name"] in keep]
+
+
 # ─────────────────────── chat ───────────────────────
 
 async def chat(chat_id: int, user_message: str, system: str = None, touch_activity: bool = True) -> str:
@@ -2053,14 +2109,19 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
     reply = None
     try:
         # Tool call loop — up to 5 rounds
+        called_tools: set[str] = set()
         for _round in range(5):
+            # Round 0 always offers the full schema so the model's initial
+            # choice is never constrained; later rounds narrow to what it has
+            # actually reached for, which is where the duplicate cost is.
+            round_tools = TOOLS if _round == 0 else _tools_for_round(called_tools)
             try:
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=600,
                     temperature=0.7,
-                    tools=TOOLS,
+                    tools=round_tools,
                     tool_choice="auto",
                 )
             except Exception as tool_err:
@@ -2088,6 +2149,7 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     args = {}
+                called_tools.add(tc.function.name)
                 result = await _execute_tool(chat_id, tc.function.name, args)
                 logger.info("Tool %s(%s) → %s", tc.function.name, args, result)
                 messages.append({

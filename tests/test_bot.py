@@ -3877,3 +3877,61 @@ class TestLinkCmd:
         with bot._db() as con:
             code = con.execute("SELECT code FROM mcp_link_codes").fetchone()["code"]
         assert code in reply
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12: Per-round tool narrowing (_tools_for_round)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestToolsForRound:
+    """The full TOOLS schema is re-sent on every round of the tool-call loop, so
+    a two-round turn pays for it twice. `_tools_for_round` trims rounds 2+ to
+    what the model still plausibly needs."""
+
+    def _names(self, called):
+        return {t["function"]["name"] for t in bot._tools_for_round(called)}
+
+    def test_empty_called_set_falls_back_to_full_list(self):
+        # A later round with nothing recorded must never be handed FEWER tools
+        # than round 1 offered.
+        assert bot._tools_for_round(set()) is bot.TOOLS
+
+    def test_every_write_tool_survives_narrowing(self):
+        # Regression guard for the bug this design was rewritten to fix: an
+        # earlier version narrowed to the caller's own domain group, so "look at
+        # my reminders and create a task from them" reached round 2 with
+        # add_task withheld and duplicated the reminder instead — silently doing
+        # the wrong thing rather than failing. A round-2 request is the "now act
+        # on it" half of a turn, and which action it needs cannot be predicted
+        # from what it read first, so every write tool stays available.
+        for called in ({"get_reminders"}, {"get_tasks"}, {"search"},
+                       {"get_streak"}, {"get_notes"}, {"get_journal"}):
+            missing = bot._WRITE_TOOLS - self._names(called)
+            assert not missing, f"after {called}, write tools withheld: {missing}"
+
+    def test_add_task_available_after_reading_reminders(self):
+        # The exact cross-domain case that regressed, pinned on its own.
+        assert "add_task" in self._names({"get_reminders"})
+
+    def test_called_tool_is_always_kept(self):
+        for name in ("search", "get_streak", "get_journal"):
+            assert name in self._names({name})
+
+    def test_read_only_tools_outside_the_group_are_dropped(self):
+        # The actual saving: lookups the model has shown no interest in.
+        names = self._names({"get_tasks"})
+        assert "get_habits" not in names
+        assert "get_notes" not in names
+        # ...while its own group's reads stay reachable.
+        assert "get_tasks" in names
+
+    def test_narrowed_list_is_a_strict_subset_of_tools(self):
+        all_names = {t["function"]["name"] for t in bot.TOOLS}
+        got = self._names({"get_tasks"})
+        assert got < all_names
+
+    def test_group_and_write_tool_names_are_real(self):
+        # A typo in a group would silently withhold a tool forever.
+        all_names = {t["function"]["name"] for t in bot.TOOLS}
+        declared = set(bot._WRITE_TOOLS).union(*bot._TOOL_GROUPS)
+        assert declared <= all_names, declared - all_names
