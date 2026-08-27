@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import sqlite3
+import secrets
 import uuid
 import calendar
 import tempfile
@@ -157,11 +158,77 @@ def _init_db() -> None:
                 created_at     TEXT    NOT NULL,
                 removed_at     TEXT
             );
+            -- One-time codes proving a Telegram account requested an MCP Google link
+            -- (Milestone B / AUTH-02). 10-minute TTL, single-use, consumed by mcp_server.py.
+            CREATE TABLE IF NOT EXISTS mcp_link_codes (
+                code       TEXT PRIMARY KEY,
+                chat_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at    TEXT
+            );
+            -- Verified Google identity -> Telegram chat_id, established once via
+            -- mcp_link_codes. Read/written by mcp_server.py's OAuth provider.
+            CREATE TABLE IF NOT EXISTS mcp_identity (
+                google_sub TEXT PRIMARY KEY,
+                email      TEXT,
+                chat_id    TEXT NOT NULL,
+                linked_at  TEXT NOT NULL
+            );
+            -- Dynamically registered OAuth clients (claude.ai etc.) against our
+            -- own thin Authorization Server. Owned entirely by mcp_server.py.
+            CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+                client_id  TEXT PRIMARY KEY,
+                info_json  TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            -- In-flight claude.ai /authorize requests, parked while we round-trip
+            -- through Google to establish identity. Single-use, short TTL.
+            CREATE TABLE IF NOT EXISTS mcp_pending_authorize (
+                state                 TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                scopes                TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                redirect_uri_explicit INTEGER NOT NULL,
+                resource              TEXT,
+                client_state          TEXT,
+                created_at            TEXT NOT NULL,
+                expires_at            REAL NOT NULL
+            );
+            -- Our own short-lived authorization codes, minted after a completed
+            -- Google login resolves to a bound chat_id.
+            CREATE TABLE IF NOT EXISTS mcp_auth_codes (
+                code                  TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                chat_id               TEXT NOT NULL,
+                scopes                TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                redirect_uri_explicit INTEGER NOT NULL,
+                resource              TEXT,
+                expires_at            REAL NOT NULL,
+                created_at            TEXT NOT NULL
+            );
+            -- Issued access/refresh tokens, stored as sha256 hashes only —
+            -- never the plaintext token, mirroring how api_keys are never
+            -- stored in plaintext.
+            CREATE TABLE IF NOT EXISTS mcp_tokens (
+                token_hash TEXT PRIMARY KEY,
+                kind       TEXT NOT NULL,   -- 'access' | 'refresh'
+                client_id  TEXT NOT NULL,
+                chat_id    TEXT NOT NULL,
+                scopes     TEXT NOT NULL,
+                expires_at REAL,            -- NULL = no expiry (refresh tokens)
+                created_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_notes_chat        ON notes(chat_id);
             CREATE INDEX IF NOT EXISTS idx_journal_chat      ON journal(chat_id);
             CREATE INDEX IF NOT EXISTS idx_profile_chat      ON profile_memory(chat_id);
             CREATE INDEX IF NOT EXISTS idx_episodic_chat     ON episodic_memory(chat_id);
             CREATE INDEX IF NOT EXISTS idx_reminder_log_chat ON reminder_log(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_mcp_identity_chat ON mcp_identity(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_mcp_tokens_chat   ON mcp_tokens(chat_id);
         """)
     # one-time migration of notes/journal still living in state.json
     if os.path.exists(STATE_FILE):
@@ -206,6 +273,23 @@ def _init_db() -> None:
                     json.dump(s, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("Key migration failed: %s", e)
+
+
+# ── MCP link-code helpers (Milestone B / AUTH-02) ──
+
+def db_create_link_code(chat_id: str, ttl_minutes: int = 10) -> str:
+    """Create a one-time code proving this Telegram account requested an MCP
+    Google link. Consumed by mcp_server.py's OAuth provider, which owns the
+    verification and (google_sub -> chat_id) binding — this only proves the
+    Telegram side of the handshake."""
+    code = secrets.token_hex(4)
+    now = datetime.utcnow()
+    with _db() as con:
+        con.execute(
+            "INSERT INTO mcp_link_codes(code, chat_id, created_at, expires_at) VALUES(?,?,?,?)",
+            (code, str(chat_id), now.isoformat(), (now + timedelta(minutes=ttl_minutes)).isoformat())
+        )
+    return code
 
 
 # ── notes helpers ──
@@ -496,6 +580,12 @@ def _new_user(**overrides) -> dict:
         "pending_checkin": None,
         "debug_clock": "",
         "debug_clock_expires": "",
+        # Persona is a Milestone A / Phase 4 concept, landed early and minimally
+        # (see project memory: onboarding + persona, Milestone B side-quest).
+        # Full Phase 4 (pressure dial, never-do rules, drift resistance) is not
+        # this — just a character voice, always on, defaulting to Jeeves.
+        "persona": "Jeeves",
+        "honorific": "",
     }
     base.update(overrides)
     return base
@@ -568,6 +658,14 @@ def get_user(chat_id: int) -> dict:
     if db_clock_expires:
         u["debug_clock_expires"] = db_clock_expires
     return u
+
+
+def _is_new_user(user: dict) -> bool:
+    """True for an account that hasn't meaningfully engaged yet — no context
+    set, no tasks, at most one recorded activity day. Shared by start()'s
+    onboarding message and build_system_prompt()'s honorific-ask instruction,
+    so the two can never silently diverge on what "new" means."""
+    return not user["context"] and not user["tasks"] and len(user.get("activity_days", [])) <= 1
 
 
 # ─────────────────────── rate limiting ───────────────────────
@@ -679,16 +777,15 @@ TOOLS = [
         "function": {
             "name": "set_timezone",
             "description": (
-                "Save the user's timezone. Always convert city/country names to a valid IANA "
-                "timezone name (e.g. 'Jerusalem' → 'Asia/Jerusalem', 'Moscow' → 'Europe/Moscow', "
-                "'New York' → 'America/New_York'). Also accepts UTC offsets like 'UTC+3'."
+                "Save the user's timezone. Always convert city/country names to IANA form "
+                "('Moscow' → 'Europe/Moscow'). Also accepts offsets like 'UTC+3'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "timezone": {
                         "type": "string",
-                        "description": "IANA timezone name (e.g. 'Asia/Jerusalem') or UTC offset (e.g. 'UTC+3').",
+                        "description": "IANA name (e.g. 'Asia/Jerusalem') or offset (e.g. 'UTC+3').",
                     }
                 },
                 "required": ["timezone"],
@@ -700,29 +797,58 @@ TOOLS = [
         "function": {
             "name": "set_checkins",
             "description": (
-                "Enable or disable daily morning/evening check-ins and alerts for the user. "
-                "Call with enabled=true when the user asks for morning/evening check-ins, "
-                "daily plans, accountability prompts, or 'subscribe'. "
-                "Call with enabled=false to stop them. "
-                "Optionally set morning/evening times (HH:MM 24h)."
+                "Enable/disable daily morning+evening check-ins and alerts. enabled=true for "
+                "check-ins, daily plans, accountability prompts or 'subscribe'; false to stop."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "True to enable daily check-ins, false to disable.",
-                    },
-                    "morning": {
-                        "type": "string",
-                        "description": "Morning check-in time HH:MM (optional, default 08:00).",
-                    },
-                    "evening": {
-                        "type": "string",
-                        "description": "Evening check-in time HH:MM (optional, default 21:00).",
-                    },
+                    "enabled": {"type": "boolean", "description": "True to enable, false to disable."},
+                    "morning": {"type": "string", "description": "HH:MM, default 08:00."},
+                    "evening": {"type": "string", "description": "HH:MM, default 21:00."},
                 },
                 "required": ["enabled"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_persona",
+            "description": (
+                "Change the voice the bot speaks in — 'talk like Yoda', 'stop the butler thing', "
+                "'talk normally'. Pass the character as given, or 'plain' for no persona. "
+                "All later messages adopt that voice while staying substantively helpful."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "character": {
+                        "type": "string",
+                        "description": "Character/style name or short description, e.g. 'Yoda', 'Jeeves', 'plain'.",
+                    }
+                },
+                "required": ["character"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_honorific",
+            "description": (
+                "Save how the user wants to be addressed ('call me Sir', 'just use my name, Alex'). "
+                "Pass the exact form, or an empty string to drop it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "form": {
+                        "type": "string",
+                        "description": "e.g. 'Sir', 'Miss', 'Alex'. Empty string clears it.",
+                    }
+                },
+                "required": ["form"],
             },
         },
     },
@@ -792,13 +918,9 @@ TOOLS = [
         "function": {
             "name": "add_reminder",
             "description": (
-                "Schedule a single reminder. For relative time ('in 5 minutes', 'in 2 hours') use "
-                "delay_minutes — this always fires once. For a specific clock time use time. "
-                "Clock-time reminders default to daily recurring (once=false). "
-                "Set once=true ONLY when the user explicitly says 'one time', 'just today', or similar. "
-                "When the user lists several times in one message (e.g. 'at 13:30, 17:30 and 21:30'), "
-                "call this tool once per time and use the SAME once value for all of them — never mix "
-                "daily and one-time within a single request."
+                "Schedule one reminder. Relative ('in 5 minutes') → delay_minutes, always one-off. "
+                "Clock time → time, daily unless the user explicitly says one-time. "
+                "For several times in one message, call once per time with the SAME once value."
             ),
             "parameters": {
                 "type": "object",
@@ -806,19 +928,19 @@ TOOLS = [
                     "message": {"type": "string", "description": "The reminder message."},
                     "reason": {
                         "type": "string",
-                        "description": "Why this reminder matters to the user, if known from context or memory (e.g. 'to keep your leg mobile', 'you wanted to learn Kubernetes for work'). Included when the reminder fires. Omit if unknown — don't invent one.",
+                        "description": "Why it matters to the user, if known (e.g. 'to keep your leg mobile'). Shown when it fires. Omit rather than invent.",
                     },
                     "delay_minutes": {
                         "type": "integer",
-                        "description": "Fire once after this many minutes from now. Use for relative requests like 'in 5 minutes'. When set, time and once are ignored.",
+                        "description": "Fire once N minutes from now. Overrides time and once.",
                     },
                     "time": {
                         "type": "string",
-                        "description": "Time in HH:MM (24h) local time, e.g. '09:30'. Required when delay_minutes is not set.",
+                        "description": "Local HH:MM (24h). Required unless delay_minutes is set.",
                     },
                     "once": {
                         "type": "boolean",
-                        "description": "False (default) = repeat daily. True = fire only once; use ONLY when user explicitly requests a one-time reminder.",
+                        "description": "Default false = daily. True only on explicit one-time request.",
                     },
                 },
                 "required": ["message"],
@@ -829,13 +951,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_reminders",
-            "description": "List the user's active reminders with their numbers and reasons, so a specific one can be targeted with remove_reminder. Call this first if the user refers to a reminder by description rather than number. Set include_history=true to also see past (removed) reminders.",
+            "description": "List active reminders with numbers and reasons, so remove_reminder can target one. Call first when the user names a reminder by description rather than number.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "include_history": {
                         "type": "boolean",
-                        "description": "Also include past/removed reminders from the reminder history. Default false.",
+                        "description": "Also include past/removed reminders. Default false.",
                     },
                 },
                 "required": [],
@@ -878,12 +1000,8 @@ TOOLS = [
         "function": {
             "name": "save_memory",
             "description": (
-                "Silently save anything worth remembering: facts the user shares about themselves, "
-                "decisions, observations, plans, or reflections. "
-                "Use type='profile' for stable facts about the user (name, goals, preferences), "
-                "'episodic' for time-bound events worth recalling for ~30 days, "
-                "'note' for general facts/plans/short info, 'journal' for reflections/day summaries. "
-                "Call this automatically whenever the user shares something meaningful — no need for an explicit command."
+                "Silently save anything worth remembering — facts, decisions, plans, reflections. "
+                "Call automatically whenever the user shares something meaningful; no command needed."
             ),
             "parameters": {
                 "type": "object",
@@ -892,7 +1010,7 @@ TOOLS = [
                     "type": {
                         "type": "string",
                         "enum": ["profile", "episodic", "note", "journal"],
-                        "description": "'profile' for stable user facts, 'episodic' for time-bound events, 'note' for facts/plans, 'journal' for reflections.",
+                        "description": "profile=stable user facts; episodic=time-bound events (~30d); note=facts/plans; journal=reflections.",
                     },
                 },
                 "required": ["text"],
@@ -920,18 +1038,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_tracker",
-            "description": "Create a new custom tracker for the user (e.g. steps, weight, mood, sleep). Use this when the user asks to track something new that doesn't exist yet.",
+            "description": "Create a new custom tracker (steps, weight, mood, sleep…) when the user asks to track something that doesn't exist yet.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Tracker name, letters only, lowercase (e.g. 'steps', 'weight', 'mood').",
-                    },
-                    "unit": {
-                        "type": "string",
-                        "description": "Optional unit label (e.g. 'kg', 'km', 'hours'). Leave empty if not applicable.",
-                    },
+                    "name": {"type": "string", "description": "Lowercase letters only, e.g. 'steps'."},
+                    "unit": {"type": "string", "description": "Optional unit, e.g. 'kg'. Empty if none."},
                 },
                 "required": ["name"],
             },
@@ -1151,6 +1263,20 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 "timezone": tz,
             }
         return {"success": True, "enabled": False}
+
+    if name == "set_persona":
+        character = (args.get("character") or "").strip()
+        if not character:
+            return {"error": "character is required"}
+        user["persona"] = character
+        save_state(state)
+        return {"success": True, "persona": character}
+
+    if name == "set_honorific":
+        form = (args.get("form") or "").strip()
+        user["honorific"] = form
+        save_state(state)
+        return {"success": True, "honorific": form}
 
     if name == "get_current_time":
         try:
@@ -1804,6 +1930,26 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         if lang else ""
     )
 
+    _mcp_domain = os.environ.get("MCP_REMOTE_DOMAIN")
+    if _mcp_domain:
+        connect_claude_instruction = (
+            "10b. When asked how to connect you to Claude (Claude Desktop, Claude Code, or claude.ai), "
+            "explain both steps, in order:\n"
+            "  1) In claude.ai: Settings → Connectors → Add custom connector, paste this URL exactly: "
+            f"https://{_mcp_domain}/mcp — no client ID or secret needed, it registers itself. Click Connect.\n"
+            "  2) That opens Google sign-in. Before or during that, send /link here in Telegram, tap the "
+            "link it replies with, and sign in with the *same* Google account — that's what binds Google "
+            "to this Telegram account (one-time, expires in 10 minutes). If they connect in claude.ai "
+            "before ever running /link, they'll get a clear error telling them to /link first and retry.\n"
+            "  After both are done, Claude can access their tasks/habits/notes/journal directly.\n"
+        )
+    else:
+        connect_claude_instruction = (
+            "10b. If asked how to connect you to Claude: the remote MCP server isn't configured on this "
+            "deployment right now, so only Claude Desktop/Code (local, stdio) can connect, not claude.ai. "
+            "Say so plainly rather than describing a link that won't work.\n"
+        )
+
     tz_str = user.get("timezone", "UTC")
     try:
         from zoneinfo import ZoneInfo as _ZI
@@ -1816,9 +1962,45 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         _utc_label = tz_str
     tz_section = f"\nThe user's timezone is {tz_str} ({_utc_label}).\n"
 
+    # Persona: Milestone A / Phase 4 concept, landed early and minimally as a
+    # user request during Milestone B — see project memory. This is deliberately
+    # NOT the full Phase 4 (no pressure dial, no never-do rules, no drift-testing
+    # across 50+ turns) — just a character voice, always on, default Jeeves.
+    # Set only via set_persona/set_honorific (talking to the bot), never a
+    # settings screen or slash command, matching PROJECT.md's stated constraint.
+    persona = (user.get("persona") or "Jeeves").strip()
+    honorific = (user.get("honorific") or "").strip()
+    if persona.lower() in ("plain", "none", "off"):
+        persona_instruction = ""
+    else:
+        persona_instruction = (
+            f"Adopt the voice of {persona} in *how* you phrase replies — word choice, tone, small "
+            "mannerisms. This is decoration on your phrasing only.\n"
+        )
+    if honorific:
+        honorific_instruction = (
+            f'Address the user as "{honorific}" where it fits naturally, not forced into every sentence.\n'
+        )
+    elif _is_new_user(user):
+        # /start's onboarding text asks this too, but plenty of users never
+        # type /start — they just start talking. Without this, a brand-new
+        # user chatting freely would never get asked at all.
+        honorific_instruction = (
+            "This user hasn't said how they'd like to be addressed yet. Early in this "
+            "conversation — within your first reply or two, not necessarily the very first — "
+            "ask naturally (e.g. 'and how should I address you?'), then call set_honorific once "
+            "they answer. One question, not an interrogation; if they ignore it, drop it.\n"
+        )
+    else:
+        honorific_instruction = ""
+
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
+        "0. Literal requests always win over voice: an exact word, an exact number, an exact "
+        "format, a direct factual answer — output exactly that, nothing added, nothing in "
+        "character. Persona is for ordinary conversation, never for a literal request.\n"
+        f"{persona_instruction}{honorific_instruction}"
         "1. Be a helpful, direct assistant.\n"
         "2. Proactively hold the user accountable for their goals and tasks.\n"
         "3. During check-ins, ask about specific tasks from their task list.\n"
@@ -1833,6 +2015,7 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "call create_tracker first, then log_tracker to log the initial value if provided.\n"
         "10. When asked what you can do or how to use you, explain concisely: tasks, trackers, "
         "reminders, habits, journal, check-ins, and that the user can speak naturally.\n"
+        f"{connect_claude_instruction}"
         "11. Silently call save_memory whenever the user shares a personal fact, decision, plan, "
         "or reflection that is worth remembering for future conversations. "
         "Choose the right type: 'profile' for permanent facts about the user (name, job, allergies, preferences), "
@@ -1843,6 +2026,62 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         f"{tz_section}{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
     )
+
+
+# ─────────────────────── tool selection ───────────────────────
+# The full TOOLS schema is ~2400 tokens and is re-sent on every request in the
+# tool-call loop, so a two-round turn pays for it twice. After round 1 the model
+# has already chosen its tools, and the only ones it still plausibly needs are
+# the ones it just called plus their natural follow-ups (get_reminders →
+# remove_reminder, create_tracker → log_tracker). Narrowing rounds 2+ to that
+# set leaves round 1 — the round that actually decides what gets called —
+# completely untouched.
+
+# Every tool that CHANGES something stays available in all rounds. An earlier
+# attempt narrowed rounds 2+ to the caller's own domain group, which broke a
+# real cross-domain request: "look at my reminders and create a task from them"
+# called get_reminders in round 1, found add_task withheld in round 2, and
+# duplicated the reminder instead — silently doing the wrong thing rather than
+# failing. A round-2 request is by nature the "now act on it" half of a turn,
+# so which action it needs cannot be predicted from what it read first.
+_WRITE_TOOLS = frozenset({
+    "add_task", "complete_task", "remove_task", "set_today_focus",
+    "add_reminder", "remove_reminder",
+    "log_tracker", "create_tracker",
+    "add_habit", "complete_habit", "remove_habit",
+    "add_note", "remove_note",
+    "add_journal_entry", "save_memory",
+    "set_timezone", "set_checkins", "set_persona", "set_honorific",
+    "get_current_time",  # resolving relative dates is a prerequisite for many writes
+})
+
+# Read-only lookups, by contrast, are what a first round is FOR. Once the model
+# has the data in the transcript it has no reason to re-fetch it, so these are
+# the ones worth withholding later — with the group rule below keeping a
+# read-then-read chain (get_reminders → get_reminders(include_history)) intact.
+_TOOL_GROUPS = (
+    {"get_tasks", "add_task", "complete_task", "remove_task", "set_today_focus"},
+    {"get_reminders", "add_reminder", "remove_reminder"},
+    {"get_trackers", "create_tracker", "log_tracker"},
+    {"get_habits", "add_habit", "complete_habit", "remove_habit"},
+    {"get_notes", "add_note", "remove_note"},
+    {"get_journal", "add_journal_entry"},
+)
+
+
+def _tools_for_round(called: set[str]) -> list:
+    """Return the tool schemas to send once the model has already called
+    `called`. Keeps every write tool plus the read tools it has shown interest
+    in; falls back to the full list when nothing is known, so a caller that
+    somehow reaches a later round with no recorded calls is never left with
+    fewer tools than it started with."""
+    if not called:
+        return TOOLS
+    keep = set(called) | _WRITE_TOOLS
+    for group in _TOOL_GROUPS:
+        if called & group:
+            keep |= group
+    return [t for t in TOOLS if t["function"]["name"] in keep]
 
 
 # ─────────────────────── chat ───────────────────────
@@ -1870,14 +2109,19 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
     reply = None
     try:
         # Tool call loop — up to 5 rounds
+        called_tools: set[str] = set()
         for _round in range(5):
+            # Round 0 always offers the full schema so the model's initial
+            # choice is never constrained; later rounds narrow to what it has
+            # actually reached for, which is where the duplicate cost is.
+            round_tools = TOOLS if _round == 0 else _tools_for_round(called_tools)
             try:
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=600,
                     temperature=0.7,
-                    tools=TOOLS,
+                    tools=round_tools,
                     tool_choice="auto",
                 )
             except Exception as tool_err:
@@ -1905,6 +2149,7 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     args = {}
+                called_tools.add(tc.function.name)
                 result = await _execute_tool(chat_id, tc.function.name, args)
                 logger.info("Tool %s(%s) → %s", tc.function.name, args, result)
                 messages.append({
@@ -2571,6 +2816,7 @@ _HELP_TEXT = (
     "  /pomodoro [min]  /export  /clear\n"
     "  /reset  — wipe all data\n"
     "  /feedback <text>  — send feedback to bot admin\n"
+    "  /link  — connect this account to Claude via Google sign-in\n"
     "  (Send export JSON to import)\n"
 )
 
@@ -2578,31 +2824,37 @@ _HELP_TEXT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     save_state(state)
-    is_new = not user["context"] and not user["tasks"] and len(user.get("activity_days", [])) <= 1
+    is_new = _is_new_user(user)
     if is_new:
         await update.message.reply_text(
-            "👋 Welcome to Secretary Bot!\n\n"
-            "I'm your AI-powered personal secretary and accountability coach. "
-            "You can talk to me in plain language — I'll understand and act.\n\n"
-            "🧠 What I can do:\n"
+            "Good day. Jeeves, at your service — your personal secretary and accountability "
+            "coach, for as long as you'll have me. You may speak to me in plain language "
+            "throughout; I shall understand and act accordingly.\n\n"
+            "🧠 A brief accounting of my duties:\n"
             "  • Tasks — add, complete, set deadlines, tag with #hashtags\n"
-            "  • Trackers — create and log anything: weight, steps, mood, sleep…\n"
+            "  • Trackers — anything you'd care to log: weight, steps, mood, sleep…\n"
             "  • Reminders — daily or one-time, in any language\n"
-            "  • Habits — track daily habits with streaks\n"
-            "  • Journal — save reflections, get AI insights\n"
-            "  • Check-ins — morning/evening accountability messages\n"
-            "  • …and more — just ask!\n\n"
-            "Let's get set up in 4 steps:\n\n"
-            "1️⃣ Tell me about yourself:\n"
+            "  • Habits — tracked, with streaks\n"
+            "  • Journal — reflections, with a considered word or two in reply\n"
+            "  • Check-ins — a morning and evening word, if you subscribe\n"
+            "  • …and rather more besides — simply ask\n\n"
+            "Before we begin — how shall I address you? \"Sir\", \"Madam\", your given name, "
+            "or something else entirely — your call. And should this manner of speech not suit, "
+            "say so; I can just as easily be Yoda, or considerably less formal company. "
+            "Either preference, once stated, holds until you say otherwise.\n\n"
+            "Four small matters, whenever convenient:\n\n"
+            "1️⃣ A word about yourself:\n"
             "   /setcontext I'm a developer working on fitness and learning Spanish\n\n"
-            "2️⃣ Set your timezone — easiest: 📍 share your location\n"
-            "   (tap the 📎 attachment icon → Location)\n"
-            "   Or: /settimezone Asia/Jerusalem\n\n"
-            "3️⃣ Add your first goal:\n"
+            "2️⃣ Your timezone — simplest by 📍 sharing your location\n"
+            "   (the 📎 attachment icon → Location)\n"
+            "   or: /settimezone Asia/Jerusalem\n\n"
+            "3️⃣ A first goal:\n"
             "   /addtask Exercise 3× per week\n\n"
-            "4️⃣ Enable daily check-ins:\n"
+            "4️⃣ Daily check-ins, should you want them:\n"
             "   /subscribe\n\n"
-            "Or just start chatting — say something like:\n"
+            "And should you wish Claude to see this account's data directly, /link will "
+            "explain how.\n\n"
+            "Or simply begin — try:\n"
             "  \"Add a tracker for my daily steps\"\n"
             "  \"Remind me to drink water every day at 10:00\"\n"
             "  \"What time is it?\""
@@ -3165,6 +3417,27 @@ async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Feedback send failed: %s", e)
         await update.message.reply_text("⚠️ Could not deliver feedback right now.")
+
+
+async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/link — one-time code + URL to connect this Telegram account to the
+    remote MCP server via Google sign-in (Milestone B / AUTH-01/02)."""
+    chat_id = update.effective_chat.id
+    code = db_create_link_code(chat_id)
+    domain = os.environ.get("MCP_REMOTE_DOMAIN")
+    if domain:
+        url = f"https://{domain}/link/{code}"
+        await update.message.reply_text(
+            "🔗 Tap to connect Claude to your data:\n"
+            f"{url}\n\n"
+            "Signs you in with Google. One-time use, expires in 10 minutes."
+        )
+    else:
+        await update.message.reply_text(
+            f"🔗 Your one-time link code: {code}\n"
+            "(MCP_REMOTE_DOMAIN isn't set for this bot, so no direct link — "
+            "expires in 10 minutes.)"
+        )
 
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4585,6 +4858,7 @@ def main():
     app.add_handler(CommandHandler("compress", compress_history))
     app.add_handler(CommandHandler("time", time_cmd))
     app.add_handler(CommandHandler("feedback", feedback_cmd))
+    app.add_handler(CommandHandler("link", link_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("duedate", duedate_cmd))
     app.add_handler(CommandHandler("extend", extend_cmd))

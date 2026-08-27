@@ -4,3 +4,5 @@ tzdata
 mcp>=1.0.0
 timezonefinder>=6.0.0
 cryptography>=42.0.0
+httpx>=0.28.0
+PyJWT>=2.13.0

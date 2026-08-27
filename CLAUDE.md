@@ -41,6 +41,57 @@ export $(grep -v '^#' env | xargs) && python -m pytest tests/test_bot.py -v -k n
 
 The test file stubs out `telegram`, `telegram.ext`, and `timezonefinder` at import time so `bot.py` can be imported without a running Telegram app. `bot.STATE_FILE` and `bot.DB_FILE` are both redirected to temp files at import time (so the suite never touches the real `state.json`/`bot_memory.db`), and each test additionally gets a fresh SQLite temp file via an autouse `isolate_db` fixture.
 
+## `console.py` — Telegram-free back door
+
+A local debug console that drives `bot.py`'s **real** handlers without Telegram,
+against a **throwaway sandbox** copy of the data. Built for walking through a
+brand-new user's first session (onboarding, free-text conversation) repeatedly.
+
+```bash
+sandbox              # ~/bin/sandbox — sources env, uses the venv, works from any cwd
+
+sandbox --keep             # reuse sandbox instead of wiping it
+sandbox --chat-id 424242   # pretend to be another user
+sandbox --owner            # this chat_id becomes MY_CHAT_ID → /debug, /adminstats work
+sandbox --seed-from-live   # copy real state.json/bot_memory.db into a fresh sandbox
+sandbox -v                 # show INFO logging (tool calls, LLM HTTP)
+
+# equivalent, from the repo:
+export $(grep -v '^#' env | xargs) && python3 console.py
+```
+
+At the prompt, `/command` runs the real command handler, anything else goes
+through `chat()` to the **real LLM** with full tool-use, and `:`-prefixed words
+are console meta-commands (`:help`, `:state`, `:jobs`, `:commands`, `:reset`,
+`:chat <id>`, `:verbose`, `:quit`).
+
+How it stays honest and contained:
+
+- **Sandbox by default** — `bot.STATE_FILE`/`bot.DB_FILE` are repointed at
+  `/tmp/secretary-bot-console/` *before* `import bot`, because `state =
+  load_state()` runs at bot.py's module bottom. The real `state.json` /
+  `bot_memory.db` are never opened. Deleting the sandbox dir gives you a virgin
+  user; `--keep` preserves it between runs.
+- **Runs under the venv, always** — dependencies live in `venv/`, but a bare
+  `python3 console.py` picks up `/usr/bin/python3` (no `openai`) and dies at
+  bot.py's import line. `_reexec_in_venv()` transparently `os.execv`s into
+  `venv/bin/python3` when started outside a virtualenv, guarded against
+  looping; `~/bin/sandbox` names that interpreter directly, the way
+  `start_bot.sh` does.
+- **Zero changes to `bot.py`** — the console is purely additive. It stubs
+  `telegram`/`timezonefinder` and fakes `Update`/`context` the same way
+  `tests/test_bot.py` does, deliberately keeping that trick recognisably
+  identical in both places.
+- **Command list is derived, not copied** — `_discover_commands()` parses
+  `main()`'s `CommandHandler(...)` registrations out of bot.py's source with
+  `ast`, so the console can never drift out of sync with the real command set.
+  Unknown `/commands` fall through to `handle_custom_command`, matching
+  `main()`'s handler precedence.
+- **Jobs are recorded, not run** — `_FakeJobQueue` logs what `schedule_user_*`
+  tried to schedule (inspect with `:jobs`) instead of firing it. To actually
+  execute a job body, use the owner-gated `/debug fire <job>`, which works here
+  under `--owner`.
+
 ## Environment (`env` file)
 
 | Variable | Required | Purpose |
@@ -248,6 +299,14 @@ A separate MCP (Model Context Protocol) server exposing a user's data as tools f
 
 Two transports:
 - **stdio** (default, `python3 mcp_server.py`) — for Claude Desktop/Code.
-- **remote HTTP** (`MCP_TRANSPORT=remote`) — serves `streamable-http` on `MCP_REMOTE_HOST:MCP_REMOTE_PORT` (default `127.0.0.1:8545`) so claude.ai's web app can connect, since it can't reach local stdio servers. This process does **not** terminate TLS itself — nginx owns port 443 on the host (it also fronts an unrelated Alteon MCP server on the same box, port-routed by hostname) and reverse-proxies `https://mcp-sbot.alteon.help` to this port; see `/etc/nginx/conf.d/mcp-sbot.alteon.help.conf`. Managed as systemd unit `secretary-mcp.service` (`EnvironmentFile=mcp_remote.env`, `Restart=on-failure`). Config via `mcp_remote.env` (gitignored): `MCP_REMOTE_TOKEN`, `MCP_REMOTE_DOMAIN`, `MCP_REMOTE_HOST`, `MCP_REMOTE_PORT`. Auth is a `?key=` query param (`_TokenAuthMiddleware`), not a header, because claude.ai's custom-connector dialog only accepts a URL. `MCP_REMOTE_DOMAIN` also sets the allowed `Host` header via `TransportSecuritySettings` to block DNS-rebinding — it must match the public hostname nginx forwards (`Host: $host`), not the internal port.
+- **remote HTTP** (`MCP_TRANSPORT=remote`) — serves `streamable-http` on `MCP_REMOTE_HOST:MCP_REMOTE_PORT` (default `127.0.0.1:8545`) so claude.ai's web app can connect, since it can't reach local stdio servers. This process does **not** terminate TLS itself — nginx owns port 443 on the host (it also fronts an unrelated Alteon MCP server on the same box, port-routed by hostname) and reverse-proxies `https://mcp-sbot.alteon.help` to this port; see `/etc/nginx/conf.d/mcp-sbot.alteon.help.conf`. Managed as systemd unit `secretary-mcp.service` (`EnvironmentFile=mcp_remote.env`, `Restart=on-failure`). Config via `mcp_remote.env` (gitignored): `MCP_REMOTE_DOMAIN`, `MCP_REMOTE_HOST`, `MCP_REMOTE_PORT`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`. `MCP_REMOTE_DOMAIN` also sets the allowed `Host` header via `TransportSecuritySettings` to block DNS-rebinding — it must match the public hostname nginx forwards (`Host: $host`), not the internal port.
+
+  **Auth (Milestone B, AUTH-01/02)**: replaced the old `?key=` shared-secret query param — see `git log` around the `milestone-b-mcp-oidc` branch if you need the removed `_TokenAuthMiddleware` for reference. `mcp_server.py` is now its own thin OAuth 2.1 Authorization Server (`SecretaryOAuthProvider`, wired via `FastMCP(auth=..., auth_server_provider=...)`), which gates `/mcp` behind a real Bearer token and auto-wires `/authorize`, `/token`, `/register`, `/revoke` and the discovery well-known paths. Google is used only to verify *identity* (OIDC `id_token`, checked against Google's JWKS via `PyJWT`) — it never sees the MCP resource and issues no tokens this server relies on. Two independent Google round-trips share one `/oauth/google/callback` route, disambiguated by the `state` prefix:
+  - `link:<code>` — user-initiated. `/link` in Telegram (`bot.py`, writes a one-time code to `mcp_link_codes`) → tap → `/link/<code>` redirects straight to Google → the callback verifies identity and binds `(google_sub, email) → chat_id` into `mcp_identity`. Never touches claude.ai's OAuth dance.
+  - `authz:<id>` — claude.ai-initiated, via its own `/authorize` request (parked in `mcp_pending_authorize` while the Google round-trip happens). Resolves the caller's `chat_id` by looking up the already-bound `mcp_identity` row (403 if not yet linked — the error message tells the user to `/link` first), mints our own authorization code, and redirects back to claude.ai's `redirect_uri`.
+
+  Access/refresh tokens are stored in `mcp_tokens` as sha256 hashes only, never plaintext (mirrors how `api_keys` is never plaintext). Access tokens expire after 1 hour; refresh tokens don't expire but rotate on every use. All new tables (`mcp_link_codes`, `mcp_identity`, `mcp_oauth_clients`, `mcp_pending_authorize`, `mcp_auth_codes`, `mcp_tokens`) are created by `bot.py`'s `_init_db()`, matching the existing pattern where `mcp_server.py` never creates schema itself.
+
+  **Not yet done**: tool calls still take `chat_id` as a caller-supplied parameter on every tool (`get_tasks(chat_id, ...)` etc.) — a valid Bearer token proves *who's calling*, but nothing yet stops a tool call from naming a different `chat_id`. AUTH-03 (dropping the parameter on the remote surface and resolving `chat_id` server-side via `mcp.server.auth.middleware.auth_context.get_access_token().subject`) is a separate, not-yet-built slice.
   - TLS cert for `mcp-sbot.alteon.help` is Let's Encrypt via certbot (`webroot` method, since nginx permanently owns 80/443 — `standalone` would conflict), copied into `/etc/pki/nginx/` (nginx's expected location on this box) rather than read from `/etc/letsencrypt/live/` directly. A renewal deploy-hook (`/etc/letsencrypt/renewal-hooks/deploy/copy-to-nginx.sh`, host-wide — also benefits the Alteon cert) re-copies and reloads nginx automatically on renewal.
   - nginx has no explicit `default_server` on port 80/443; the first server block loaded from `conf.d/*.conf` (alphabetical) wins as the fallback for unmatched hostnames. Any new vhost needs its own explicit `server_name` block, or requests to it will silently fall through to whichever vhost happens to load first.

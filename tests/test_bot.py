@@ -313,6 +313,137 @@ class TestBuildSystemPrompt:
         prompt = bot.build_system_prompt(u)
         assert "Old focus" not in prompt
 
+    def test_connect_claude_instruction_uses_real_domain_when_configured(self):
+        u = fresh_user()
+        with patch.dict(os.environ, {"MCP_REMOTE_DOMAIN": "mcp-sbot.alteon.help"}):
+            prompt = bot.build_system_prompt(u)
+        assert "https://mcp-sbot.alteon.help/mcp" in prompt
+        assert "/link" in prompt
+        assert "no client ID or secret needed" in prompt
+
+    def test_connect_claude_instruction_admits_remote_unavailable_when_domain_unset(self):
+        u = fresh_user()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MCP_REMOTE_DOMAIN", None)
+            prompt = bot.build_system_prompt(u)
+        assert "isn't configured on this deployment" in prompt
+        assert "https://" not in prompt.split("connect you to Claude")[-1].split("\n")[0]
+
+    def test_persona_defaults_to_jeeves(self):
+        u = fresh_user()
+        prompt = bot.build_system_prompt(u)
+        assert "voice of Jeeves" in prompt
+
+    def test_persona_reflects_custom_character(self):
+        u = fresh_user(persona="Yoda")
+        prompt = bot.build_system_prompt(u)
+        assert "voice of Yoda" in prompt
+        assert "Jeeves" not in prompt
+
+    def test_persona_plain_disables_the_instruction_entirely(self):
+        u = fresh_user(persona="plain")
+        prompt = bot.build_system_prompt(u)
+        assert "Adopt the voice" not in prompt
+
+    def test_literal_compliance_rule_always_present(self):
+        """The override that lets literal requests win over persona voice is
+        not itself conditional on persona being set — it's rule 0, always."""
+        for persona in ("Jeeves", "Yoda", "plain"):
+            u = fresh_user(persona=persona)
+            prompt = bot.build_system_prompt(u)
+            assert "Literal requests always win over voice" in prompt
+
+    def test_no_honorific_by_default(self):
+        u = fresh_user()
+        prompt = bot.build_system_prompt(u)
+        assert "Address the user as" not in prompt
+
+    def test_honorific_injected_when_set(self):
+        u = fresh_user(honorific="Sir")
+        prompt = bot.build_system_prompt(u)
+        assert 'Address the user as "Sir"' in prompt
+
+    def test_new_user_without_honorific_gets_asked(self):
+        """Regression: a brand-new user who never types /start (just starts
+        chatting, e.g. via console.py) must still get asked — the ask can't
+        live only in start()'s hardcoded onboarding text."""
+        u = fresh_user()  # no context, no tasks, no activity_days -> _is_new_user() True
+        prompt = bot.build_system_prompt(u)
+        assert "ask naturally" in prompt
+        assert "how should I address you" in prompt
+
+    def test_established_user_without_honorific_not_pestered(self):
+        u = fresh_user(context="I'm a developer", tasks=["Ship the feature"])
+        prompt = bot.build_system_prompt(u)
+        assert "ask naturally" not in prompt
+        assert "Address the user as" not in prompt
+
+    def test_honorific_set_suppresses_the_ask_even_for_new_user(self):
+        u = fresh_user(honorific="Sir")  # still "new" by the tasks/context/activity heuristic
+        prompt = bot.build_system_prompt(u)
+        assert "ask naturally" not in prompt
+        assert 'Address the user as "Sir"' in prompt
+
+
+class TestIsNewUser:
+    def test_fresh_user_is_new(self):
+        assert bot._is_new_user(fresh_user()) is True
+
+    def test_user_with_context_not_new(self):
+        assert bot._is_new_user(fresh_user(context="I'm a developer")) is False
+
+    def test_user_with_tasks_not_new(self):
+        assert bot._is_new_user(fresh_user(tasks=["Buy milk"])) is False
+
+    def test_user_with_multiple_activity_days_not_new(self):
+        assert bot._is_new_user(fresh_user(activity_days=["2026-01-01", "2026-01-02"])) is False
+
+    def test_shared_by_start_and_system_prompt(self):
+        """start()'s is_new and build_system_prompt()'s honorific-ask must
+        use the literal same function, not two copies of the heuristic that
+        could silently drift apart."""
+        import inspect
+        start_src = inspect.getsource(bot.start)
+        prompt_src = inspect.getsource(bot.build_system_prompt)
+        assert "_is_new_user(user)" in start_src
+        assert "_is_new_user(user)" in prompt_src
+
+
+class TestPersonaTools:
+    def test_set_persona_saves_character(self):
+        cid = 9801
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_persona", {"character": "Rambo"}))
+        assert result["success"] is True
+        assert result["persona"] == "Rambo"
+        assert bot.state["users"][str(cid)]["persona"] == "Rambo"
+
+    def test_set_persona_requires_character(self):
+        cid = 9802
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_persona", {"character": ""}))
+        assert "error" in result
+
+    def test_set_honorific_saves_form(self):
+        cid = 9803
+        bot.state["users"][str(cid)] = fresh_user()
+        result = run(bot._execute_tool(cid, "set_honorific", {"form": "Madam"}))
+        assert result["success"] is True
+        assert result["honorific"] == "Madam"
+        assert bot.state["users"][str(cid)]["honorific"] == "Madam"
+
+    def test_set_honorific_empty_string_clears_it(self):
+        cid = 9804
+        bot.state["users"][str(cid)] = fresh_user(honorific="Sir")
+        result = run(bot._execute_tool(cid, "set_honorific", {"form": ""}))
+        assert result["success"] is True
+        assert bot.state["users"][str(cid)]["honorific"] == ""
+
+    def test_new_user_defaults_to_jeeves_persona_and_no_honorific(self):
+        u = bot._new_user()
+        assert u["persona"] == "Jeeves"
+        assert u["honorific"] == ""
+
 
 class TestRateLimit:
     def setup_method(self):
@@ -3657,3 +3788,150 @@ class TestReviewFixCR01:
         assert debug_result == "muted"
         debug_context.bot.send_message.assert_not_awaited()
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11: MCP link-code primitive — /link + db_create_link_code
+# (Milestone B / AUTH-02 groundwork; consumed by mcp_server.py's OAuth
+# provider, which is out of this test file's scope.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDbCreateLinkCode:
+    def setup_method(self):
+        _fresh_db()
+
+    def test_returns_8_char_hex_code(self):
+        code = bot.db_create_link_code("1")
+        assert len(code) == 8
+        int(code, 16)  # raises if not hex
+
+    def test_codes_are_unique(self):
+        codes = {bot.db_create_link_code("1") for _ in range(20)}
+        assert len(codes) == 20
+
+    def test_row_persisted_with_chat_id_and_expiry(self):
+        before = bot.datetime.utcnow()
+        code = bot.db_create_link_code("42")
+        with bot._db() as con:
+            row = con.execute(
+                "SELECT * FROM mcp_link_codes WHERE code=?", (code,)
+            ).fetchone()
+        assert row is not None
+        assert row["chat_id"] == "42"
+        assert row["used_at"] is None
+        created = bot.datetime.fromisoformat(row["created_at"])
+        expires = bot.datetime.fromisoformat(row["expires_at"])
+        assert created >= before
+        assert (expires - created) == bot.timedelta(minutes=10)
+
+    def test_custom_ttl(self):
+        code = bot.db_create_link_code("1", ttl_minutes=1)
+        with bot._db() as con:
+            row = con.execute(
+                "SELECT created_at, expires_at FROM mcp_link_codes WHERE code=?", (code,)
+            ).fetchone()
+        created = bot.datetime.fromisoformat(row["created_at"])
+        expires = bot.datetime.fromisoformat(row["expires_at"])
+        assert (expires - created) == bot.timedelta(minutes=1)
+
+
+class TestLinkCmd:
+    def setup_method(self):
+        _fresh_db()
+
+    def _update_and_context(self, chat_id=123):
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+        return update, context
+
+    def test_creates_link_code_row_for_this_chat(self):
+        update, context = self._update_and_context(chat_id=555)
+        run(bot.link_cmd(update, context))
+        with bot._db() as con:
+            rows = con.execute(
+                "SELECT chat_id FROM mcp_link_codes"
+            ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["chat_id"] == "555"
+
+    def test_replies_with_bare_code_when_domain_unset(self):
+        update, context = self._update_and_context()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MCP_REMOTE_DOMAIN", None)
+            run(bot.link_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "link code" in reply.lower()
+        assert "http" not in reply
+
+    def test_replies_with_full_url_when_domain_set(self):
+        update, context = self._update_and_context()
+        with patch.dict(os.environ, {"MCP_REMOTE_DOMAIN": "mcp-sbot.alteon.help"}):
+            run(bot.link_cmd(update, context))
+        update.message.reply_text.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "https://mcp-sbot.alteon.help/link/" in reply
+        # the code embedded in the URL must be the one actually stored
+        with bot._db() as con:
+            code = con.execute("SELECT code FROM mcp_link_codes").fetchone()["code"]
+        assert code in reply
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12: Per-round tool narrowing (_tools_for_round)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestToolsForRound:
+    """The full TOOLS schema is re-sent on every round of the tool-call loop, so
+    a two-round turn pays for it twice. `_tools_for_round` trims rounds 2+ to
+    what the model still plausibly needs."""
+
+    def _names(self, called):
+        return {t["function"]["name"] for t in bot._tools_for_round(called)}
+
+    def test_empty_called_set_falls_back_to_full_list(self):
+        # A later round with nothing recorded must never be handed FEWER tools
+        # than round 1 offered.
+        assert bot._tools_for_round(set()) is bot.TOOLS
+
+    def test_every_write_tool_survives_narrowing(self):
+        # Regression guard for the bug this design was rewritten to fix: an
+        # earlier version narrowed to the caller's own domain group, so "look at
+        # my reminders and create a task from them" reached round 2 with
+        # add_task withheld and duplicated the reminder instead — silently doing
+        # the wrong thing rather than failing. A round-2 request is the "now act
+        # on it" half of a turn, and which action it needs cannot be predicted
+        # from what it read first, so every write tool stays available.
+        for called in ({"get_reminders"}, {"get_tasks"}, {"search"},
+                       {"get_streak"}, {"get_notes"}, {"get_journal"}):
+            missing = bot._WRITE_TOOLS - self._names(called)
+            assert not missing, f"after {called}, write tools withheld: {missing}"
+
+    def test_add_task_available_after_reading_reminders(self):
+        # The exact cross-domain case that regressed, pinned on its own.
+        assert "add_task" in self._names({"get_reminders"})
+
+    def test_called_tool_is_always_kept(self):
+        for name in ("search", "get_streak", "get_journal"):
+            assert name in self._names({name})
+
+    def test_read_only_tools_outside_the_group_are_dropped(self):
+        # The actual saving: lookups the model has shown no interest in.
+        names = self._names({"get_tasks"})
+        assert "get_habits" not in names
+        assert "get_notes" not in names
+        # ...while its own group's reads stay reachable.
+        assert "get_tasks" in names
+
+    def test_narrowed_list_is_a_strict_subset_of_tools(self):
+        all_names = {t["function"]["name"] for t in bot.TOOLS}
+        got = self._names({"get_tasks"})
+        assert got < all_names
+
+    def test_group_and_write_tool_names_are_real(self):
+        # A typo in a group would silently withhold a tool forever.
+        all_names = {t["function"]["name"] for t in bot.TOOLS}
+        declared = set(bot._WRITE_TOOLS).union(*bot._TOOL_GROUPS)
+        assert declared <= all_names, declared - all_names

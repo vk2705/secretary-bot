@@ -54,7 +54,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - `GROQ_API_KEY` - Groq API key for free-tier LLM (optional; if set, keyless users use Groq instead of OpenAI)
 - `MASTER_KEY` - Fernet encryption key for API keys stored in SQLite (optional; auto-generated ephemeral if unset, printed to stderr)
 - `MY_CHAT_ID` - Single user's chat_id for one-time state.json migration (optional)
-- `MCP_REMOTE_TOKEN` - Shared secret for `/mcp?key=` auth (required for remote mode)
+- `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` - Google OAuth credentials backing the remote MCP server's own Authorization Server (Milestone B; required for remote mode — replaced the old `MCP_REMOTE_TOKEN` shared-secret `?key=` auth)
 - `MCP_REMOTE_DOMAIN` - Public hostname for Host-header DNS-rebinding check (required for remote mode)
 - `MCP_REMOTE_HOST` - Local bind address (default `127.0.0.1`)
 - `MCP_REMOTE_PORT` - Local bind port (default `8545`)
