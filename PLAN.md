@@ -252,6 +252,15 @@ Open questions to settle before implementing:
 - Where it lives — new SQLite table (e.g. `complaints`), similar to `notes`/`journal`.
 - Whether/how it surfaces — an admin command to review recent complaints (e.g. `/complaints`), or just a raw table queried manually for now.
 
+### 60. Reliable persistence of user-given LLM behavior preferences 🔲 proposed
+Right now, if a user tells the bot a standing style/behavior preference — e.g. "always use emojis in reminders", "keep replies short", "never use my first name" — there's no dedicated place that reliably captures and enforces it. The only path today is the LLM voluntarily calling `save_memory` to write it into `profile_memory`, which then shows up in every system prompt (`build_system_prompt`) as a "permanent user fact" — but whether the model bothers to save it, and whether it then actually honors it every time (including in code paths that re-invoke the LLM, like `_run_reminder`'s paraphrasing step), is not guaranteed by anything in the code. This is the same root cause behind #59's example (Russian in, English out) and the emoji-reminder question: preferences are memory-dependent, not enforced.
+
+Open questions to settle before implementing:
+- Should there be a distinct, structured category from general `profile_memory` facts — e.g. a `preferences` table/list that's always surfaced verbatim near the top of the system prompt (higher priority than free-form facts), rather than mixed in with arbitrary permanent facts?
+- Does the LLM need an explicit tool (e.g. `save_preference`) separate from `save_memory`, so the model is nudged to use it specifically when it detects a standing instruction about its own behavior (tone, formatting, language, emoji use, etc.) rather than a fact about the user's life?
+- How to keep this bounded — a user could ask for many preferences over time; needs a cap/dedup strategy similar to `notes`/`profile_memory`.
+- Should `/mystats` or a new command let the user see/edit their stored preferences directly, instead of only being set implicitly through conversation?
+
 ## Implementation order
 
 1. [x] Write PLAN.md
