@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 13 in progress (#61 done; #59, #60, #62, #63 still backlog)
+## Status: Iteration 13 in progress (#61, #62 done; #59, #60, #63 still backlog)
 
 ---
 
@@ -274,20 +274,46 @@ Implemented:
 
 Not done (left as-is, out of scope for this pass): the confirmation flag doesn't gate `/duedate`/`/extend` (those are dates, not clock times) — only things with an actual `HH:MM`.
 
-### 62. Treat a clarifying follow-up as an edit, not a duplicate action 🔲 proposed
+### 62. Treat a clarifying follow-up as an edit, not a duplicate action ✅ done (2026-08-28)
 Example: user says "remind me tomorrow at 6am about зарядка [exercise]." Then, in a follow-up message, clarifies/narrows it: "про зарядку" (about the exercise) and adds "зарядку физкультурой" (meaning: by "зарядка" I mean physical workout specifically). The bot must recognize this second message as a **clarification of the reminder it just created**, not an instruction to create a second, separate reminder — today nothing in `build_system_prompt()` or the tool descriptions (`add_reminder`, `bot.py`) tells the model to check recent history for an in-flight action it just took before creating a new one, so a near-duplicate reminder is a real risk.
 
-**Confirmed in live data (2026-08-28)**: user `5838336004` has exactly this
+**Confirmed in live data (2026-08-28)**: user `5838336004` had exactly this
 — three near-duplicate daily reminders, all at `06:00`, all themed "утренняя
 пробежка"/"morning run": `"Напоминание о пробежке"`, `"Утренняя пробежка!
 🏃‍♂️✨"`, `"🏃‍♀️ Утренняя пробежка!"`. Textbook case of successive
 clarifying messages each producing a new `add_reminder` call instead of
-editing the one already made.
+editing the one already made. Cleaned up via `admin.py`.
 
-Open questions to settle before implementing:
-- Is this purely a system-prompt instruction (e.g. "before calling add_reminder/add_task/etc., check whether the last 1-2 turns already created something this message is clarifying — if so, call remove_reminder + add_reminder (or an update path) instead of adding a new one"), or does it need a structural change — e.g. an `update_reminder` tool instead of relying on the model to compose remove+add itself?
-- How far back / how narrow a window counts as "recent enough to be a clarification" vs. "a genuinely new, similar reminder" (e.g. user asks for a second workout reminder in the same conversation) — needs some judgment call the model makes from context, not a hard rule.
-- Does this generalize beyond reminders — same risk exists for `add_task`, `add_habit`, `create_tracker` when a user immediately refines what they just asked for.
+Implemented (structural, not prompt-only — a prompt instruction alone proved
+unreliable, same lesson as #61's earlier persona-vs-literal-request
+regression):
+- `_similarity()` — stemmed word overlap plus containment (for a
+  clarification that only *adds* words), tuned against real duplicate pairs
+  and real non-duplicate pairs from live data until both sides held.
+- `add_task`/`add_reminder` call it against existing entries and **refuse**
+  a near-duplicate rather than creating it and warning afterward — the
+  create-then-warn version was tried first and found too late: a
+  clarification often arrives as *several tool calls in the same turn*, so
+  by the time the model reads the warning both duplicates already exist
+  (reproduced live: two `add_reminder` calls back to back). The refusal
+  explains how to edit the original (`remove_reminder`/`remove_task` then
+  re-add) and offers `confirm_duplicate=true` for a genuinely separate
+  second entry.
+- Word overlap alone can't catch every case (two real duplicates scored
+  0.2, no threshold separates that from "buy milk"/"buy bread" without
+  false positives) — same time slot + any shared topic word is treated as
+  a duplicate too, since two reminders can't reasonably fire the same
+  wording-adjacent thing at the same minute by coincidence.
+- Same-time conflicts between genuinely *different* reminders are still
+  allowed, but now reported back (`other_reminders_at_same_time`) so the
+  model can mention the clash instead of staying silent about it.
+- Generalizes to `add_task` the same way; `add_habit`/`create_tracker`
+  deliberately left out of scope — habits/trackers are named once and
+  reused, not re-stated per entry, so the collision shape doesn't apply the
+  same way.
+
+Verified against the real API: the reproducer test for this went from
+0-1/3 passing to 4/4 across repeated runs.
 
 ### 63. Existing users predate `timezone_confirmed` — same silent-UTC risk as #61 was meant to close 🔲 proposed
 `_new_user()`'s `timezone_confirmed` field (added by #61) only exists for
