@@ -255,11 +255,11 @@ Open questions to settle before implementing:
 ### 60. Reliable persistence of user-given LLM behavior preferences 🔲 proposed
 Right now, if a user tells the bot a standing style/behavior preference — e.g. "always use emojis in reminders", "keep replies short", "never use my first name" — there's no dedicated place that reliably captures and enforces it. The only path today is the LLM voluntarily calling `save_memory` to write it into `profile_memory`, which then shows up in every system prompt (`build_system_prompt`) as a "permanent user fact" — but whether the model bothers to save it, and whether it then actually honors it every time (including in code paths that re-invoke the LLM, like `_run_reminder`'s paraphrasing step), is not guaranteed by anything in the code. This is the same root cause behind #59's example (Russian in, English out) and the emoji-reminder question: preferences are memory-dependent, not enforced.
 
-Open questions to settle before implementing:
-- Should there be a distinct, structured category from general `profile_memory` facts — e.g. a `preferences` table/list that's always surfaced verbatim near the top of the system prompt (higher priority than free-form facts), rather than mixed in with arbitrary permanent facts?
-- Does the LLM need an explicit tool (e.g. `save_preference`) separate from `save_memory`, so the model is nudged to use it specifically when it detects a standing instruction about its own behavior (tone, formatting, language, emoji use, etc.) rather than a fact about the user's life?
-- How to keep this bounded — a user could ask for many preferences over time; needs a cap/dedup strategy similar to `notes`/`profile_memory`.
-- Should `/mystats` or a new command let the user see/edit their stored preferences directly, instead of only being set implicitly through conversation?
+Decided:
+- Yes — a distinct, structured `preferences` store, separate from general `profile_memory` facts, always surfaced verbatim near the top of the system prompt (higher priority than free-form facts), not mixed in with arbitrary permanent facts.
+- Yes — a dedicated `save_preference` tool, separate from `save_memory`, so the model is nudged to use it specifically for standing instructions about its own behavior (tone, formatting, language, emoji use, etc.) rather than facts about the user's life.
+- No cap/limit — unlike `notes`/`profile_memory`, preferences are not bounded or pruned. (Still dedup on exact/near-duplicate text so repeating the same preference doesn't pile up entries.)
+- Yes — a user-facing way to see/edit stored preferences directly (e.g. a `/preferences` command), not only set implicitly through conversation.
 
 ## Implementation order
 
