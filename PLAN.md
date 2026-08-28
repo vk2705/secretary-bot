@@ -264,11 +264,22 @@ Decided:
 ### 61. Confirm timezone before scheduling anything at a specific time 🔲 proposed
 When a user asks to schedule something at a specific clock time — a reminder ("remind me at 6am"), a check-in time change, etc. — the bot must first make sure it actually knows their timezone, and then explicitly confirm the resolved time back to them with the timezone named, e.g. "Setting a reminder for 6:00 AM Moscow time (Europe/Moscow)." This is a hard requirement, not a nice-to-have: today `add_reminder`/`get_current_time`/etc. just read `user.get("timezone", "UTC")` silently (`bot.py`), so a user who's never explicitly set a timezone gets everything scheduled against UTC with zero confirmation — a reminder can silently land at the wrong absolute time.
 
+Decided:
+- Track confirmation as a separate flag (e.g. `timezone_confirmed`), not inferred from the value still being the default `"UTC"` string.
+- That flag lives in the **database** (SQLite `user_prefs`), the same way the timezone value itself is already persisted there via `db_set_pref`/`db_get_pref` (`bot.py`) — not only in `state.json` — so it survives a `state.json` overwrite/restore exactly like the timezone override does today.
+
 Open questions to settle before implementing:
-- How to detect "timezone not yet confirmed" vs. "user genuinely lives in UTC" — a separate boolean (e.g. `timezone_confirmed`) rather than inferring it from the value still being the default `"UTC"` string?
 - Scope: does this gate only reminders (things with an absolute clock time), or also `/setcheckin`, `/quiethours`, and any other time-of-day setting?
 - Confirmation flow: ask "what timezone are you in?" up front before scheduling anything if unconfirmed, vs. schedule provisionally against the current stored/default zone and always state the resolved time+zone back so the user can correct it if wrong (e.g. "6:00 AM UTC — let me know if that's not your local time")?
-- This is a system-prompt instruction, not new state, once `timezone_confirmed` (if used) exists — should live alongside `lang_instruction`/`tz_section` in `build_system_prompt()`.
+- The gating logic is a system-prompt instruction, not new state, once `timezone_confirmed` exists — should live alongside `lang_instruction`/`tz_section` in `build_system_prompt()`.
+
+### 62. Treat a clarifying follow-up as an edit, not a duplicate action 🔲 proposed
+Example: user says "remind me tomorrow at 6am about зарядка [exercise]." Then, in a follow-up message, clarifies/narrows it: "про зарядку" (about the exercise) and adds "зарядку физкультурой" (meaning: by "зарядка" I mean physical workout specifically). The bot must recognize this second message as a **clarification of the reminder it just created**, not an instruction to create a second, separate reminder — today nothing in `build_system_prompt()` or the tool descriptions (`add_reminder`, `bot.py`) tells the model to check recent history for an in-flight action it just took before creating a new one, so a near-duplicate reminder is a real risk.
+
+Open questions to settle before implementing:
+- Is this purely a system-prompt instruction (e.g. "before calling add_reminder/add_task/etc., check whether the last 1-2 turns already created something this message is clarifying — if so, call remove_reminder + add_reminder (or an update path) instead of adding a new one"), or does it need a structural change — e.g. an `update_reminder` tool instead of relying on the model to compose remove+add itself?
+- How far back / how narrow a window counts as "recent enough to be a clarification" vs. "a genuinely new, similar reminder" (e.g. user asks for a second workout reminder in the same conversation) — needs some judgment call the model makes from context, not a hard rule.
+- Does this generalize beyond reminders — same risk exists for `add_task`, `add_habit`, `create_tracker` when a user immediately refines what they just asked for.
 
 ## Implementation order
 
