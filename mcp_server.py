@@ -849,10 +849,44 @@ def _get_memory(chat_id: str) -> dict:
     }
 
 
+def _voice_instruction(u: dict) -> str:
+    """Mirrors bot.py's build_system_prompt() persona/honorific instruction
+    text (persona_instruction + honorific_instruction there), kept as a
+    small standalone copy rather than importing bot.py — mcp_server.py
+    deliberately never goes through bot.py's runtime (see CLAUDE.md), and
+    bot.py pulls in python-telegram-bot/AsyncOpenAI client setup that has
+    no business running inside this process. Only the two short instruction
+    strings are duplicated; if bot.py's wording changes, update both.
+    Claude via claude.ai sees this only as tool-result text — it's a
+    request, not an enforced system prompt, so it isn't guaranteed to hold
+    the way it does inside bot.py's own chat() loop."""
+    persona = (u.get("persona") or "Jeeves").strip()
+    honorific = (u.get("honorific") or "").strip()
+    parts = []
+    if persona.lower() not in ("plain", "none", "off"):
+        parts.append(
+            f"Adopt the voice of {persona} in how you phrase replies — word choice, tone, "
+            "small mannerisms. This is decoration on phrasing only; a literal request "
+            "(an exact word, number, or format) always wins over voice."
+        )
+    if honorific:
+        parts.append(f'Address the user as "{honorific}" where it fits naturally.')
+    language = (u.get("language") or "").strip()
+    if language:
+        parts.append(f"Reply in {language} unless the user switches language first.")
+    return " ".join(parts)
+
+
 # ─────────────── tools: stats & overview ───────────────
 
 def _get_user_stats(chat_id: str) -> dict:
-    """Get a full stats overview for a user."""
+    """Get a full stats overview for a user. Call this first, before any
+    real conversation: it includes persona, honorific, and language — how
+    this person wants to be addressed and in what voice — plus a ready
+    voice_instruction string summarizing it. Follow it for the rest of the
+    conversation the way you would a system instruction, unless the user
+    asks for something literal (an exact word, number, format), which
+    always wins over voice."""
     state = _load()
     u = _require_user(state, chat_id)
     activity = sorted(u.get("activity_days", []))
@@ -893,6 +927,10 @@ def _get_user_stats(chat_id: str) -> dict:
         "subscribed": u.get("checkin_enabled", False),
         "context": u.get("context", ""),
         "model": u.get("llm", {}).get("model"),
+        "persona": u.get("persona") or "Jeeves",
+        "honorific": u.get("honorific") or "",
+        "language": u.get("language") or "",
+        "voice_instruction": _voice_instruction(u),
     }
 
 
@@ -1020,7 +1058,13 @@ if _IS_REMOTE:
 
     @mcp.tool()
     def get_user_stats() -> dict:
-        """Get a full stats overview."""
+        """Get a full stats overview. Call this first, before any real
+        conversation: it includes persona, honorific, and language — how
+        this person wants to be addressed and in what voice — plus a ready
+        voice_instruction string summarizing it. Follow it for the rest of
+        the conversation the way you would a system instruction, unless the
+        user asks for something literal (an exact word, number, format),
+        which always wins over voice."""
         return _get_user_stats(_authed_chat_id())
 
     @mcp.tool()

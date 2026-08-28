@@ -672,3 +672,57 @@ class TestReloadNeverFallsBackToProductionFiles:
         importlib.reload(mcp_server)
         assert str(mcp_server.STATE_FILE) == os.environ["BOT_STATE_FILE"]
         assert str(mcp_server.DB_FILE) == os.environ["BOT_DB_FILE"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# get_user_stats carries persona/honorific/language + voice_instruction, so
+# Claude (via claude.ai/MCP) can know which character to play and how to
+# address the user — mirrors bot.py's build_system_prompt() persona/
+# honorific instructions, but as tool-result data rather than a system
+# prompt (see _voice_instruction()'s own docstring on that distinction).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGetUserStatsVoiceContext:
+    def test_default_persona_is_jeeves_with_no_honorific(self):
+        bot.state["users"]["1"] = bot._new_user()
+        bot.save_state(bot.state)
+        stats = mcp_server._get_user_stats("1")
+        assert stats["persona"] == "Jeeves"
+        assert stats["honorific"] == ""
+        assert "Jeeves" in stats["voice_instruction"]
+
+    def test_custom_persona_and_honorific_both_surface(self):
+        bot.state["users"]["2"] = bot._new_user(persona="Yoda", honorific="Master")
+        bot.save_state(bot.state)
+        stats = mcp_server._get_user_stats("2")
+        assert stats["persona"] == "Yoda"
+        assert stats["honorific"] == "Master"
+        assert "Yoda" in stats["voice_instruction"]
+        assert "Master" in stats["voice_instruction"]
+
+    def test_plain_persona_produces_no_voice_clause(self):
+        bot.state["users"]["3"] = bot._new_user(persona="plain")
+        bot.save_state(bot.state)
+        stats = mcp_server._get_user_stats("3")
+        assert stats["persona"] == "plain"
+        assert "voice" not in stats["voice_instruction"].lower()
+
+    def test_language_surfaces_in_stats_and_instruction(self):
+        bot.state["users"]["4"] = bot._new_user(language="Russian")
+        bot.save_state(bot.state)
+        stats = mcp_server._get_user_stats("4")
+        assert stats["language"] == "Russian"
+        assert "Russian" in stats["voice_instruction"]
+
+    def test_empty_language_produces_no_language_clause(self):
+        bot.state["users"]["5"] = bot._new_user()
+        bot.save_state(bot.state)
+        stats = mcp_server._get_user_stats("5")
+        assert stats["language"] == ""
+        assert "unless the user switches" not in stats["voice_instruction"]
+
+    def test_voice_instruction_never_crashes_on_a_bare_new_user(self):
+        bot.state["users"]["6"] = bot._new_user()
+        bot.save_state(bot.state)
+        stats = mcp_server._get_user_stats("6")
+        assert isinstance(stats["voice_instruction"], str)
