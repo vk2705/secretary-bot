@@ -24,6 +24,7 @@ Usage:
     set-timezone <chat_id> <iana_tz>             Set + confirm a user's timezone
     list-reminders <chat_id>                     Numbered reminders for one user
     remove-reminder <chat_id> <n>                Delete reminder n (1-based)
+    restart-bot                                  Stop + start the bot, no data edit
 
 Every command re-execs into venv/bin/python3 the same way console.py does,
 so a bare `python3 admin.py` works from any shell.
@@ -244,6 +245,16 @@ def cmd_remove_reminder(bot, args) -> None:
     _with_bot_stopped(_do)
 
 
+def cmd_restart_bot(bot, args) -> None:
+    """Stop + start the live bot with no data edit in between — for picking
+    up a code change (bot.py/requirements.txt) without touching state.json
+    or bot_memory.db at all. Used by .git/hooks/post-commit."""
+    was_running = _stop_bot() is not None
+    _start_bot()
+    if not was_running:
+        print("(bot wasn't running before this — started fresh)")
+
+
 def main() -> None:
     _reexec_in_venv()
     _install_stubs()
@@ -270,6 +281,11 @@ def main() -> None:
     p.add_argument("chat_id")
     p.add_argument("n")
     p.set_defaults(fn=cmd_remove_reminder)
+
+    sub.add_parser(
+        "restart-bot",
+        help="Stop + start the live bot (no data edit) — for picking up a code change",
+    ).set_defaults(fn=cmd_restart_bot)
 
     args = parser.parse_args()
 
