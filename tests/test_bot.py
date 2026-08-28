@@ -369,8 +369,13 @@ class TestBuildSystemPrompt:
         live only in start()'s hardcoded onboarding text."""
         u = fresh_user()  # no context, no tasks, no activity_days -> _is_new_user() True
         prompt = bot.build_system_prompt(u)
-        assert "ask naturally" in prompt
         assert "how should I address you" in prompt
+        assert "set_honorific" in prompt
+        # ...but the question must never displace the user's actual request:
+        # an earlier wording had the model asking instead of calling the tool
+        # the request needed (verified live — add_task/set_today_focus dropped
+        # to 0/3 for new users).
+        assert "FIRST" in prompt
 
     def test_established_user_without_honorific_not_pestered(self):
         u = fresh_user(context="I'm a developer", tasks=["Ship the feature"])
@@ -4408,3 +4413,182 @@ class TestSetTimezoneReportsWhatItStored:
                     if t["function"]["name"] == "set_timezone")
         assert "EXPLICITLY" in desc
         assert "never infer" in desc.lower()
+
+
+class TestDuplicateAndClashDetection:
+    """A clarifying follow-up ("...in the canteen") reads to the model as a
+    fresh request, so it called add_task/add_reminder again and the user
+    silently ended up with two near-identical entries — confirmed in live data
+    (three 06:00 "morning run" reminders on one account) and in a sandbox
+    session. Prompt-only guidance proved unreliable, so the tools detect the
+    collision themselves and hand it back for the model to raise."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = MagicMock()
+
+    @pytest.mark.parametrize("a,b", [
+        ("Встреча с мышью", "Встреча с мышью в столовой"),
+        ("Утренняя пробежка!", "🏃 Утренняя пробежка!"),
+        ("morning run", "run in the morning"),
+        ("team meeting", "team meetings"),
+        ("пробежка", "пробежке"),
+    ])
+    def test_near_duplicates_score_above_threshold(self, a, b):
+        assert bot._similarity(a, b) >= 0.5, f"{a!r} vs {b!r} should read as similar"
+
+    @pytest.mark.parametrize("a,b", [
+        ("Встреча с мышью", "Купить молоко"),
+        ("buy milk", "buy bread"),
+        ("позвонить маме", "позвонить врачу"),
+        ("call mom", "call the doctor"),
+        ("morning run", "evening yoga"),
+        ("встреча с мышью", "встреча с котом"),
+    ])
+    def test_different_items_score_below_threshold(self, a, b):
+        assert bot._similarity(a, b) < 0.5, f"{a!r} vs {b!r} must not be flagged as duplicates"
+
+    def test_similarity_handles_empty_and_stopword_only_text(self):
+        assert bot._similarity("", "anything") == 0.0
+        assert bot._similarity("the a of", "in on at") == 0.0
+
+    def test_add_task_refuses_a_near_duplicate(self):
+        uid = 8100
+        bot.state["users"][str(uid)] = fresh_user()
+        run(bot._execute_tool(uid, "add_task", {"text": "Встреча с мышью"}))
+        result = run(bot._execute_tool(uid, "add_task", {"text": "Встреча с мышью в столовой"}))
+        # Refused, not created-then-flagged: a clarification often arrives as
+        # several tool calls in one turn, so a warning in the result comes too
+        # late — the duplicate already exists by the time the model reads it.
+        assert "error" in result
+        assert result["similar_existing_tasks"][0]["number"] == 1
+        assert "what_to_do" in result
+        assert len(bot.state["users"][str(uid)]["tasks"]) == 1
+
+    def test_add_task_duplicate_can_be_forced(self):
+        uid = 8106
+        bot.state["users"][str(uid)] = fresh_user()
+        run(bot._execute_tool(uid, "add_task", {"text": "Встреча с мышью"}))
+        result = run(bot._execute_tool(uid, "add_task",
+                                       {"text": "Встреча с мышью в столовой",
+                                        "confirm_duplicate": True}))
+        assert result["success"]
+        assert len(bot.state["users"][str(uid)]["tasks"]) == 2
+
+    def test_add_task_does_not_flag_an_unrelated_task(self):
+        uid = 8101
+        bot.state["users"][str(uid)] = fresh_user()
+        run(bot._execute_tool(uid, "add_task", {"text": "Купить молоко"}))
+        result = run(bot._execute_tool(uid, "add_task", {"text": "Встреча с мышью"}))
+        assert "similar_existing_tasks" not in result
+
+    def test_add_reminder_refuses_a_near_duplicate(self):
+        uid = 8102
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        run(bot._execute_tool(uid, "add_reminder", {"message": "Утренняя пробежка", "time": "06:00"}))
+        result = run(bot._execute_tool(uid, "add_reminder",
+                                       {"message": "🏃 Утренняя пробежка", "time": "07:00"}))
+        assert "error" in result
+        assert result["similar_existing_reminders"]
+        assert "what_to_do" in result
+        assert len(bot.state["users"][str(uid)]["reminders"]) == 1
+
+    def test_add_reminder_duplicate_can_be_forced(self):
+        uid = 8107
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        run(bot._execute_tool(uid, "add_reminder", {"message": "Утренняя пробежка", "time": "06:00"}))
+        result = run(bot._execute_tool(uid, "add_reminder",
+                                       {"message": "🏃 Утренняя пробежка", "time": "07:00",
+                                        "confirm_duplicate": True}))
+        assert result["success"]
+        assert len(bot.state["users"][str(uid)]["reminders"]) == 2
+
+    def test_same_time_plus_shared_topic_word_is_treated_as_duplicate(self):
+        # The two live duplicates that word-overlap alone can't catch
+        # ("Напомни про зарядку" vs "Напоминание о зарядке физкультурой" score
+        # 0.2) shared a time. Same slot + any shared topic word is far more
+        # likely a restatement than a genuinely separate reminder.
+        uid = 8103
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        run(bot._execute_tool(uid, "add_reminder",
+                              {"message": "Напомни про зарядку", "time": "06:00"}))
+        result = run(bot._execute_tool(uid, "add_reminder",
+                                       {"message": "Напоминание о зарядке физкультурой",
+                                        "time": "06:00"}))
+        assert "error" in result
+        assert len(bot.state["users"][str(uid)]["reminders"]) == 1
+
+    def test_same_time_but_unrelated_topic_is_allowed_with_a_clash_note(self):
+        uid = 8108
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        run(bot._execute_tool(uid, "add_reminder", {"message": "Выпить таблетки", "time": "08:00"}))
+        result = run(bot._execute_tool(uid, "add_reminder",
+                                       {"message": "Позвонить маме", "time": "08:00"}))
+        assert result["success"], "unrelated reminders at the same time must still be allowed"
+        assert result["other_reminders_at_same_time"][0]["time"] == "08:00"
+        assert len(bot.state["users"][str(uid)]["reminders"]) == 2
+
+    def test_distinct_reminders_at_distinct_times_are_silent(self):
+        uid = 8104
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        run(bot._execute_tool(uid, "add_reminder", {"message": "Купить молоко", "time": "06:00"}))
+        result = run(bot._execute_tool(uid, "add_reminder",
+                                       {"message": "Позвонить врачу", "time": "09:00"}))
+        assert "similar_existing_reminders" not in result
+        assert "other_reminders_at_same_time" not in result
+        assert "action_required" not in result
+
+    def test_refusal_explains_how_to_proceed(self):
+        # A refusal must never be a dead end: the model needs to know both how
+        # to edit the original and how to override if the user really meant two.
+        uid = 8105
+        bot.state["users"][str(uid)] = fresh_user()
+        run(bot._execute_tool(uid, "add_task", {"text": "Встреча с мышью"}))
+        result = run(bot._execute_tool(uid, "add_task", {"text": "Встреча с мышью в столовой"}))
+        assert "remove_task" in result["what_to_do"]
+        assert "confirm_duplicate=true" in result["what_to_do"]
+
+
+class TestSelfIntroductionSetsHonorific:
+    """A plain self-introduction ("я кот Леопольд") answers "how should I
+    address you?" just as well as "call me X", but the tool description only
+    described the explicit form — so the model didn't call set_honorific and
+    asked again a turn later."""
+
+    def test_tool_description_covers_plain_self_introduction(self):
+        desc = next(t["function"]["description"] for t in bot.TOOLS
+                    if t["function"]["name"] == "set_honorific")
+        assert "self-introduction" in desc.lower()
+        assert "never ask how to address them again" in desc.lower()
+
+    def test_prompt_instruction_covers_plain_self_introduction(self):
+        cid = 8200
+        bot.state["users"][str(cid)] = fresh_user()
+        prompt = bot.build_system_prompt(bot.state["users"][str(cid)], cid)
+        assert "a plain self-introduction" in prompt.lower()
+
+    def test_no_ask_instruction_once_honorific_is_set(self):
+        cid = 8201
+        bot.state["users"][str(cid)] = fresh_user(honorific="Leopold")
+        prompt = bot.build_system_prompt(bot.state["users"][str(cid)], cid)
+        assert "hasn't said how they'd like to be addressed" not in prompt
+        assert "Leopold" in prompt
+
+    def test_setting_the_honorific_cancels_the_ask_for_the_rest_of_the_turn(self):
+        # The prompt for this turn was built before the tool ran, so it still
+        # says "ask how to address them" — which had the bot thanking the user
+        # by name and asking what to call them in the same reply.
+        bot.state = {"users": {}}
+        uid = 8300
+        bot.state["users"][str(uid)] = fresh_user()
+        result = run(bot._execute_tool(uid, "set_honorific", {"form": "Леопольд"}))
+        assert result["success"]
+        assert "do not ask how to address them" in result["note"].lower()
+
+    def test_clearing_the_honorific_carries_no_cancel_note(self):
+        bot.state = {"users": {}}
+        uid = 8301
+        bot.state["users"][str(uid)] = fresh_user(honorific="Sir")
+        result = run(bot._execute_tool(uid, "set_honorific", {"form": ""}))
+        assert result["success"]
+        assert "note" not in result

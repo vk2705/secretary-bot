@@ -922,8 +922,11 @@ TOOLS = [
         "function": {
             "name": "set_honorific",
             "description": (
-                "Save how the user wants to be addressed ('call me Sir', 'just use my name, Alex'). "
-                "Pass the exact form, or an empty string to drop it."
+                "Save how to address the user. Call this whenever they tell you who they are or "
+                "what to call them — an explicit 'call me Sir' or 'just use my name, Alex', but "
+                "equally a plain self-introduction like 'I'm Leopold' or 'меня зовут Аня', which "
+                "answers the question just as well. Pass the exact form to use, or an empty string "
+                "to drop it. Once this is set, never ask how to address them again."
             ),
             "parameters": {
                 "type": "object",
@@ -949,7 +952,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "add_task",
-            "description": "Add a new task to the user's task list.",
+            "description": (
+                "Add a new task. Refused if it looks like a near-duplicate of an existing task "
+                "— edit that one instead, or retry with confirm_duplicate=true if the user "
+                "really wants both."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -957,6 +964,13 @@ TOOLS = [
                     "due_date": {
                         "type": "string",
                         "description": "Optional due date in YYYY-MM-DD format.",
+                    },
+                    "confirm_duplicate": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only to override a near-duplicate refusal, when the user "
+                            "genuinely wants a second, separate task."
+                        ),
                     },
                 },
                 "required": ["text"],
@@ -1005,7 +1019,9 @@ TOOLS = [
             "description": (
                 "Schedule one reminder. Relative ('in 5 minutes') → delay_minutes, always one-off. "
                 "Clock time → time, daily unless the user explicitly says one-time. "
-                "For several times in one message, call once per time with the SAME once value."
+                "For several times in one message, call once per time with the SAME once value. "
+                "Refused if it looks like a near-duplicate of an existing reminder — edit that "
+                "one instead, or retry with confirm_duplicate=true if the user really wants both."
             ),
             "parameters": {
                 "type": "object",
@@ -1026,6 +1042,13 @@ TOOLS = [
                     "once": {
                         "type": "boolean",
                         "description": "Default false = daily. True only on explicit one-time request.",
+                    },
+                    "confirm_duplicate": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true only to override a near-duplicate refusal, when the user "
+                            "genuinely wants a second, separate reminder."
+                        ),
                     },
                 },
                 "required": ["message"],
@@ -1382,7 +1405,17 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         form = (args.get("form") or "").strip()
         user["honorific"] = form
         save_state(state)
-        return {"success": True, "honorific": form}
+        result = {"success": True, "honorific": form}
+        if form:
+            # The system prompt for this turn was built before this call, so it
+            # still carries the "ask how to address them" instruction — which
+            # left the model thanking the user by name and *then* asking what to
+            # call them in the same breath. Cancel it for the rest of the turn.
+            result["note"] = (
+                f'Now settled: address them as "{form}". Do not ask how to address them in '
+                "this reply or any later one — the question is answered."
+            )
+        return result
 
     if name == "get_current_time":
         try:
@@ -1421,6 +1454,21 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             except ValueError:
                 due_error = f"due_date '{raw_due}' is invalid (use YYYY-MM-DD); task added without due date."
         task = {"text": text, "due": due} if due else text
+        similar = _find_similar(text, [_task_text(t) for t in user.get("tasks", [])])
+        # Refuse rather than create-then-complain — see add_reminder's note: a
+        # clarification can arrive as several calls in one turn, by which point
+        # reporting the collision in the result comes too late.
+        if similar and not args.get("confirm_duplicate"):
+            return {
+                "error": "Not created: this looks like a near-duplicate of a task you already have.",
+                "similar_existing_tasks": similar,
+                "what_to_do": (
+                    "If this is a clarification of that existing task, edit it instead: call "
+                    "remove_task on its number, then add_task with the corrected wording. If the "
+                    "user genuinely wants a second, separate task, call add_task again with "
+                    "confirm_duplicate=true."
+                ),
+            }
         user["tasks"].append(task)
         save_state(state)
         result = {"success": True, "task": text, "due": due}
@@ -1548,12 +1596,59 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             return {"success": True, "once_at": time_str, "message": message}
         # ── daily recurring ──
         reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False, "reason": reason}
-        user.setdefault("reminders", []).append(reminder)
+        existing = user.setdefault("reminders", [])
+        similar = _find_similar(message, [r.get("message", "") for r in existing])
+        # Wording alone can't catch every clarification: "Напомни про зарядку"
+        # vs "Напоминание о зарядке физкультурой" share only one content word
+        # and score 0.2, below any threshold safe from false positives. But
+        # they were also both at 06:00 — a reminder at the exact same time that
+        # shares any topic word is far more likely a restatement than a second,
+        # genuinely separate reminder, so treat that as a duplicate too.
+        if not similar:
+            same_slot = [r for r in existing if r.get("time") == time_str]
+            similar = [
+                s for s in _find_similar(
+                    message, [r.get("message", "") for r in same_slot], threshold=0.15)
+            ]
+            for s in similar:  # renumber against the full list, not the filtered one
+                s["number"] = next(
+                    i + 1 for i, r in enumerate(existing)
+                    if r.get("message", "") == s["text"] and r.get("time") == time_str
+                )
+        # Refuse rather than create-then-complain. A clarifying follow-up often
+        # arrives as several add_reminder calls inside one turn, so reporting
+        # the collision in the result is too late — the duplicates already
+        # exist by the time the model reads it. Blocking here is also
+        # recoverable: the model is told exactly how to edit the original.
+        if similar and not args.get("confirm_duplicate"):
+            return {
+                "error": "Not created: this looks like a near-duplicate of a reminder you "
+                         "already have.",
+                "similar_existing_reminders": similar,
+                "what_to_do": (
+                    "If this is a clarification of that existing reminder, edit it instead: "
+                    "call remove_reminder on its number, then add_reminder with the corrected "
+                    "wording. If the user genuinely wants a second, separate reminder, call "
+                    "add_reminder again with confirm_duplicate=true."
+                ),
+            }
+        same_time = [
+            {"number": i + 1, "time": r.get("time"), "message": r.get("message")}
+            for i, r in enumerate(existing) if r.get("time") == time_str
+        ]
+        existing.append(reminder)
         save_state(state)
         db_log_reminder(chat_id, reminder["id"], message, reason, "daily", time_str)
         if _app:
             schedule_user_reminder(_app, chat_id, reminder)
-        return {"success": True, "daily_at": time_str, "message": message}
+        result = {"success": True, "daily_at": time_str, "message": message}
+        if same_time:
+            result["other_reminders_at_same_time"] = same_time
+            result["action_required"] = (
+                "The user already has a different reminder at this exact time. Mention the "
+                "clash so they can move one if they meant them to be separate."
+            )
+        return result
 
     if name == "get_reminders":
         reminders = user.get("reminders", [])
@@ -1916,6 +2011,65 @@ def _utcnow(user: dict = None) -> datetime:
 
 # ─────────────────────── task helpers ───────────────────────
 
+_STOPWORDS = {
+    "a", "an", "the", "to", "at", "in", "on", "of", "for", "with", "and", "my",
+    "и", "в", "на", "с", "о", "по", "у", "к", "не", "для",
+}
+
+
+def _similarity(a: str, b: str) -> float:
+    """Word-overlap similarity (Jaccard over content words), 0.0–1.0.
+
+    Deliberately not difflib: "встреча с мышью" vs "встреча с мышью в столовой"
+    should read as near-identical even though one is much longer, and shared
+    content words capture that better than character-level ratios.
+    """
+    def stem(w: str) -> str:
+        # Crude but language-agnostic: drop a trailing inflection so Russian
+        # case endings match ("пробежке"/"пробежка"/"пробежку") and English
+        # plurals do too ("meeting"/"meetings"). Real duplicates in live data
+        # differed only by ending and scored 0.0 without this. Trimming to a
+        # fixed prefix (rather than one char) makes the comparison symmetric:
+        # "meeting"→"meetin" and "meetings"→"meetin" both land on the same
+        # stem, which a single-char trim does not achieve.
+        return w[:6] if len(w) > 6 else w
+
+    def words(s: str) -> set[str]:
+        return {stem(w) for w in re.findall(r"\w+", s.lower()) if w not in _STOPWORDS}
+
+    wa, wb = words(a), words(b)
+    if not wa or not wb:
+        return 0.0
+    shared = len(wa & wb)
+    jaccard = shared / len(wa | wb)
+    # Jaccard alone punishes a clarification that only *adds* words ("meeting"
+    # vs "team meeting in the canteen"), which is exactly the shape we care
+    # about — so also credit containment, but only when the shorter text is
+    # almost entirely contained in the longer one. Partial containment is what
+    # makes unrelated short pairs collide ("buy milk" / "buy bread" share one
+    # word out of two), so anything below near-total falls back to Jaccard.
+    containment = shared / min(len(wa), len(wb))
+    return max(jaccard, containment if containment >= 0.99 else 0.0)
+
+
+def _find_similar(text: str, existing: list[str], threshold: float = 0.5) -> list[dict]:
+    """Return existing entries that look like near-duplicates of `text`.
+
+    A clarifying follow-up ("...in the canteen", "actually make it 7") reads to
+    the model as a fresh request, so it calls add_task/add_reminder again and
+    the user silently ends up with two near-identical entries — confirmed in
+    live data (three 06:00 "morning run" reminders on one account) and in a
+    sandbox session. The model can't be relied on to re-check history, so the
+    tools surface the collision themselves instead of asking it to remember.
+    """
+    hits = []
+    for i, other in enumerate(existing):
+        score = _similarity(text, other)
+        if score >= threshold:
+            hits.append({"number": i + 1, "text": other, "similarity": round(score, 2)})
+    return hits
+
+
 def _task_text(task) -> str:
     return task["text"] if isinstance(task, dict) else str(task)
 
@@ -2117,10 +2271,12 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         # type /start — they just start talking. Without this, a brand-new
         # user chatting freely would never get asked at all.
         honorific_instruction = (
-            "This user hasn't said how they'd like to be addressed yet. Early in this "
-            "conversation — within your first reply or two, not necessarily the very first — "
-            "ask naturally (e.g. 'and how should I address you?'), then call set_honorific once "
-            "they answer. One question, not an interrogation; if they ignore it, drop it.\n"
+            "You don't know how this user wants to be addressed yet. Do whatever they actually "
+            "asked for FIRST — call the tools their request needs — then, if it fits, add one "
+            "short question at the end ('and how should I address you?'). Never let the question "
+            "replace the work. Ask once; if they ignore it, drop it. A plain self-introduction "
+            "answers it: if they say \"I'm Leopold\", call set_honorific with that name and "
+            "never ask again.\n"
         )
     else:
         honorific_instruction = ""
@@ -2153,16 +2309,13 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "'episodic' for recent events or observations that are relevant for ~30 days, "
         "'journal' for reflections or day summaries, 'note' for short reminders or plans. "
         "Do NOT tell the user you are saving it — just save it in the background.\n"
-        "12. Exception to #8: if the user's timezone is not yet confirmed (see below) and they ask "
-        "to schedule anything at a specific clock time — a reminder like \"remind me at 6am\", a "
-        "meeting or task at a given hour, a check-in time, quiet hours — do NOT call the tool yet. "
-        "Ask what city or timezone they're in first, call set_timezone with their answer, then "
-        "complete the original request and confirm the resolved time naming the timezone THEY gave "
-        "you. Never name, guess, or imply any timezone the user has not actually confirmed — not "
-        "in the confirmation, not in passing. This does not apply to relative delays like \"in 30 "
-        "minutes\", which don't need a timezone. If a scheduling tool call ever fails because the "
-        "timezone isn't confirmed, treat that as the same signal: ask, call set_timezone, then "
-        "retry the original request.\n"
+        "12. Exception to #8: only when the timezone is unconfirmed (see below) AND the request "
+        "names an actual clock time (\"at 6am\", \"19:30\") — a reminder, a check-in, quiet "
+        "hours — don't call the tool yet: ask which city they're in, call set_timezone, then "
+        "finish the request. A plain date with no time (\"today\", \"by Friday\") needs no "
+        "timezone, and neither do relative delays (\"in 30 minutes\") — handle those normally. "
+        "Never name or imply a timezone they haven't confirmed. A tool call failing for an "
+        "unconfirmed timezone is the same signal: ask, set it, retry.\n"
         f"{lang_instruction}"
         f"{tz_section}{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
