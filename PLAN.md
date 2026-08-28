@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 12 complete
+## Status: Iteration 13 in progress (#61 done; #59, #60, #62 still backlog)
 
 ---
 
@@ -261,17 +261,18 @@ Decided:
 - No cap/limit — unlike `notes`/`profile_memory`, preferences are not bounded or pruned. (Still dedup on exact/near-duplicate text so repeating the same preference doesn't pile up entries.)
 - Yes — a user-facing way to see/edit stored preferences directly (e.g. a `/preferences` command), not only set implicitly through conversation.
 
-### 61. Confirm timezone before scheduling anything at a specific time 🔲 proposed
-When a user asks to schedule something at a specific clock time — a reminder ("remind me at 6am"), a check-in time change, etc. — the bot must first make sure it actually knows their timezone, and then explicitly confirm the resolved time back to them with the timezone named, e.g. "Setting a reminder for 6:00 AM Moscow time (Europe/Moscow)." This is a hard requirement, not a nice-to-have: today `add_reminder`/`get_current_time`/etc. just read `user.get("timezone", "UTC")` silently (`bot.py`), so a user who's never explicitly set a timezone gets everything scheduled against UTC with zero confirmation — a reminder can silently land at the wrong absolute time.
+### 61. Confirm timezone before scheduling anything at a specific time ✅ done (iteration 13)
+When a user asks to schedule something at a specific clock time — a reminder ("remind me at 6am"), a check-in time change, etc. — the bot must first make sure it actually knows their timezone, and then explicitly confirm the resolved time back to them with the timezone named, e.g. "Setting a reminder for 6:00 AM Moscow time (Europe/Moscow)." Previously `add_reminder`/`get_current_time`/etc. just read `user.get("timezone", "UTC")` silently, so a user who'd never explicitly set a timezone got everything scheduled against UTC with zero confirmation.
 
-Decided:
-- Track confirmation as a separate flag (e.g. `timezone_confirmed`), not inferred from the value still being the default `"UTC"` string.
-- That flag lives in the **database** (SQLite `user_prefs`), the same way the timezone value itself is already persisted there via `db_set_pref`/`db_get_pref` (`bot.py`) — not only in `state.json` — so it survives a `state.json` overwrite/restore exactly like the timezone override does today.
+Implemented:
+- New per-user flag `timezone_confirmed` (`_new_user()` default `False`), persisted in SQLite `user_prefs` via `db_set_pref`/`db_get_pref` and overlaid in `get_user()` — same durability pattern as the timezone value itself, survives a `state.json` overwrite/restore.
+- New helper `_set_user_timezone(chat_id, user, tz_str)` sets the timezone *and* marks it confirmed in one place; used by all three timezone-setting paths: the `set_timezone` LLM tool, `/settimezone`, and location-based auto-detect (`handle_location`).
+- Hard gate via `_timezone_gate(user)`: returns a tool-error dict (fed back to the LLM, which asks the user for their timezone and retries) when unconfirmed. Applied to the `add_reminder` tool's absolute-time branches (both `once` and daily-recurring) and the `set_checkins` tool when enabling. **Not** applied to relative delays (`delay_minutes`), which don't depend on timezone at all.
+- Same gate (as a direct user-facing message, since these are typed commands, not LLM turns) added to `/remind add`, `/remind once` (only its absolute `HH:MM` form, not `30m`/`2h`), `/remind annual`, `/setcheckin`, and `/quiethours` (only when actually setting a window, not when viewing or disabling).
+- `build_system_prompt()`'s `tz_section` now states explicitly whether the timezone is confirmed or just defaulted, plus a new numbered instruction (#12) telling the model: for absolute-time scheduling requests, ask for the timezone first if unconfirmed, call `set_timezone`, then complete the original request and confirm the resolved time with the zone named. This is an explicit carve-out from instruction #8 ("call tools immediately without asking first").
+- Tests: added coverage in `tests/test_bot.py` for the gate blocking/allowing correctly, `set_timezone` confirming and unblocking, and `set_checkins` disable not being gated; updated 7 pre-existing reminder tests to pass `timezone_confirmed=True` since they test reminder CRUD, not the new onboarding gate.
 
-Open questions to settle before implementing:
-- Scope: does this gate only reminders (things with an absolute clock time), or also `/setcheckin`, `/quiethours`, and any other time-of-day setting?
-- Confirmation flow: ask "what timezone are you in?" up front before scheduling anything if unconfirmed, vs. schedule provisionally against the current stored/default zone and always state the resolved time+zone back so the user can correct it if wrong (e.g. "6:00 AM UTC — let me know if that's not your local time")?
-- The gating logic is a system-prompt instruction, not new state, once `timezone_confirmed` exists — should live alongside `lang_instruction`/`tz_section` in `build_system_prompt()`.
+Not done (left as-is, out of scope for this pass): the confirmation flag doesn't gate `/duedate`/`/extend` (those are dates, not clock times) — only things with an actual `HH:MM`.
 
 ### 62. Treat a clarifying follow-up as an edit, not a duplicate action 🔲 proposed
 Example: user says "remind me tomorrow at 6am about зарядка [exercise]." Then, in a follow-up message, clarifies/narrows it: "про зарядку" (about the exercise) and adds "зарядку физкультурой" (meaning: by "зарядка" I mean physical workout specifically). The bot must recognize this second message as a **clarification of the reminder it just created**, not an instruction to create a second, separate reminder — today nothing in `build_system_prompt()` or the tool descriptions (`add_reminder`, `bot.py`) tells the model to check recent history for an in-flight action it just took before creating a new one, so a near-duplicate reminder is a real risk.
