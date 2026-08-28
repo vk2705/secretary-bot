@@ -563,6 +563,7 @@ def _new_user(**overrides) -> dict:
         "context": "",
         "checkin_enabled": False,
         "timezone": "UTC",
+        "timezone_confirmed": False,
         "reminders": [],
         "trackers": {},
         "habits": {},
@@ -646,6 +647,8 @@ def get_user(chat_id: int) -> dict:
     db_tz = db_get_pref(key, "timezone")
     if db_tz:
         u["timezone"] = db_tz
+    if db_get_pref(key, "timezone_confirmed") == "1":
+        u["timezone_confirmed"] = True
     # Debug-only simulated clock (DEBUG-02): SQLite is the durable store so
     # the override survives a state.json overwrite/restore, exactly like
     # timezone above. The expiry is overlaid onto the user dict too, so
@@ -658,6 +661,38 @@ def get_user(chat_id: int) -> dict:
     if db_clock_expires:
         u["debug_clock_expires"] = db_clock_expires
     return u
+
+
+def _set_user_timezone(chat_id: int, user: dict, tz_str: str) -> None:
+    """Set the timezone and mark it as explicitly confirmed by the user (as
+    opposed to sitting on the "UTC" default nobody actually chose). Persists
+    both to SQLite so they survive a state.json overwrite/restore, exactly
+    like the timezone override itself. Call sites still call save_state()
+    afterwards, same as before this helper existed."""
+    user["timezone"] = tz_str
+    user["timezone_confirmed"] = True
+    db_set_pref(str(chat_id), "timezone", tz_str)
+    db_set_pref(str(chat_id), "timezone_confirmed", "1")
+
+
+_TZ_NOT_CONFIRMED_MSG = (
+    "⚠️ I don't know your timezone yet, so I can't schedule this correctly. "
+    "Set it first with /settimezone <city or IANA zone> (or share your 📍 location), then try again."
+)
+
+
+def _timezone_gate(user: dict) -> dict | None:
+    """Return a tool-error dict if the user's timezone hasn't been explicitly
+    confirmed yet -- scheduling anything at an absolute clock time against a
+    guessed/default timezone risks silently landing at the wrong real-world
+    time (PLAN.md #61). None means it's fine to proceed. Not applied to
+    relative delays (e.g. "in 30 minutes"), which don't depend on timezone."""
+    if user.get("timezone_confirmed"):
+        return None
+    return {
+        "error": "Timezone not confirmed yet. Ask the user what city or timezone they're in, "
+                 "call set_timezone with it, then retry this exact request.",
+    }
 
 
 def _is_new_user(user: dict) -> bool:
@@ -1212,9 +1247,8 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             ZoneInfo(tz_str)
         except (ZoneInfoNotFoundError, KeyError):
             return {"error": f"Unknown timezone: {tz_raw}. Use an IANA name like Asia/Jerusalem or a UTC offset like UTC+3."}
-        user["timezone"] = tz_str
+        _set_user_timezone(chat_id, user, tz_str)
         save_state(state)
-        db_set_pref(str(chat_id), "timezone", tz_str)
         if _app:
             schedule_user_checkins(_app, chat_id)
             schedule_user_alerts(_app, chat_id)
@@ -1233,6 +1267,10 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
 
     if name == "set_checkins":
         enabled = bool(args.get("enabled", True))
+        if enabled:
+            gate = _timezone_gate(user)
+            if gate:
+                return gate
         morning = (args.get("morning") or "").strip()
         evening = (args.get("evening") or "").strip()
         def _valid_time(s):
@@ -1401,6 +1439,9 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                                     name=f"once_{chat_id}_{uuid.uuid4()}")
             return {"success": True, "once_in_minutes": delay_minutes, "message": message}
         # ── absolute time ──
+        gate = _timezone_gate(user)
+        if gate:
+            return gate
         time_str = (args.get("time") or "").strip()
         try:
             h, m = time_str.split(":")
@@ -1960,7 +2001,13 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         _utc_label = f"UTC{_offset[:3]}:{_offset[3:]}" if len(_offset) == 5 else tz_str
     except Exception:
         _utc_label = tz_str
-    tz_section = f"\nThe user's timezone is {tz_str} ({_utc_label}).\n"
+    if user.get("timezone_confirmed"):
+        tz_section = f"\nThe user's timezone is {tz_str} ({_utc_label}), confirmed by them.\n"
+    else:
+        tz_section = (
+            f"\nThe user's timezone defaults to {tz_str} ({_utc_label}) but has NOT been "
+            "confirmed by them yet.\n"
+        )
 
     # Persona: Milestone A / Phase 4 concept, landed early and minimally as a
     # user request during Milestone B — see project memory. This is deliberately
@@ -2022,6 +2069,14 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "'episodic' for recent events or observations that are relevant for ~30 days, "
         "'journal' for reflections or day summaries, 'note' for short reminders or plans. "
         "Do NOT tell the user you are saving it — just save it in the background.\n"
+        "12. Exception to #8: if the user's timezone is not yet confirmed (see below) and they ask "
+        "to schedule anything at a specific clock time — a reminder like \"remind me at 6am\", a "
+        "check-in time, quiet hours — do NOT call the tool yet. Ask what city or timezone they're "
+        "in first, call set_timezone with their answer, then complete the original request and "
+        "confirm the resolved time with the timezone named (e.g. \"Setting that for 6:00 AM Moscow "
+        "time\"). This does not apply to relative delays like \"in 30 minutes\", which don't need a "
+        "timezone. If a scheduling tool call ever fails because the timezone isn't confirmed, treat "
+        "that as the same signal: ask, call set_timezone, then retry the original request.\n"
         f"{lang_instruction}"
         f"{tz_section}{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
@@ -3589,9 +3644,8 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     user = get_user(chat_id)
-    user["timezone"] = tz_str
+    _set_user_timezone(chat_id, user, tz_str)
     save_state(state)
-    db_set_pref(str(chat_id), "timezone", tz_str)
     schedule_user_checkins(context.application, chat_id)
     schedule_user_alerts(context.application, chat_id)
     for reminder in user.get("reminders", []):
@@ -3631,9 +3685,8 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     user = get_user(update.effective_chat.id)
-    user["timezone"] = tz_str
+    _set_user_timezone(update.effective_chat.id, user, tz_str)
     save_state(state)
-    db_set_pref(str(update.effective_chat.id), "timezone", tz_str)
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
     for reminder in user.get("reminders", []):
@@ -3763,6 +3816,9 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) < 3:
             await update.message.reply_text("Usage: /remind add HH:MM <message>")
             return
+        if not user.get("timezone_confirmed"):
+            await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
+            return
         time_str = args[1]
         try:
             h, m = time_str.split(":")
@@ -3785,6 +3841,11 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         spec = args[1]
         message = " ".join(args[2:])
+        if ":" in spec and not user.get("timezone_confirmed"):
+            # Only the absolute HH:MM form of /remind once depends on timezone;
+            # the relative 30m/2h form fires N real-time minutes from now regardless.
+            await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
+            return
         delay = _parse_once_delay(spec, user.get("timezone", "UTC"))
         if delay is None or delay <= 0:
             await update.message.reply_text("Invalid time spec. Use: 30m, 2h, or HH:MM")
@@ -3830,6 +3891,9 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Usage: /remind annual MM-DD HH:MM <message>\n"
                 "Example: /remind annual 12-25 09:00 Merry Christmas!"
             )
+            return
+        if not user.get("timezone_confirmed"):
+            await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
             return
         date_str = args[1]
         time_str = args[2]
@@ -4664,6 +4728,10 @@ async def quiet_hours_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid time. Use HH:MM format.")
         return
 
+    if not user.get("timezone_confirmed"):
+        await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
+        return
+
     user["quiet_hours"] = {"start": start_str, "end": end_str}
     save_state(state)
     tz = user.get("timezone", "UTC")
@@ -4690,6 +4758,10 @@ async def set_checkin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /setcheckin <morning HH:MM> <evening HH:MM>")
+        return
+
+    if not user.get("timezone_confirmed"):
+        await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
         return
 
     def _valid(s):

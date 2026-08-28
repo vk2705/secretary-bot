@@ -115,7 +115,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 - **`state.json`** — tasks, conversation history, user prefs (timezone, check-in times, quiet hours, habits, trackers, archived tasks, `today_focus`, `language`, `milestones_sent`, `muted_until`, `llm`). Written atomically via `tempfile.mkstemp` + `os.replace`.
 - **`bot_memory.db`** (SQLite, WAL mode) — notes, journal entries, profile memory, episodic memory, encrypted API keys, rate-limit log, job-fire log, `user_prefs` (critical prefs that must survive a `state.json` overwrite/restore — currently just `timezone`), `reminder_log` (append-only history of every reminder ever created/removed, so removed reminders stay searchable). `_db()` opens a new connection per call (thread-safe). `_init_db()` creates all tables and migrates legacy data from state.json.
 
-`get_user(chat_id)` overlays `user_prefs.timezone` from SQLite onto `state.json`'s copy on every call — SQLite wins if set. This is why `set_timezone`/`/settimezone`/location-detection all call `db_set_pref(chat_id, "timezone", ...)` in addition to setting `user["timezone"]`: without the SQLite write, a stale `/import` or manual `state.json` edit would silently revert the user's timezone.
+`get_user(chat_id)` overlays `user_prefs.timezone` from SQLite onto `state.json`'s copy on every call — SQLite wins if set. This is why `set_timezone`/`/settimezone`/location-detection all call `db_set_pref(chat_id, "timezone", ...)` in addition to setting `user["timezone"]`: without the SQLite write, a stale `/import` or manual `state.json` edit would silently revert the user's timezone. The same three call sites also set `user["timezone_confirmed"] = True` and `db_set_pref(chat_id, "timezone_confirmed", "1")` (via the `_set_user_timezone()` helper) — see "Timezone confirmation gate" below.
 
 ### State schema (per user, authoritative source: `_new_user()`)
 
@@ -126,6 +126,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
   "context": "user-set description of themselves",
   "checkin_enabled": false,
   "timezone": "UTC",
+  "timezone_confirmed": false,
   "checkin_times": {"morning": "08:00", "evening": "21:00"},
   "quiet_hours": {"start": null, "end": null},
   "reminders": [{"id": "uuid4", "time": "HH:MM", "message": "...", "once": false}],
@@ -146,6 +147,8 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 `pending_checkin` holds `"morning"`/`"evening"`/`null` — set to the check-in label whenever a proactive check-in fires, cleared whenever the user genuinely engages (any `chat()` call with `touch_activity=True`, the default). Used to (a) tell the model when a check-in went unanswered so it can acknowledge the silence instead of repeating the same prompt, and (b) keep `activity_days`/streak honest — see below.
 
 `get_user(chat_id)` forward-fills any missing keys using `_new_user()` defaults, so new fields are automatically backward-compatible.
+
+**Timezone confirmation gate (PLAN.md #61):** `timezone_confirmed` distinguishes "the user explicitly told us their timezone" from "still sitting on the `UTC` default nobody chose." `_timezone_gate(user)` returns a tool-error dict (fed back to the LLM, which asks the user for their timezone and retries) whenever it's `False` and something is about to be scheduled at an absolute clock time — applied to the `add_reminder` tool's absolute-time branches and `set_checkins` when enabling, plus the equivalent direct checks in `/remind add|once|annual`, `/setcheckin`, and `/quiethours`. It deliberately does **not** gate relative delays (`add_reminder`'s `delay_minutes`, or `/remind once 30m`), which don't depend on timezone at all. `build_system_prompt()`'s `tz_section` states the confirmation status explicitly so the model asks proactively instead of only discovering it via a tool error.
 
 ### Key functions
 

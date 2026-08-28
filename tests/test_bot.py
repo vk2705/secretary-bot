@@ -577,7 +577,7 @@ class TestExecuteToolUnit:
         assert "error" in result  # no scheduler available
 
     def test_add_reminder_daily_stored(self):
-        bot.state["users"]["10"] = fresh_user()
+        bot.state["users"]["10"] = fresh_user(timezone_confirmed=True)
         bot._app = MagicMock()
         bot._app.job_queue = MagicMock()
         with patch("bot.schedule_user_reminder"):
@@ -586,6 +586,56 @@ class TestExecuteToolUnit:
             }))
         assert result["success"] is True
         assert len(bot.state["users"]["10"]["reminders"]) == 1
+
+    def test_add_reminder_absolute_time_blocked_without_confirmed_timezone(self):
+        """PLAN.md #61: don't schedule anything at a clock time until the
+        user's timezone has been explicitly confirmed (not just defaulted)."""
+        bot.state["users"]["10"] = fresh_user()
+        bot._app = MagicMock()
+        bot._app.job_queue = MagicMock()
+        with patch("bot.schedule_user_reminder"):
+            result = run(bot._execute_tool(10, "add_reminder", {
+                "message": "Evening walk", "time": "20:00"
+            }))
+        assert "error" in result
+        assert "timezone" in result["error"].lower()
+        assert len(bot.state["users"]["10"]["reminders"]) == 0
+
+    def test_add_reminder_relative_delay_not_gated_by_timezone(self):
+        """A relative delay ("in N minutes") doesn't depend on timezone, so it
+        should work even before the user has confirmed one."""
+        bot.state["users"]["10"] = fresh_user()
+        bot._app = MagicMock()
+        bot._app.job_queue = MagicMock()
+        result = run(bot._execute_tool(10, "add_reminder", {
+            "message": "Take medicine", "delay_minutes": 5
+        }))
+        assert result["success"] is True
+
+    def test_set_timezone_confirms_and_unblocks_reminders(self):
+        bot.state["users"]["10"] = fresh_user()
+        run(bot._execute_tool(10, "set_timezone", {"timezone": "Europe/Moscow"}))
+        assert bot.state["users"]["10"]["timezone_confirmed"] is True
+        bot._app = MagicMock()
+        bot._app.job_queue = MagicMock()
+        with patch("bot.schedule_user_reminder"):
+            result = run(bot._execute_tool(10, "add_reminder", {
+                "message": "Evening walk", "time": "20:00"
+            }))
+        assert result["success"] is True
+
+    def test_set_checkins_blocked_without_confirmed_timezone(self):
+        bot.state["users"]["10"] = fresh_user()
+        result = run(bot._execute_tool(10, "set_checkins", {"enabled": True}))
+        assert "error" in result
+        assert "timezone" in result["error"].lower()
+
+    def test_set_checkins_disable_not_gated_by_timezone(self):
+        """Turning check-ins off doesn't schedule anything, so it shouldn't
+        require a confirmed timezone."""
+        bot.state["users"]["10"] = fresh_user()
+        result = run(bot._execute_tool(10, "set_checkins", {"enabled": False}))
+        assert result == {"success": True, "enabled": False}
 
     def test_add_journal_entry(self):
         bot.state["users"]["10"] = fresh_user()
@@ -1160,7 +1210,7 @@ class TestNewExecuteTools:
     # ── get_reminders / remove_reminder ──────────────────────────────────────
 
     def test_get_reminders_tool(self):
-        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"] = fresh_user(timezone_confirmed=True)
         run(bot._execute_tool(20, "add_reminder", {"message": "drink water", "time": "09:00"}))
         run(bot._execute_tool(20, "add_reminder", {"message": "stretch", "time": "10:00"}))
         result = run(bot._execute_tool(20, "get_reminders", {}))
@@ -1175,7 +1225,7 @@ class TestNewExecuteTools:
         assert result["count"] == 0
 
     def test_remove_reminder_success(self):
-        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"] = fresh_user(timezone_confirmed=True)
         run(bot._execute_tool(20, "add_reminder", {"message": "drink water", "time": "09:00"}))
         run(bot._execute_tool(20, "add_reminder", {"message": "stretch", "time": "10:00"}))
         result = run(bot._execute_tool(20, "remove_reminder", {"reminder_number": 1}))
@@ -1190,7 +1240,7 @@ class TestNewExecuteTools:
         assert "error" in result
 
     def test_add_reminder_with_reason(self):
-        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"] = fresh_user(timezone_confirmed=True)
         run(bot._execute_tool(20, "add_reminder", {
             "message": "Do exercise", "time": "11:00", "reason": "to keep your leg mobile",
         }))
@@ -1198,7 +1248,7 @@ class TestNewExecuteTools:
         assert result["reminders"][0]["reason"] == "to keep your leg mobile"
 
     def test_get_reminders_include_history(self):
-        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"] = fresh_user(timezone_confirmed=True)
         run(bot._execute_tool(20, "add_reminder", {
             "message": "Do exercise", "time": "11:00", "reason": "stay active",
         }))
@@ -1211,7 +1261,7 @@ class TestNewExecuteTools:
         assert result["history"][0]["status"] == "removed"
 
     def test_search_finds_active_reminder(self):
-        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"] = fresh_user(timezone_confirmed=True)
         run(bot._execute_tool(20, "add_reminder", {
             "message": "Do exercise", "time": "11:00", "reason": "stay active",
         }))
@@ -1220,7 +1270,7 @@ class TestNewExecuteTools:
         assert result["reminders"][0]["status"] == "active"
 
     def test_search_finds_removed_reminder(self):
-        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"] = fresh_user(timezone_confirmed=True)
         run(bot._execute_tool(20, "add_reminder", {"message": "Do exercise", "time": "11:00"}))
         run(bot._execute_tool(20, "remove_reminder", {"reminder_number": 1}))
         result = run(bot._execute_tool(20, "search", {"query": "exercise"}))

@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 12 complete
+## Status: Iteration 13 in progress (#61 done; #59, #60, #62 still backlog)
 
 ---
 
@@ -240,6 +240,47 @@ Shows real-time rate limit status: messages used this hour, messages remaining, 
 - Tag-filtered task display now shows ♻️ recurring indicator
 - `_execute_tool add_task` returns a warning (not silent success) when `due_date` is invalid
 - `mute_status` in `/mystats` no longer has a spurious leading newline
+
+## Backlog (ideas — not yet implemented, pending discussion)
+
+### 59. Capture user complaints about bot mistakes 🔲 proposed
+When a user expresses dissatisfaction with something the bot did — e.g. they wrote in Russian but the bot answered in English, or gave wrong/ignored info — that complaint currently just sits in `history` and gets lost. It should be captured somewhere durable so recurring failure patterns (like language mismatches) can actually get reviewed and fixed instead of silently repeating.
+
+Open questions to settle before implementing:
+- How to detect "the user is complaining about the bot" — a dedicated tool the LLM calls when it recognizes dissatisfaction, vs. a keyword/heuristic pass over messages?
+- What to store per complaint: chat_id, timestamp, the user's message, what the bot did (e.g. last assistant reply + language used), and a rough category (e.g. `wrong_language`, `wrong_info`, `ignored_instruction`).
+- Where it lives — new SQLite table (e.g. `complaints`), similar to `notes`/`journal`.
+- Whether/how it surfaces — an admin command to review recent complaints (e.g. `/complaints`), or just a raw table queried manually for now.
+
+### 60. Reliable persistence of user-given LLM behavior preferences 🔲 proposed
+Right now, if a user tells the bot a standing style/behavior preference — e.g. "always use emojis in reminders", "keep replies short", "never use my first name" — there's no dedicated place that reliably captures and enforces it. The only path today is the LLM voluntarily calling `save_memory` to write it into `profile_memory`, which then shows up in every system prompt (`build_system_prompt`) as a "permanent user fact" — but whether the model bothers to save it, and whether it then actually honors it every time (including in code paths that re-invoke the LLM, like `_run_reminder`'s paraphrasing step), is not guaranteed by anything in the code. This is the same root cause behind #59's example (Russian in, English out) and the emoji-reminder question: preferences are memory-dependent, not enforced.
+
+Decided:
+- Yes — a distinct, structured `preferences` store, separate from general `profile_memory` facts, always surfaced verbatim near the top of the system prompt (higher priority than free-form facts), not mixed in with arbitrary permanent facts.
+- Yes — a dedicated `save_preference` tool, separate from `save_memory`, so the model is nudged to use it specifically for standing instructions about its own behavior (tone, formatting, language, emoji use, etc.) rather than facts about the user's life.
+- No cap/limit — unlike `notes`/`profile_memory`, preferences are not bounded or pruned. (Still dedup on exact/near-duplicate text so repeating the same preference doesn't pile up entries.)
+- Yes — a user-facing way to see/edit stored preferences directly (e.g. a `/preferences` command), not only set implicitly through conversation.
+
+### 61. Confirm timezone before scheduling anything at a specific time ✅ done (iteration 13)
+When a user asks to schedule something at a specific clock time — a reminder ("remind me at 6am"), a check-in time change, etc. — the bot must first make sure it actually knows their timezone, and then explicitly confirm the resolved time back to them with the timezone named, e.g. "Setting a reminder for 6:00 AM Moscow time (Europe/Moscow)." Previously `add_reminder`/`get_current_time`/etc. just read `user.get("timezone", "UTC")` silently, so a user who'd never explicitly set a timezone got everything scheduled against UTC with zero confirmation.
+
+Implemented:
+- New per-user flag `timezone_confirmed` (`_new_user()` default `False`), persisted in SQLite `user_prefs` via `db_set_pref`/`db_get_pref` and overlaid in `get_user()` — same durability pattern as the timezone value itself, survives a `state.json` overwrite/restore.
+- New helper `_set_user_timezone(chat_id, user, tz_str)` sets the timezone *and* marks it confirmed in one place; used by all three timezone-setting paths: the `set_timezone` LLM tool, `/settimezone`, and location-based auto-detect (`handle_location`).
+- Hard gate via `_timezone_gate(user)`: returns a tool-error dict (fed back to the LLM, which asks the user for their timezone and retries) when unconfirmed. Applied to the `add_reminder` tool's absolute-time branches (both `once` and daily-recurring) and the `set_checkins` tool when enabling. **Not** applied to relative delays (`delay_minutes`), which don't depend on timezone at all.
+- Same gate (as a direct user-facing message, since these are typed commands, not LLM turns) added to `/remind add`, `/remind once` (only its absolute `HH:MM` form, not `30m`/`2h`), `/remind annual`, `/setcheckin`, and `/quiethours` (only when actually setting a window, not when viewing or disabling).
+- `build_system_prompt()`'s `tz_section` now states explicitly whether the timezone is confirmed or just defaulted, plus a new numbered instruction (#12) telling the model: for absolute-time scheduling requests, ask for the timezone first if unconfirmed, call `set_timezone`, then complete the original request and confirm the resolved time with the zone named. This is an explicit carve-out from instruction #8 ("call tools immediately without asking first").
+- Tests: added coverage in `tests/test_bot.py` for the gate blocking/allowing correctly, `set_timezone` confirming and unblocking, and `set_checkins` disable not being gated; updated 7 pre-existing reminder tests to pass `timezone_confirmed=True` since they test reminder CRUD, not the new onboarding gate.
+
+Not done (left as-is, out of scope for this pass): the confirmation flag doesn't gate `/duedate`/`/extend` (those are dates, not clock times) — only things with an actual `HH:MM`.
+
+### 62. Treat a clarifying follow-up as an edit, not a duplicate action 🔲 proposed
+Example: user says "remind me tomorrow at 6am about зарядка [exercise]." Then, in a follow-up message, clarifies/narrows it: "про зарядку" (about the exercise) and adds "зарядку физкультурой" (meaning: by "зарядка" I mean physical workout specifically). The bot must recognize this second message as a **clarification of the reminder it just created**, not an instruction to create a second, separate reminder — today nothing in `build_system_prompt()` or the tool descriptions (`add_reminder`, `bot.py`) tells the model to check recent history for an in-flight action it just took before creating a new one, so a near-duplicate reminder is a real risk.
+
+Open questions to settle before implementing:
+- Is this purely a system-prompt instruction (e.g. "before calling add_reminder/add_task/etc., check whether the last 1-2 turns already created something this message is clarifying — if so, call remove_reminder + add_reminder (or an update path) instead of adding a new one"), or does it need a structural change — e.g. an `update_reminder` tool instead of relying on the model to compose remove+add itself?
+- How far back / how narrow a window counts as "recent enough to be a clarification" vs. "a genuinely new, similar reminder" (e.g. user asks for a second workout reminder in the same conversation) — needs some judgment call the model makes from context, not a hard rule.
+- Does this generalize beyond reminders — same risk exists for `add_task`, `add_habit`, `create_tracker` when a user immediately refines what they just asked for.
 
 ## Implementation order
 
