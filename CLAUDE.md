@@ -92,6 +92,44 @@ How it stays honest and contained:
   execute a job body, use the owner-gated `/debug fire <job>`, which works here
   under `--owner`.
 
+## `admin.py` — CLI for editing live data
+
+Stops the bot, edits `state.json`/`bot_memory.db` through `bot.py`'s real
+functions (never hand-edits JSON/SQLite), restarts the bot. Same stub trick
+as `console.py`. Commands: `list-users`, `show-user <chat_id>`,
+`set-timezone <chat_id> <iana_tz>`, `list-reminders <chat_id>`,
+`remove-reminder <chat_id> <n>`. Read-only commands don't touch the running
+process. Refuses to start a second bot instance (Telegram allows only one
+`getUpdates` poller — a second process crashes both with `409 Conflict`).
+
+```bash
+export $(grep -v '^#' env | xargs) && python3 admin.py list-users
+python3 admin.py set-timezone 5838336004 Asia/Yekaterinburg
+```
+
+## `backup.sh` — hourly data backup
+
+Copies `state.json` + `bot_memory.db` into a **separate, private** GitHub
+repo (`vk2705/secretary-bot-backups`, cloned at
+`/home/ec2-user/secretary-bot-backups`) and commits + pushes if anything
+changed. Deliberately a different repo from this one — those two files hold
+a real person's journal and behavioral memory, so they must never end up in
+this (public) code repository's history, gitignored or not.
+
+Run via `secretary-bot-backup.timer` (systemd, hourly, `Persistent=true` so
+a missed run catches up after downtime) → `secretary-bot-backup.service` →
+`backup.sh`. Follows the same systemd pattern as `secretary-mcp.service`
+rather than cron, which isn't installed on this host. Check with
+`systemctl status secretary-bot-backup.timer` / `journalctl -u
+secretary-bot-backup.service`. No bot stop/restart needed for backups —
+`save_state()`'s atomic tempfile+`os.replace()` write means any read of
+`state.json` mid-write is always a complete, consistent version, never a
+torn one.
+
+Restore: `git show <commit>:state.json > state.json` (and `bot_memory.db`
+the same way) from inside the backup repo, after stopping the bot — see
+that repo's README.
+
 ## Environment (`env` file)
 
 | Variable | Required | Purpose |
