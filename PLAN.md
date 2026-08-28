@@ -261,6 +261,15 @@ Decided:
 - No cap/limit — unlike `notes`/`profile_memory`, preferences are not bounded or pruned. (Still dedup on exact/near-duplicate text so repeating the same preference doesn't pile up entries.)
 - Yes — a user-facing way to see/edit stored preferences directly (e.g. a `/preferences` command), not only set implicitly through conversation.
 
+### 61. Confirm timezone before scheduling anything at a specific time 🔲 proposed
+When a user asks to schedule something at a specific clock time — a reminder ("remind me at 6am"), a check-in time change, etc. — the bot must first make sure it actually knows their timezone, and then explicitly confirm the resolved time back to them with the timezone named, e.g. "Setting a reminder for 6:00 AM Moscow time (Europe/Moscow)." This is a hard requirement, not a nice-to-have: today `add_reminder`/`get_current_time`/etc. just read `user.get("timezone", "UTC")` silently (`bot.py`), so a user who's never explicitly set a timezone gets everything scheduled against UTC with zero confirmation — a reminder can silently land at the wrong absolute time.
+
+Open questions to settle before implementing:
+- How to detect "timezone not yet confirmed" vs. "user genuinely lives in UTC" — a separate boolean (e.g. `timezone_confirmed`) rather than inferring it from the value still being the default `"UTC"` string?
+- Scope: does this gate only reminders (things with an absolute clock time), or also `/setcheckin`, `/quiethours`, and any other time-of-day setting?
+- Confirmation flow: ask "what timezone are you in?" up front before scheduling anything if unconfirmed, vs. schedule provisionally against the current stored/default zone and always state the resolved time+zone back so the user can correct it if wrong (e.g. "6:00 AM UTC — let me know if that's not your local time")?
+- This is a system-prompt instruction, not new state, once `timezone_confirmed` (if used) exists — should live alongside `lang_instruction`/`tz_section` in `build_system_prompt()`.
+
 ## Implementation order
 
 1. [x] Write PLAN.md
