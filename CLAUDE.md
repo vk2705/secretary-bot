@@ -107,6 +107,19 @@ export $(grep -v '^#' env | xargs) && python3 admin.py list-users
 python3 admin.py set-timezone 5838336004 Asia/Yekaterinburg
 ```
 
+## `githooks/post-commit` — auto-restart the bot after a code change
+
+Every commit to `master` that touches `bot.py` or `requirements.txt`
+restarts the live bot automatically (via `admin.py restart-bot`), so a code
+change goes live without a manual kill+nohup. Commits that only touch
+docs/tests/`PLAN.md` are left alone — nothing in memory changed, so nothing
+needs restarting. Only fires on `master` (this repo is worked on directly
+there — see the top-level project instructions).
+
+Hooks live in the tracked `githooks/` directory, not `.git/hooks/` (which
+git never versions), wired in via `core.hooksPath`. **One-time setup on any
+fresh clone**: `git config core.hooksPath githooks`.
+
 ## `backup.sh` — hourly data backup
 
 Copies `state.json` + `bot_memory.db` into a **separate, private** GitHub

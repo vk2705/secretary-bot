@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# post-commit — restart the live bot after a commit that actually touches
+# code it runs (bot.py, requirements.txt), so a code change goes live
+# without a manual kill+nohup every time. Never restarts for a commit that
+# only touches docs/tests/PLAN.md — those don't change what's in memory.
+#
+# Only acts on master: this repo is worked on directly on master (see
+# CLAUDE.md), so a commit lands here exactly when it's meant to be live,
+# not mid-review on a feature branch.
+#
+# Uses admin.py's own stop/start machinery (not a hand-rolled kill+nohup)
+# so this hook can never diverge from the one restart path already proven
+# safe against Telegram's single-poller constraint (see admin.py's history:
+# a naive pgrep-based restart here caused a real 409 Conflict crash loop
+# during development).
+
+set -euo pipefail
+
+REPO="$(git rev-parse --show-toplevel)"
+cd "$REPO"
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$BRANCH" != "master" ]; then
+  exit 0
+fi
+
+CHANGED="$(git diff --name-only HEAD@{1} HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD 2>/dev/null || echo bot.py)"
+if ! echo "$CHANGED" | grep -qE '^(bot\.py|requirements\.txt)$'; then
+  exit 0
+fi
+
+echo "post-commit: bot.py or requirements.txt changed — restarting live bot" >&2
+
+if [ ! -r "$REPO/env" ]; then
+  echo "post-commit: $REPO/env missing — skipping restart, restart manually" >&2
+  exit 0
+fi
+
+set -a
+. "$REPO/env"
+set +a
+
+"$REPO/venv/bin/python3" "$REPO/admin.py" restart-bot >&2 || \
+  echo "post-commit: restart failed — check nohup.out and restart manually" >&2
+
+exit 0
