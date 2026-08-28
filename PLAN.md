@@ -1,6 +1,6 @@
 # Secretary Bot — Feature Expansion Plan
 
-## Status: Iteration 13 in progress (#61 done; #59, #60, #62 still backlog)
+## Status: Iteration 13 in progress (#61 done; #59, #60, #62, #63 still backlog)
 
 ---
 
@@ -277,10 +277,43 @@ Not done (left as-is, out of scope for this pass): the confirmation flag doesn't
 ### 62. Treat a clarifying follow-up as an edit, not a duplicate action 🔲 proposed
 Example: user says "remind me tomorrow at 6am about зарядка [exercise]." Then, in a follow-up message, clarifies/narrows it: "про зарядку" (about the exercise) and adds "зарядку физкультурой" (meaning: by "зарядка" I mean physical workout specifically). The bot must recognize this second message as a **clarification of the reminder it just created**, not an instruction to create a second, separate reminder — today nothing in `build_system_prompt()` or the tool descriptions (`add_reminder`, `bot.py`) tells the model to check recent history for an in-flight action it just took before creating a new one, so a near-duplicate reminder is a real risk.
 
+**Confirmed in live data (2026-08-28)**: user `5838336004` has exactly this
+— three near-duplicate daily reminders, all at `06:00`, all themed "утренняя
+пробежка"/"morning run": `"Напоминание о пробежке"`, `"Утренняя пробежка!
+🏃‍♂️✨"`, `"🏃‍♀️ Утренняя пробежка!"`. Textbook case of successive
+clarifying messages each producing a new `add_reminder` call instead of
+editing the one already made.
+
 Open questions to settle before implementing:
 - Is this purely a system-prompt instruction (e.g. "before calling add_reminder/add_task/etc., check whether the last 1-2 turns already created something this message is clarifying — if so, call remove_reminder + add_reminder (or an update path) instead of adding a new one"), or does it need a structural change — e.g. an `update_reminder` tool instead of relying on the model to compose remove+add itself?
 - How far back / how narrow a window counts as "recent enough to be a clarification" vs. "a genuinely new, similar reminder" (e.g. user asks for a second workout reminder in the same conversation) — needs some judgment call the model makes from context, not a hard rule.
 - Does this generalize beyond reminders — same risk exists for `add_task`, `add_habit`, `create_tracker` when a user immediately refines what they just asked for.
+
+### 63. Existing users predate `timezone_confirmed` — same silent-UTC risk as #61 was meant to close 🔲 proposed
+`_new_user()`'s `timezone_confirmed` field (added by #61) only exists for
+users created after that change. Every user registered before it —
+confirmed via live `state.json`/SQLite `user_prefs` check on 2026-08-28 —
+has no `timezone_confirmed` key at all (not `False`, just absent), and
+`get_user()`'s forward-fill only adds *missing* keys with `_new_user()`
+defaults, so an old user picks up `timezone_confirmed: False` the next time
+they're loaded — but if they already have reminders scheduled at an
+absolute clock time from before #61 existed, those keep firing at whatever
+UTC-based time they were created with, with no retroactive prompt to
+confirm.
+
+**Confirmed in live data**: user `5838336004` — `timezone: "UTC"` (never
+set), `timezone_confirmed` absent, three daily reminders at `06:00`
+(see #62 above) that have been firing at 6am UTC, not the user's actual
+local morning, this whole time.
+
+Open questions to settle before implementing:
+- One-time backfill/migration in `_init_db()` or `get_user()` that flags
+  every reminder created before `timezone_confirmed` existed as
+  "unconfirmed timezone" and prompts the user once, vs. a passive check
+  that only asks the next time they touch scheduling.
+- Whether to proactively message affected existing users (a one-time
+  broadcast-style nudge) or wait for them to interact with anything
+  timezone-sensitive.
 
 ## Implementation order
 
