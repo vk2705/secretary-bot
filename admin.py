@@ -240,6 +240,12 @@ def cmd_remove_reminder(bot, args) -> None:
             sys.exit(1)
         removed = reminders.pop(n - 1)
         bot.save_state(bot.state)
+        # Mirror the remove_reminder tool: reminder_log is an append-only
+        # history, so without this the deleted reminder still reads as active
+        # in get_reminders(include_history=true) and in search results.
+        # (No job to cancel here — the bot process is stopped, and it rebuilds
+        # every job from state on the restart that follows.)
+        bot.db_mark_reminder_removed(chat_id, removed["id"])
         print(f"chat_id {chat_id}: removed reminder {n} — {removed['time']} {removed['message']!r}")
 
     _with_bot_stopped(_do)

@@ -72,6 +72,14 @@ def _get_fernet() -> Fernet:
 # Rate limiting: max AI calls per hour per user (backed by SQLite)
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
+# Per-tracker retention cap, enforced on write (log_tracker) and on /import.
+TRACKER_LOG_CAP = 5000
+# /debug prompt sends the prompt inline up to this length, as a document above it
+# (Telegram's own message cap is 4096; this leaves room for delivery overhead).
+DEBUG_PROMPT_INLINE_MAX = 4000
+# Legacy in-memory snooze store. Superseded by the snooze_tokens SQLite table
+# (which survives restarts); kept only so a button delivered before that switch
+# still resolves. Nothing writes to it any more.
 _snooze_cache: dict[str, dict] = {}  # token → {"message": ..., "reason": ...}
 _app = None  # set in main(); used by tool executor to schedule reminders
 
@@ -157,6 +165,17 @@ def _init_db() -> None:
                 time           TEXT,
                 created_at     TEXT    NOT NULL,
                 removed_at     TEXT
+            );
+            -- Payload behind each "🔁 Snooze 30 min" button. Persisted (not just
+            -- an in-memory dict) so a restart between delivering a reminder and
+            -- the user tapping Snooze doesn't turn the button into "Snooze
+            -- expired" — restarts are routine now that a bot.py commit triggers one.
+            CREATE TABLE IF NOT EXISTS snooze_tokens (
+                token      TEXT PRIMARY KEY,
+                chat_id    TEXT NOT NULL,
+                message    TEXT NOT NULL,
+                reason     TEXT,
+                created_at TEXT NOT NULL
             );
             -- One-time codes proving a Telegram account requested an MCP Google link
             -- (Milestone B / AUTH-02). 10-minute TTL, single-use, consumed by mcp_server.py.
@@ -418,6 +437,33 @@ def db_mark_reminder_removed(chat_id: str, reminder_uuid: str) -> None:
             "UPDATE reminder_log SET removed_at=? WHERE chat_id=? AND reminder_uuid=? AND removed_at IS NULL",
             (datetime.utcnow().isoformat(), str(chat_id), reminder_uuid)
         )
+
+
+def db_save_snooze(token: str, chat_id: int, message: str, reason: str | None) -> None:
+    """Persist the payload behind a Snooze button. Also prunes entries older
+    than a day — a button nobody tapped in 24h is not coming back."""
+    with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO snooze_tokens(token, chat_id, message, reason, created_at) "
+            "VALUES(?,?,?,?,?)",
+            (token, str(chat_id), message, reason, datetime.utcnow().isoformat()),
+        )
+        con.execute(
+            "DELETE FROM snooze_tokens WHERE created_at < ?",
+            ((datetime.utcnow() - timedelta(days=1)).isoformat(),),
+        )
+
+
+def db_take_snooze(token: str) -> dict | None:
+    """Pop a snooze payload by token (single-use, like the in-memory cache)."""
+    with _db() as con:
+        row = con.execute(
+            "SELECT message, reason FROM snooze_tokens WHERE token=?", (token,)
+        ).fetchone()
+        if row is None:
+            return None
+        con.execute("DELETE FROM snooze_tokens WHERE token=?", (token,))
+    return {"message": row["message"], "reason": row["reason"]}
 
 
 def db_get_reminder_history(chat_id: str, limit: int = 50) -> list[sqlite3.Row]:
@@ -812,8 +858,12 @@ TOOLS = [
         "function": {
             "name": "set_timezone",
             "description": (
-                "Save the user's timezone. Always convert city/country names to IANA form "
-                "('Moscow' → 'Europe/Moscow'). Also accepts offsets like 'UTC+3'."
+                "Save the timezone the user has EXPLICITLY told you they are in. Convert the "
+                "city/country they named to IANA form (e.g. a user who says they're in Berlin "
+                "→ 'Europe/Berlin'). Also accepts offsets like 'UTC+3'. Never infer a timezone "
+                "from the language they write in, their name, or any other indirect hint — if "
+                "they haven't stated where they are, ask instead of calling this. Calling it "
+                "marks the timezone as user-confirmed, which suppresses later prompts to ask."
             ),
             "parameters": {
                 "type": "object",
@@ -1252,7 +1302,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         if _app:
             schedule_user_checkins(_app, chat_id)
             schedule_user_alerts(_app, chat_id)
-            for reminder in user.get("reminders", []):
+            for reminder in list(user.get("reminders", [])):
                 if not reminder.get("annual"):
                     schedule_user_reminder(_app, chat_id, reminder)
         # Build friendly label
@@ -1261,9 +1311,27 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             _now_dt = datetime.now(_tz)
             _off = _now_dt.strftime("%z")
             _label = f"UTC{_off[:3]}:{_off[3:]}" if len(_off) == 5 else tz_str
+            _local_now = _now_dt.strftime("%H:%M")
         except Exception:
             _label = tz_str
-        return {"success": True, "timezone": tz_str, "utc_offset": _label}
+            _local_now = None
+        # The model does the place→IANA conversion itself, unverified, so for an
+        # unknown or misspelled place it can land on a plausible-but-wrong zone
+        # and then report it back in the user's own words ("7am Muhosransk
+        # time") — hiding the substitution. Hand back what was actually stored,
+        # plus the resulting local time, and require the model to say it.
+        return {
+            "success": True,
+            "timezone": tz_str,
+            "utc_offset": _label,
+            "local_time_now": _local_now,
+            "confirm_to_user": (
+                f"Tell the user plainly which timezone was set — '{tz_str}' ({_label}) — and that "
+                f"it is currently {_local_now} there. Use this zone name, never the place name they "
+                "typed, unless the two clearly match. If it does not match where they said they "
+                "are, say so and ask them to correct it."
+            ) if _local_now else None,
+        }
 
     if name == "set_checkins":
         enabled = bool(args.get("enabled", True))
@@ -1376,20 +1444,29 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         if len(archived) > 100:
             user["archived_tasks"] = archived[-100:]
         if recur:
-            current_due = _task_due(task) or date.today().isoformat()
+            today = _today(user=user)
+            current_due = _task_due(task) or today.isoformat()
             try:
                 base = date.fromisoformat(current_due)
             except ValueError:
-                base = date.today()
-            if recur == "daily":
-                next_due = base + timedelta(days=1)
-            elif recur == "weekly":
-                next_due = base + timedelta(weeks=1)
-            else:
-                m = base.month % 12 + 1
-                y = base.year + (1 if base.month == 12 else 0)
-                d = min(base.day, calendar.monthrange(y, m)[1])
-                next_due = date(y, m, d)
+                base = today
+            # Roll forward from today when the stored due date is already in the
+            # past, otherwise completing a task neglected for a month just moves
+            # it from 30 days overdue to 29 — still overdue, still in the 09:00
+            # deadline alert, and needing 30 completions to catch up.
+            if base < today:
+                base = today
+
+            def _advance(d0: date) -> date:
+                if recur == "daily":
+                    return d0 + timedelta(days=1)
+                if recur == "weekly":
+                    return d0 + timedelta(weeks=1)
+                m = d0.month % 12 + 1
+                y = d0.year + (1 if d0.month == 12 else 0)
+                return date(y, m, min(d0.day, calendar.monthrange(y, m)[1]))
+
+            next_due = _advance(base)
             tasks[n - 1] = {"text": _task_text(task), "due": next_due.isoformat(), "recur": recur}
             save_state(state)
             return {"success": True, "completed": _task_text(task), "next_due": next_due.isoformat(), "recurs": recur}
@@ -1410,8 +1487,8 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             return {"error": "value must be a number"}
         log = trackers[tname].setdefault("log", [])
         log.append({"ts": datetime.utcnow().isoformat(), "value": value})
-        if len(log) > 5000:  # keep last 5000 entries per tracker
-            trackers[tname]["log"] = log[-5000:]
+        if len(log) > TRACKER_LOG_CAP:
+            trackers[tname]["log"] = log[-TRACKER_LOG_CAP:]
         unit = trackers[tname].get("unit", "")
         save_state(state)
         return {"success": True, "logged": f"{value}{unit}", "tracker": tname}
@@ -1456,11 +1533,18 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             delay = _parse_once_delay(time_str, user_tz)
             if delay is None or delay <= 0:
                 return {"error": f"Time {time_str} is in the past or invalid"}
-            db_log_reminder(chat_id, None, message, reason, "once", time_str)
-            async def _once_time_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message, _reason=reason):
-                await _run_reminder(ctx, _cid, {"message": _msg, "reason": _reason}, simulate=False)
-            _app.job_queue.run_once(_once_time_job, when=delay,
-                                    name=f"once_{chat_id}_{uuid.uuid4()}")
+            # Persisted (unlike the delay_minutes branch above) so restore_all_jobs
+            # can re-arm it: a one-shot scheduled for tonight used to vanish on any
+            # restart between now and then, silently, after the bot had confirmed it.
+            reminder = {
+                "id": str(uuid.uuid4()), "time": time_str, "message": message,
+                "once": True, "reason": reason,
+                "fire_at": (datetime.utcnow() + timedelta(seconds=delay)).isoformat(),
+            }
+            user.setdefault("reminders", []).append(reminder)
+            save_state(state)
+            db_log_reminder(chat_id, reminder["id"], message, reason, "once", time_str)
+            schedule_user_reminder(_app, chat_id, reminder)
             return {"success": True, "once_at": time_str, "message": message}
         # ── daily recurring ──
         reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False, "reason": reason}
@@ -2071,12 +2155,14 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "Do NOT tell the user you are saving it — just save it in the background.\n"
         "12. Exception to #8: if the user's timezone is not yet confirmed (see below) and they ask "
         "to schedule anything at a specific clock time — a reminder like \"remind me at 6am\", a "
-        "check-in time, quiet hours — do NOT call the tool yet. Ask what city or timezone they're "
-        "in first, call set_timezone with their answer, then complete the original request and "
-        "confirm the resolved time with the timezone named (e.g. \"Setting that for 6:00 AM Moscow "
-        "time\"). This does not apply to relative delays like \"in 30 minutes\", which don't need a "
-        "timezone. If a scheduling tool call ever fails because the timezone isn't confirmed, treat "
-        "that as the same signal: ask, call set_timezone, then retry the original request.\n"
+        "meeting or task at a given hour, a check-in time, quiet hours — do NOT call the tool yet. "
+        "Ask what city or timezone they're in first, call set_timezone with their answer, then "
+        "complete the original request and confirm the resolved time naming the timezone THEY gave "
+        "you. Never name, guess, or imply any timezone the user has not actually confirmed — not "
+        "in the confirmation, not in passing. This does not apply to relative delays like \"in 30 "
+        "minutes\", which don't need a timezone. If a scheduling tool call ever fails because the "
+        "timezone isn't confirmed, treat that as the same signal: ask, call set_timezone, then "
+        "retry the original request.\n"
         f"{lang_instruction}"
         f"{tz_section}{context_section}{tracker_section}{habit_section}{focus_section}{profile_section}{episodic_section}{notes_section}{journal_section}"
         f"\nThe user's tracked tasks: {tasks_str}\n"
@@ -2225,6 +2311,14 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
         if "model" in err and "not found" in err:
             return "⚠️ Model not found. Use /setmodel to pick a valid model."
         return "⚠️ AI service temporarily unavailable. Please try again."
+
+    # A model can legitimately return content=None with no tool calls (most
+    # often right after a tool round). That used to become "" — which Telegram
+    # rejects outright ("message text is empty"), and which poisoned history
+    # with an empty assistant turn that degraded every later prompt.
+    if not reply or not reply.strip():
+        logger.warning("Empty model reply for %s; substituting fallback text", chat_id)
+        reply = "⚠️ I didn't manage to put that into words. Could you say it again?"
 
     # Store only the user turn and final text reply in history
     user["history"].append({"role": "user", "content": user_message})
@@ -2389,9 +2483,14 @@ async def _run_reminder(
               "not a lecture."
         )
         reply = await chat(chat_id, prompt, touch_activity=False)
-        import time as _time
-        token = f"{chat_id}_{int(_time.monotonic() * 1000) % 10_000_000}"
-        _snooze_cache[token] = {"message": msg, "reason": reason}
+        # uuid4, not a truncated monotonic clock: the old token wrapped every
+        # ~2.8h, so two reminders that far apart collided and snoozing the older
+        # button replayed the newer one's text. Stored in SQLite rather than a
+        # process-local dict so a restart between delivery and the tap doesn't
+        # turn the button into "Snooze expired" — restarts are routine now that
+        # a bot.py commit triggers one.
+        token = uuid.uuid4().hex
+        db_save_snooze(token, chat_id, msg, reason)
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
         ]])
@@ -2404,11 +2503,48 @@ async def _run_reminder(
     return None
 
 
+def _drop_reminder(chat_id: int, reminder_id: str) -> None:
+    """Remove a fired one-shot reminder from state so it doesn't linger in
+    /remind list or get re-armed by restore_all_jobs on the next restart."""
+    user = get_user(chat_id)
+    before = user.get("reminders", [])
+    user["reminders"] = [r for r in before if r.get("id") != reminder_id]
+    if len(user["reminders"]) != len(before):
+        save_state(state)
+        db_mark_reminder_removed(chat_id, reminder_id)
+
+
 def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> None:
     user = get_user(chat_id)
     job_name = f"reminder_{chat_id}_{reminder['id']}"
     for job in app.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
+
+    # One-shot reminders carry an absolute fire_at (UTC ISO) and run once, then
+    # delete themselves; daily ones repeat at a local wall-clock time.
+    if reminder.get("once"):
+        fire_at = reminder.get("fire_at")
+        if not fire_at:
+            return
+        try:
+            delay = (datetime.fromisoformat(fire_at) - datetime.utcnow()).total_seconds()
+        except ValueError:
+            return
+        if delay <= 0:
+            # Its moment passed while the bot was down — drop it rather than
+            # firing a stale "remind me at 23:00" the next morning.
+            _drop_reminder(chat_id, reminder["id"])
+            return
+
+        async def _once_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _reminder=reminder):
+            try:
+                await _run_reminder(context, _cid, _reminder, simulate=False)
+            finally:
+                _drop_reminder(_cid, _reminder["id"])
+
+        app.job_queue.run_once(_once_wrapper, when=delay, name=job_name)
+        return
+
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
 
     async def _reminder_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _reminder=reminder):
@@ -2695,7 +2831,9 @@ def restore_all_jobs(app: Application) -> None:
         cid = int(cid_str)
         schedule_user_checkins(app, cid)
         schedule_user_alerts(app, cid)
-        for reminder in user.get("reminders", []):
+        # list() because schedule_user_reminder can drop an expired one-shot
+        # from this same list while we're iterating it.
+        for reminder in list(user.get("reminders", [])):
             # Annual reminders fire via the deadline-alert job's date check, not
             # as their own daily job — scheduling them here would make them fire
             # every day instead of once a year.
@@ -3648,8 +3786,11 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     schedule_user_checkins(context.application, chat_id)
     schedule_user_alerts(context.application, chat_id)
-    for reminder in user.get("reminders", []):
-        schedule_user_reminder(context.application, chat_id, reminder)
+    for reminder in list(user.get("reminders", [])):
+        # Annual reminders fire via the deadline-alert date check; scheduling
+        # one here would turn a once-a-year reminder into a daily one.
+        if not reminder.get("annual"):
+            schedule_user_reminder(context.application, chat_id, reminder)
     await update.message.reply_text(f"📍 Timezone set to {tz_str} from your location.")
 
 
@@ -3689,7 +3830,7 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
-    for reminder in user.get("reminders", []):
+    for reminder in list(user.get("reminders", [])):
         if not reminder.get("annual"):
             schedule_user_reminder(context.application, update.effective_chat.id, reminder)
     # Show user-friendly offset for Etc/GMT zones (POSIX sign is inverted)
@@ -3873,16 +4014,23 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Usage: /remind remove <number>")
             return
         try:
-            idx = int(args[1]) - 1
-            removed = user.get("reminders", []).pop(idx)
-            job_name = f"reminder_{update.effective_chat.id}_{removed['id']}"
-            for job in context.application.job_queue.get_jobs_by_name(job_name):
-                job.schedule_removal()
-            save_state(state)
-            db_mark_reminder_removed(update.effective_chat.id, removed["id"])
-            await update.message.reply_text(f"Removed: {removed['time']} — {removed['message']}")
-        except (IndexError, ValueError):
+            n = int(args[1])
+        except ValueError:
             await update.message.reply_text("Invalid number. Use /remind list to see numbers.")
+            return
+        reminders = user.get("reminders", [])
+        # Explicit range check, not pop(n-1): "/remind remove 0" would otherwise
+        # index -1 and silently delete the *last* reminder instead of erroring.
+        if not (1 <= n <= len(reminders)):
+            await update.message.reply_text("Invalid number. Use /remind list to see numbers.")
+            return
+        removed = reminders.pop(n - 1)
+        job_name = f"reminder_{update.effective_chat.id}_{removed['id']}"
+        for job in context.application.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+        save_state(state)
+        db_mark_reminder_removed(update.effective_chat.id, removed["id"])
+        await update.message.reply_text(f"Removed: {removed['time']} — {removed['message']}")
 
     elif sub == "annual":
         # /remind annual MM-DD HH:MM <message>
@@ -4360,7 +4508,7 @@ async def _debug_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     chat_id = update.effective_chat.id
     user = get_user(chat_id)
     prompt = build_system_prompt(user, chat_id)
-    if len(prompt) <= 4000:
+    if len(prompt) <= DEBUG_PROMPT_INLINE_MAX:
         await update.message.reply_text(prompt)
     else:
         data_bytes = prompt.encode("utf-8")
@@ -4628,6 +4776,190 @@ async def focus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────── handlers: import ───────────────────────
 
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_MMDD_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+
+
+def _sanitize_import(imported: dict) -> tuple[dict, list[str]]:
+    """Validate an /import payload into only the well-formed parts of it.
+
+    The file comes from the user, and whatever lands in state is read on every
+    later turn by build_system_prompt() and the schedulers — neither of which
+    tolerates a wrong shape. An unvalidated import therefore doesn't just fail
+    at import time, it bricks the account: build_system_prompt() raises on
+    every subsequent message, so the user can't even talk to the bot to undo
+    it. Drop what doesn't fit the shape in _new_user() and report it, rather
+    than trusting the file or rejecting it wholesale over one bad entry.
+
+    Returns (clean, skipped) — `clean` holds only keys that validated, and
+    `skipped` holds human-readable notes about what was dropped.
+    """
+    clean: dict = {}
+    skipped: list[str] = []
+
+    if not isinstance(imported, dict):
+        return clean, ["file is not a JSON object"]
+
+    # tasks: list of plain strings or {"text": str, "due": ISO date, "recur": ...}
+    if "tasks" in imported:
+        raw = imported["tasks"]
+        if isinstance(raw, list):
+            tasks, bad = [], 0
+            for t in raw:
+                if isinstance(t, str):
+                    tasks.append(t)
+                elif isinstance(t, dict) and isinstance(t.get("text"), str):
+                    task = {"text": t["text"]}
+                    due = t.get("due")
+                    if isinstance(due, str) and due:
+                        try:
+                            date.fromisoformat(due)
+                            task["due"] = due
+                        except ValueError:
+                            bad += 1
+                            continue
+                    if t.get("recur") in ("daily", "weekly", "monthly"):
+                        task["recur"] = t["recur"]
+                    tasks.append(task)
+                else:
+                    bad += 1
+            clean["tasks"] = tasks
+            if bad:
+                skipped.append(f"{bad} malformed task(s)")
+        else:
+            skipped.append("tasks (not a list)")
+
+    if "context" in imported:
+        if isinstance(imported["context"], str):
+            clean["context"] = imported["context"]
+        else:
+            skipped.append("context (not text)")
+
+    if "timezone" in imported:
+        tz = imported["timezone"]
+        if isinstance(tz, str):
+            try:
+                ZoneInfo(tz)
+                clean["timezone"] = tz
+            except (ZoneInfoNotFoundError, KeyError, ValueError):
+                skipped.append(f"timezone '{tz}' (unknown)")
+        else:
+            skipped.append("timezone (not text)")
+
+    # trackers: {name: {"unit": str, "log": [{"ts": iso, "value": number}]}}
+    if "trackers" in imported:
+        raw = imported["trackers"]
+        if isinstance(raw, dict):
+            trackers, bad = {}, 0
+            for tname, data in raw.items():
+                if not isinstance(tname, str) or not isinstance(data, dict):
+                    bad += 1
+                    continue
+                log = []
+                for entry in data.get("log", []) if isinstance(data.get("log"), list) else []:
+                    if (isinstance(entry, dict) and isinstance(entry.get("ts"), str)
+                            and isinstance(entry.get("value"), (int, float))
+                            and not isinstance(entry.get("value"), bool)):
+                        log.append({"ts": entry["ts"], "value": float(entry["value"])})
+                unit = data.get("unit")
+                trackers[tname.lower()] = {
+                    "unit": unit if isinstance(unit, str) else "",
+                    "log": log[-TRACKER_LOG_CAP:],
+                }
+            clean["trackers"] = trackers
+            if bad:
+                skipped.append(f"{bad} malformed tracker(s)")
+        else:
+            skipped.append("trackers (not an object)")
+
+    # habits: {name: {"completions": [ISO date], "created": ISO date}}
+    if "habits" in imported:
+        raw = imported["habits"]
+        if isinstance(raw, dict):
+            habits, bad = {}, 0
+            for hname, data in raw.items():
+                if not isinstance(hname, str) or not isinstance(data, dict):
+                    bad += 1
+                    continue
+                comps = data.get("completions")
+                habits[hname] = {
+                    "completions": [c for c in comps if isinstance(c, str)] if isinstance(comps, list) else [],
+                    "created": data["created"] if isinstance(data.get("created"), str) else date.today().isoformat(),
+                }
+            clean["habits"] = habits
+            if bad:
+                skipped.append(f"{bad} malformed habit(s)")
+        else:
+            skipped.append("habits (not an object)")
+
+    if "journal" in imported:
+        raw = imported["journal"]
+        if isinstance(raw, list):
+            clean["journal"] = [
+                e["entry"] if isinstance(e, dict) and isinstance(e.get("entry"), str)
+                else e if isinstance(e, str) else None
+                for e in raw
+            ]
+            dropped = clean["journal"].count(None)
+            clean["journal"] = [e for e in clean["journal"] if e is not None]
+            if dropped:
+                skipped.append(f"{dropped} malformed journal entr(ies)")
+        else:
+            skipped.append("journal (not a list)")
+
+    if "notes" in imported:
+        raw = imported["notes"]
+        if isinstance(raw, list):
+            notes = []
+            for n in raw:
+                if isinstance(n, str):
+                    notes.append(n)
+                elif isinstance(n, dict) and isinstance(n.get("text"), str):
+                    notes.append(n["text"])
+            clean["notes"] = notes
+            if len(notes) != len(raw):
+                skipped.append(f"{len(raw) - len(notes)} malformed note(s)")
+        else:
+            skipped.append("notes (not a list)")
+
+    # reminders: schedule_user_reminder() indexes r["time"] unconditionally and
+    # run_daily needs a real HH:MM, so a missing/!HH:MM time is fatal downstream.
+    if "reminders" in imported:
+        raw = imported["reminders"]
+        if isinstance(raw, list):
+            reminders, bad = [], 0
+            for r in raw:
+                if not isinstance(r, dict) or not isinstance(r.get("time"), str) \
+                        or not _HHMM_RE.match(r["time"]) or not isinstance(r.get("message"), str):
+                    bad += 1
+                    continue
+                rem = {
+                    "id": r["id"] if isinstance(r.get("id"), str) and r.get("id") else str(uuid.uuid4()),
+                    "time": r["time"],
+                    "message": r["message"],
+                    "once": bool(r.get("once", False)),
+                }
+                if isinstance(r.get("reason"), str):
+                    rem["reason"] = r["reason"]
+                # An annual reminder needs a valid MM-DD or the deadline-alert
+                # date check silently never matches it.
+                if r.get("annual"):
+                    if isinstance(r.get("date"), str) and _MMDD_RE.match(r["date"]):
+                        rem["annual"] = True
+                        rem["date"] = r["date"]
+                    else:
+                        bad += 1
+                        continue
+                reminders.append(rem)
+            clean["reminders"] = reminders
+            if bad:
+                skipped.append(f"{bad} malformed reminder(s)")
+        else:
+            skipped.append("reminders (not a list)")
+
+    return clean, skipped
+
+
 async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc or not doc.file_name.endswith(".json"):
@@ -4642,49 +4974,56 @@ async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid JSON file.")
         return
 
-    user = get_user(update.effective_chat.id)
+    clean, skipped = _sanitize_import(imported)
+    if not clean:
+        await update.message.reply_text(
+            "Nothing importable in that file.\n"
+            + ("Problems: " + ", ".join(skipped) if skipped else "")
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
     counts = {}
 
-    if "tasks" in imported:
-        user["tasks"] = imported["tasks"]
+    if "tasks" in clean:
+        user["tasks"] = clean["tasks"]
         counts["tasks"] = len(user["tasks"])
-    if "context" in imported:
-        user["context"] = imported["context"]
-    if "timezone" in imported:
-        try:
-            ZoneInfo(imported["timezone"])
-            user["timezone"] = imported["timezone"]
-        except (ZoneInfoNotFoundError, KeyError):
-            pass
-    if "trackers" in imported:
-        user["trackers"] = imported["trackers"]
+    if "context" in clean:
+        user["context"] = clean["context"]
+    if "timezone" in clean:
+        # Route through the same helper /settimezone uses so the SQLite
+        # override and the confirmed flag stay in sync with state.json.
+        _set_user_timezone(chat_id, user, clean["timezone"])
+    if "trackers" in clean:
+        user["trackers"] = clean["trackers"]
         counts["trackers"] = len(user["trackers"])
-    if "habits" in imported:
-        user["habits"] = imported["habits"]
+    if "habits" in clean:
+        user["habits"] = clean["habits"]
         counts["habits"] = len(user["habits"])
-    if "journal" in imported:
-        cid = str(update.effective_chat.id)
-        for e in imported["journal"]:
-            db_add_journal(cid, e.get("entry", ""), auto=False)
-        counts["journal"] = len(imported["journal"])
-    if "notes" in imported:
-        cid = str(update.effective_chat.id)
-        for n in imported["notes"]:
-            db_add_note(cid, n if isinstance(n, str) else n.get("text", ""), auto=False)
-        counts["notes"] = len(imported["notes"])
-    if "reminders" in imported:
-        for r in imported["reminders"]:
-            r.setdefault("id", str(uuid.uuid4()))
-            r.setdefault("once", False)
-        user["reminders"] = imported["reminders"]
+    if "journal" in clean:
+        cid = str(chat_id)
+        for entry in clean["journal"]:
+            db_add_journal(cid, entry, auto=False)
+        counts["journal"] = len(clean["journal"])
+    if "notes" in clean:
+        cid = str(chat_id)
+        for text in clean["notes"]:
+            db_add_note(cid, text, auto=False)
+        counts["notes"] = len(clean["notes"])
+    if "reminders" in clean:
+        user["reminders"] = clean["reminders"]
         counts["reminders"] = len(user["reminders"])
-        for reminder in user["reminders"]:
+        for reminder in list(user["reminders"]):
             if not reminder.get("annual"):
-                schedule_user_reminder(context.application, update.effective_chat.id, reminder)
+                schedule_user_reminder(context.application, chat_id, reminder)
 
     save_state(state)
     summary = "  " + "\n  ".join(f"{k}: {v}" for k, v in counts.items())
-    await update.message.reply_text(f"✓ Import successful!\n{summary}")
+    msg = f"✓ Import successful!\n{summary}"
+    if skipped:
+        msg += "\n\n⚠️ Skipped: " + ", ".join(skipped)
+    await update.message.reply_text(msg)
 
 
 # ─────────────────────── handlers: quiet hours ───────────────────────
@@ -4841,11 +5180,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── snooze button from reminder ──
     if query.data.startswith("snooze_"):
         parts = query.data.split("_")
-        # format: snooze_{cid}_{timestamp_token}_{minutes}
-        # token is everything between first and last underscore segment
+        # format: snooze_{token}_{minutes}. The join keeps this tolerant of the
+        # older multi-segment token format for any button still in flight from
+        # before the switch to a uuid4 hex (which contains no underscores).
         minutes = int(parts[-1])
         token = "_".join(parts[1:-1])
-        snoozed = _snooze_cache.pop(token, None)
+        snoozed = db_take_snooze(token) or _snooze_cache.pop(token, None)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -4861,6 +5201,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=chat_id, text=f"⏱ Snoozed {minutes} min. I'll remind you again."
         )
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global fallback for any exception a handler lets escape.
+
+    Without one registered, python-telegram-bot logs "No error handlers are
+    registered" and the user is left staring at an unanswered message — every
+    crash looks exactly like the bot ignoring them. Log the traceback for the
+    owner, and tell the user something went wrong so they can retry or report
+    it.
+    """
+    logger.error("Unhandled exception while handling update", exc_info=context.error)
+    chat = getattr(update, "effective_chat", None)
+    if chat is None:
+        return  # nothing to reply to (e.g. a job or callback-less error)
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="⚠️ Something went wrong handling that. It's been logged — please try again, "
+                 "or rephrase if it keeps happening.",
+        )
+    except Exception:
+        logger.exception("Failed to deliver the error notice to %s", chat.id)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4976,6 +5339,7 @@ def main():
     # Document handler for /import (JSON file upload)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_import))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(on_error)
 
     _init_db()
     restore_all_jobs(app)

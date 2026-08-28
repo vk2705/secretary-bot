@@ -3027,29 +3027,38 @@ class TestDebugPrompt:
         assert _delivered_text(update) == expected
 
     def test_debug_prompt_threshold_boundary_text_vs_document(self):
-        """A prompt landing exactly on the 4000-char threshold takes the text
-        path; one character more takes the document path. Padding is derived
-        from a measured probe rather than a hard-coded note size, so this
-        stays correct if prompt assembly is reshaped later (e.g. Phase 3)."""
-        base_cid = 9300
-        bot.state["users"][str(base_cid)] = fresh_user()
-        base_len = len(bot.build_system_prompt(bot.state["users"][str(base_cid)], base_cid))
+        """A prompt landing exactly on the inline threshold takes the text
+        path; one character more takes the document path. Both the threshold
+        and the padding are derived at runtime (from bot's own constant and a
+        measured probe) rather than hard-coded, so this stays correct as
+        prompt assembly grows or is reshaped later (e.g. Phase 3)."""
+        threshold = bot.DEBUG_PROMPT_INLINE_MAX
 
-        probe_cid = 9301
-        bot.state["users"][str(probe_cid)] = fresh_user()
-        probe_user = bot.state["users"][str(probe_cid)]
-        bot.db_add_note(str(probe_cid), "X")
-        probe_len = len(bot.build_system_prompt(probe_user, probe_cid))
-        overhead = probe_len - base_len - 1  # fixed chars the notes section wraps around the text
+        # Pad via `context` rather than a note: setting a context *replaces* a
+        # longer "no context set" block, so it buys headroom instead of only
+        # adding to the prompt — which a note can no longer do now that the
+        # base prompt sits within ~11 chars of the threshold on its own.
+        def _prompt_len_with_context(cid: int, text: str) -> int:
+            bot.state["users"][str(cid)] = fresh_user(context=text)
+            return len(bot.build_system_prompt(bot.state["users"][str(cid)], cid))
 
-        target_note_len = 4000 - base_len - overhead
+        one = _prompt_len_with_context(9300, "X")
+        two = _prompt_len_with_context(9301, "XX")
+        per_char = two - one
+        assert per_char == 1, f"expected context to cost 1 char each, got {per_char}"
+
+        target_len = threshold - (one - 1)
+        assert target_len >= 1, (
+            f"a one-char context already produces a {one}-char prompt, over the {threshold} "
+            f"threshold — this test needs a different padding vehicle"
+        )
 
         at_cid = 9302
-        bot.state["users"][str(at_cid)] = fresh_user()
+        at_prompt_len = _prompt_len_with_context(at_cid, "A" * target_len)
         at_user = bot.state["users"][str(at_cid)]
-        bot.db_add_note(str(at_cid), "A" * target_note_len)
         at_prompt = bot.build_system_prompt(at_user, at_cid)
-        assert len(at_prompt) == 4000
+        assert at_prompt_len == threshold
+        assert len(at_prompt) == threshold
         with as_owner(at_cid):
             update = _debug_update(at_cid)
             context = _debug_context(["prompt"])
@@ -3058,11 +3067,10 @@ class TestDebugPrompt:
         update.message.reply_document.assert_not_awaited()
 
         over_cid = 9303
-        bot.state["users"][str(over_cid)] = fresh_user()
+        bot.state["users"][str(over_cid)] = fresh_user(context="A" * (target_len + 1))
         over_user = bot.state["users"][str(over_cid)]
-        bot.db_add_note(str(over_cid), "A" * (target_note_len + 1))
         over_prompt = bot.build_system_prompt(over_user, over_cid)
-        assert len(over_prompt) == 4001
+        assert len(over_prompt) == threshold + 1
         with as_owner(over_cid):
             update = _debug_update(over_cid)
             context = _debug_context(["prompt"])
@@ -4068,3 +4076,335 @@ class TestToolsForRound:
         all_names = {t["function"]["name"] for t in bot.TOOLS}
         declared = set(bot._WRITE_TOOLS).union(*bot._TOOL_GROUPS)
         assert declared <= all_names, declared - all_names
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12: Regression tests for the 2026-08-28 bug-review findings.
+# Each of these reproduces a bug that was confirmed by direct execution against
+# the real code before being fixed — see docs/commits/ for the review write-up.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOneShotReminderSurvivesRestart:
+    """add_reminder(once=True, time=HH:MM) used to schedule an in-memory job
+    without persisting anything, so restore_all_jobs() could not re-arm it and
+    the reminder vanished on any restart — silently, after the bot had already
+    confirmed it to the user."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = MagicMock()
+
+    def test_once_at_clock_time_is_persisted_with_fire_at(self):
+        uid = 7301
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        result = run(bot._execute_tool(uid, "add_reminder",
+                                      {"message": "take pills", "time": "23:59", "once": True}))
+        assert result.get("success")
+        reminders = bot.state["users"][str(uid)]["reminders"]
+        assert len(reminders) == 1
+        assert reminders[0]["once"] is True
+        assert reminders[0]["fire_at"], "one-shot must carry an absolute fire_at to be re-armed"
+
+    def test_relative_delay_still_not_persisted(self):
+        # delay_minutes reminders are deliberately fire-and-forget; only the
+        # clock-time form needed persisting.
+        uid = 7302
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        run(bot._execute_tool(uid, "add_reminder", {"message": "tea", "delay_minutes": 10}))
+        assert bot.state["users"][str(uid)]["reminders"] == []
+
+    def test_expired_one_shot_is_dropped_not_fired_late(self):
+        uid = 7303
+        past = (bot.datetime.utcnow() - bot.timedelta(hours=3)).isoformat()
+        bot.state["users"][str(uid)] = fresh_user(
+            reminders=[{"id": "old", "time": "01:00", "message": "stale",
+                        "once": True, "fire_at": past}])
+        bot.schedule_user_reminder(bot._app, uid, bot.state["users"][str(uid)]["reminders"][0])
+        assert bot.state["users"][str(uid)]["reminders"] == [], \
+            "a one-shot whose moment passed while down must be dropped, not fired late"
+
+    def test_daily_reminder_still_uses_run_daily(self):
+        uid = 7304
+        bot.state["users"][str(uid)] = fresh_user()
+        reminder = {"id": "d1", "time": "08:00", "message": "daily", "once": False}
+        bot.schedule_user_reminder(bot._app, uid, reminder)
+        assert bot._app.job_queue.run_daily.called
+        assert not bot._app.job_queue.run_once.called
+
+
+class TestOverdueRecurringTaskRollsForward:
+    """Completing a recurring task advanced from its stored due date, so a
+    task 30 days overdue rolled to 29 days overdue — still overdue, still in
+    the deadline alert, needing 30 completions to catch up."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = MagicMock()
+
+    @pytest.mark.parametrize("recur", ["daily", "weekly", "monthly"])
+    def test_overdue_recurring_task_lands_in_the_future(self, recur):
+        uid = 7400
+        old_due = (bot.date.today() - bot.timedelta(days=30)).isoformat()
+        bot.state["users"][str(uid)] = fresh_user(
+            tasks=[{"text": "vitamins", "due": old_due, "recur": recur}])
+        result = run(bot._execute_tool(uid, "complete_task", {"task_number": 1}))
+        assert result.get("success")
+        new_due = bot.state["users"][str(uid)]["tasks"][0]["due"]
+        assert new_due > bot.date.today().isoformat(), \
+            f"{recur} task rolled to {new_due}, which is not in the future"
+
+    def test_on_time_recurring_task_still_advances_from_its_own_due_date(self):
+        # The fix must not change the normal case: a task completed on its due
+        # date advances one period from that date, not from today+1.
+        uid = 7401
+        today = bot.date.today()
+        bot.state["users"][str(uid)] = fresh_user(
+            tasks=[{"text": "vitamins", "due": today.isoformat(), "recur": "daily"}])
+        run(bot._execute_tool(uid, "complete_task", {"task_number": 1}))
+        assert bot.state["users"][str(uid)]["tasks"][0]["due"] == \
+            (today + bot.timedelta(days=1)).isoformat()
+
+
+class TestSanitizeImport:
+    """/import wrote user-supplied JSON straight into state with no validation.
+    A wrong shape didn't just fail the import — it bricked the account, because
+    build_system_prompt() then raised on every later message and the user could
+    not even talk to the bot to undo it."""
+
+    def test_non_dict_payload_rejected(self):
+        clean, skipped = bot._sanitize_import(["not", "an", "object"])
+        assert clean == {}
+        assert skipped
+
+    def test_string_trackers_dropped_not_stored(self):
+        clean, skipped = bot._sanitize_import({"trackers": "oops"})
+        assert "trackers" not in clean
+        assert any("trackers" in s for s in skipped)
+
+    def test_reminder_without_time_dropped(self):
+        clean, _ = bot._sanitize_import(
+            {"reminders": [{"id": "x", "message": "no time key"}]})
+        assert clean["reminders"] == []
+
+    def test_reminder_with_bad_time_format_dropped(self):
+        clean, _ = bot._sanitize_import(
+            {"reminders": [{"time": "25:99", "message": "bad"},
+                           {"time": "7:5", "message": "also bad"}]})
+        assert clean["reminders"] == []
+
+    def test_valid_reminder_kept_and_given_an_id(self):
+        clean, _ = bot._sanitize_import(
+            {"reminders": [{"time": "08:00", "message": "ok"}]})
+        assert len(clean["reminders"]) == 1
+        assert clean["reminders"][0]["id"]
+
+    def test_annual_reminder_needs_a_valid_mm_dd(self):
+        clean, _ = bot._sanitize_import({"reminders": [
+            {"time": "08:00", "message": "bday", "annual": True, "date": "03-14"},
+            {"time": "08:00", "message": "bad", "annual": True, "date": "not-a-date"},
+            {"time": "08:00", "message": "missing", "annual": True},
+        ]})
+        assert len(clean["reminders"]) == 1
+        assert clean["reminders"][0]["date"] == "03-14"
+
+    def test_unknown_timezone_dropped(self):
+        clean, skipped = bot._sanitize_import({"timezone": "Mars/Olympus"})
+        assert "timezone" not in clean
+        assert any("Mars/Olympus" in s for s in skipped)
+
+    def test_malformed_tasks_dropped_valid_kept(self):
+        clean, _ = bot._sanitize_import(
+            {"tasks": ["plain", {"text": "structured"}, 123, {"no_text": 1},
+                       {"text": "bad due", "due": "not-a-date"}]})
+        assert clean["tasks"] == ["plain", {"text": "structured"}]
+
+    def test_tracker_log_entries_must_be_numeric(self):
+        clean, _ = bot._sanitize_import({"trackers": {"weight": {"unit": "kg", "log": [
+            {"ts": "2026-01-01T00:00:00", "value": 80.5},
+            {"ts": "2026-01-02T00:00:00", "value": "heavy"},
+            {"ts": "2026-01-03T00:00:00", "value": True},
+            "not-an-entry",
+        ]}}})
+        assert len(clean["trackers"]["weight"]["log"]) == 1
+
+    def test_sanitized_output_survives_build_system_prompt(self):
+        # The actual failure mode: whatever import stores is read on every
+        # later turn, so it must never be able to raise there.
+        clean, _ = bot._sanitize_import(
+            {"trackers": "oops", "habits": ["wrong"], "tasks": [123], "notes": [None]})
+        uid = 7500
+        bot.state["users"][str(uid)] = fresh_user()
+        user = bot.state["users"][str(uid)]
+        for key in ("trackers", "habits", "tasks"):
+            if key in clean:
+                user[key] = clean[key]
+        assert isinstance(bot.build_system_prompt(user, uid), str)
+
+
+class TestEmptyModelReplyNeverSent:
+    """A model returning content=None with no tool calls produced "", which
+    Telegram rejects outright and which poisoned history with an empty
+    assistant turn."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = None
+
+    def test_empty_content_becomes_a_fallback_message(self):
+        uid = 7600
+        bot.state["users"][str(uid)] = fresh_user()
+        fake_msg = MagicMock()
+        fake_msg.tool_calls = None
+        fake_msg.content = None
+        response = MagicMock()
+        response.choices = [MagicMock(message=fake_msg)]
+        client = MagicMock()
+        client.chat.completions.create = AsyncMock(return_value=response)
+        original = bot.get_llm_client
+        bot.get_llm_client = lambda u, c=None: client
+        try:
+            reply = run(bot.chat(uid, "hello"))
+        finally:
+            bot.get_llm_client = original
+        assert reply.strip(), "reply must never be empty — Telegram rejects empty messages"
+        stored = bot.state["users"][str(uid)]["history"][-1]
+        assert stored["role"] == "assistant" and stored["content"].strip()
+
+
+class TestSnoozeTokenPersistence:
+    """Snooze payloads lived in a process-local dict keyed by a monotonic clock
+    truncated to ~2.8h, so tokens collided and every restart invalidated every
+    outstanding Snooze button."""
+
+    def test_token_round_trips_through_sqlite(self):
+        bot.db_save_snooze("tok1", 42, "drink water", "staying hydrated")
+        assert bot.db_take_snooze("tok1") == {"message": "drink water", "reason": "staying hydrated"}
+
+    def test_token_is_single_use(self):
+        bot.db_save_snooze("tok2", 42, "msg", None)
+        bot.db_take_snooze("tok2")
+        assert bot.db_take_snooze("tok2") is None
+
+    def test_unknown_token_returns_none(self):
+        assert bot.db_take_snooze("never-existed") is None
+
+    def test_reminder_run_stores_a_collision_free_token(self):
+        # uuid4 hex: no underscores (the callback splits on "_") and no wrap.
+        tokens = {bot.uuid.uuid4().hex for _ in range(100)}
+        assert len(tokens) == 100
+        assert all("_" not in t for t in tokens)
+
+
+class TestRemindRemoveIndexGuard:
+    """"/remind remove 0" hit pop(-1) and silently deleted the *last* reminder
+    instead of reporting an invalid number."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "99"])
+    def test_out_of_range_removes_nothing(self, bad):
+        uid = 7700
+        bot.state["users"][str(uid)] = fresh_user(reminders=[
+            {"id": "a", "time": "08:00", "message": "first", "once": False},
+            {"id": "b", "time": "09:00", "message": "last", "once": False},
+        ])
+        update = _debug_update(uid)
+        context = _debug_context(["remove", bad])
+        context.application = MagicMock()
+        run(bot.remind_cmd(update, context))
+        assert len(bot.state["users"][str(uid)]["reminders"]) == 2, \
+            f"/remind remove {bad} must not delete anything"
+
+    def test_valid_number_still_removes_the_right_one(self):
+        uid = 7701
+        bot.state["users"][str(uid)] = fresh_user(reminders=[
+            {"id": "a", "time": "08:00", "message": "first", "once": False},
+            {"id": "b", "time": "09:00", "message": "last", "once": False},
+        ])
+        update = _debug_update(uid)
+        context = _debug_context(["remove", "1"])
+        context.application = MagicMock()
+        run(bot.remind_cmd(update, context))
+        remaining = bot.state["users"][str(uid)]["reminders"]
+        assert [r["id"] for r in remaining] == ["b"]
+
+
+class TestAnnualReminderNotScheduledDaily:
+    """Two of the three timezone-change call sites guarded against scheduling
+    an annual reminder as a daily job; handle_location did not, so sharing a
+    location turned a once-a-year reminder into a daily one."""
+
+    def test_every_reschedule_site_guards_on_annual(self):
+        """Scans every function in bot.py rather than a hard-coded list, so a
+        future call site added without the guard is caught too — that is
+        exactly how handle_location came to be the one site that missed it."""
+        import inspect
+        unguarded = []
+        for name, fn in vars(bot).items():
+            if not inspect.isfunction(fn) or fn.__module__ != "bot":
+                continue
+            if name in ("schedule_user_reminder", "_drop_reminder"):
+                continue  # the scheduler itself; annual-ness is decided by callers
+            try:
+                src = inspect.getsource(fn)
+            except OSError:
+                continue
+            if "schedule_user_reminder(" in src and "annual" not in src:
+                unguarded.append(name)
+        assert not unguarded, (
+            f"these reschedule reminders without an annual guard, so annual "
+            f"reminders would fire daily: {unguarded}"
+        )
+
+
+class TestGlobalErrorHandler:
+    """No error handler was registered, so any unhandled exception left the
+    user with silence and the traceback only in nohup.out."""
+
+    def test_error_handler_is_registered_in_main(self):
+        import inspect
+        src = inspect.getsource(bot.main)
+        assert "add_error_handler" in src
+
+    def test_error_handler_replies_to_the_user(self):
+        update = MagicMock()
+        update.effective_chat.id = 7800
+        context = MagicMock()
+        context.error = RuntimeError("boom")
+        context.bot.send_message = AsyncMock()
+        run(bot.on_error(update, context))
+        context.bot.send_message.assert_awaited_once()
+        assert "⚠️" in context.bot.send_message.call_args.kwargs["text"]
+
+    def test_error_handler_survives_an_update_with_no_chat(self):
+        context = MagicMock()
+        context.error = RuntimeError("boom")
+        context.bot.send_message = AsyncMock()
+        run(bot.on_error(object(), context))
+        context.bot.send_message.assert_not_awaited()
+
+
+class TestSetTimezoneReportsWhatItStored:
+    """The model does place→IANA conversion itself, unverified. For an unknown
+    place it landed on a plausible-but-wrong zone (a sandbox user saying
+    "Мухосранск" got Europe/Moscow) and then reported it back in the user's own
+    words, hiding the substitution."""
+
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = None
+
+    def test_result_names_the_stored_zone_and_local_time(self):
+        uid = 7900
+        bot.state["users"][str(uid)] = fresh_user()
+        result = run(bot._execute_tool(uid, "set_timezone", {"timezone": "Europe/Moscow"}))
+        assert result["timezone"] == "Europe/Moscow"
+        assert result["local_time_now"]
+        assert "Europe/Moscow" in result["confirm_to_user"]
+
+    def test_tool_description_forbids_inferring_from_language(self):
+        desc = next(t["function"]["description"] for t in bot.TOOLS
+                    if t["function"]["name"] == "set_timezone")
+        assert "EXPLICITLY" in desc
+        assert "never infer" in desc.lower()
