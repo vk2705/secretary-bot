@@ -1835,6 +1835,89 @@ class TestNaturalLanguageNewTools:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9b: Clarifying follow-up should edit, not duplicate (real API,
+# multi-turn) — PLAN.md #62. Confirmed live on chat_id 5838336004
+# (2026-08-28): three near-duplicate 06:00 daily reminders, all "morning
+# run", from what looks exactly like successive clarifying messages each
+# producing a fresh add_reminder call. Nothing in build_system_prompt() or
+# the add_reminder tool description currently tells the model to check
+# recent history for an in-flight action before creating a new one — so
+# this is not yet a guaranteed behavior. These tests exist to observe
+# whether the model gets it right *without* any fix, per PLAN.md #62's own
+# framing ("needs some judgment call the model makes from context, not a
+# hard rule") — expect these to be flaky/failing until #62 is implemented,
+# not a regression to chase to green by adjusting the prompt under test.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.nl
+class TestClarifyingFollowUpIsAnEdit:
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = MagicMock()
+        bot._app.job_queue = MagicMock()
+
+    @pytest.mark.asyncio
+    async def test_second_message_narrowing_a_just_made_reminder_edits_not_duplicates(self):
+        """'remind me tomorrow at 6am about зарядка' then, in a follow-up,
+        'про зарядку — имею в виду именно физкультуру' (clarifying which
+        'зарядка' was meant) should leave exactly one reminder behind, not
+        two. Mirrors the real three-reminder pile-up found on chat_id
+        5838336004 (see admin.py list-reminders 5838336004 before this
+        test existed, and docs/commits/ for the cleanup)."""
+        uid = 301
+        bot.state["users"][str(uid)] = fresh_user(
+            timezone="Europe/Moscow", timezone_confirmed=True,
+        )
+        with ToolCallCapture(uid) as cap:
+            await bot.chat(uid, "Напомни мне завтра в 6 утра про зарядку")
+        with ToolCallCapture(uid) as cap2:
+            reply2 = await bot.chat(
+                uid,
+                "Я имел в виду именно зарядку физкультурой, а не что-то другое — "
+                "уточни, пожалуйста, то же напоминание",
+            )
+
+        first_round_tools = [name for name, _ in cap.calls]
+        second_round_tools = [name for name, _ in cap2.calls]
+        reminders = bot.state["users"][str(uid)].get("reminders", [])
+
+        assert "add_reminder" in first_round_tools, (
+            f"First message should have created a reminder, got: {first_round_tools}"
+        )
+        assert len(reminders) == 1, (
+            f"Expected exactly one reminder after the clarification, got "
+            f"{len(reminders)}: {reminders}\n"
+            f"Second-round tool calls with args: {cap2.calls}\nReply: {reply2}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_message_asking_for_a_different_time_edits_not_duplicates(self):
+        """Same shape, but the clarification changes the time instead of the
+        wording — 'на самом деле в 7, а не в 6' should still result in one
+        reminder, now at 7, not two."""
+        uid = 302
+        bot.state["users"][str(uid)] = fresh_user(
+            timezone="Europe/Moscow", timezone_confirmed=True,
+        )
+        with ToolCallCapture(uid) as cap:
+            await bot.chat(uid, "Поставь ежедневное напоминание в 6 утра: пробежка")
+        with ToolCallCapture(uid) as cap2:
+            reply2 = await bot.chat(uid, "На самом деле в 7, а не в 6 — поправь")
+
+        reminders = bot.state["users"][str(uid)].get("reminders", [])
+        second_round_tools = [name for name, _ in cap2.calls]
+
+        assert len(reminders) == 1, (
+            f"Expected exactly one reminder after the time correction, got "
+            f"{len(reminders)}: {reminders}\n"
+            f"Second-round tool calls: {second_round_tools}\nReply: {reply2}"
+        )
+        assert reminders[0]["time"] == "07:00", (
+            f"Expected the surviving reminder to be corrected to 07:00, got: {reminders}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 10: Debug command — owner-gated /debug fire|clock|prompt (Phase 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
