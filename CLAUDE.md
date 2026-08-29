@@ -12,16 +12,28 @@ A multi-user personal secretary/accountability Telegram bot (`bot.py`, ~4200 lin
 # Install dependencies
 pip install -r requirements.txt
 
-# Load credentials and run
+# Load credentials and run (foreground, e.g. for local debugging)
 export $(grep -v '^#' env | xargs) && python3 bot.py
-
-# Background (current deploy method)
-export $(grep -v '^#' env | xargs) && nohup python3 bot.py &
-
-# Check running / view logs
-pgrep -a python3
-tail -f nohup.out
 ```
+
+**Deployed as `secretary-bot.service`** (systemd, `Restart=on-failure`,
+`RestartSec=5`) — the same pattern as `secretary-mcp.service`. `ExecStart`
+is `start_bot.sh`, which sources `env`'s `export KEY=value` lines itself
+(systemd's own `EnvironmentFile=` can't parse those). Prefer `admin.py
+restart-bot` for a code-change restart (goes through the same stop/start
+path the `post-commit` hook uses); for anything else:
+
+```bash
+sudo systemctl status secretary-bot.service
+sudo systemctl restart secretary-bot.service
+journalctl -u secretary-bot.service -f
+```
+
+`StartLimitBurst=5`/`StartLimitIntervalSec=300` caps a runaway restart loop
+(e.g. a persistently bad token) rather than hammering Telegram's API
+forever — if the unit lands in `failed` from hitting that limit, fix the
+underlying cause first, then `sudo systemctl reset-failed
+secretary-bot.service` before starting it again.
 
 ## Running tests
 
