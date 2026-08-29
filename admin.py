@@ -12,9 +12,12 @@ isn't repeatable or auditable. This wraps the same approach as a real tool.
 
 Every write command stops the live bot first (so it isn't concurrently
 writing state.json out from under this process), edits through bot.py's
-real functions, then restarts it via start_bot.sh — the same restart path
-used manually throughout this project's history. Read-only commands don't
-touch the running process at all.
+real functions, then restarts it — both via `systemctl` against the
+secretary-bot.service unit (Restart=on-failure), not a hand-rolled
+kill+nohup. Read-only commands don't touch the running process at all.
+
+Requires passwordless sudo for `systemctl start/stop/show` on
+secretary-bot.service (already the case on this host).
 
 Usage:
     export $(grep -v '^#' env | xargs) && python3 admin.py <command> [args]
@@ -40,7 +43,6 @@ from unittest.mock import MagicMock
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 VENV_PYTHON = os.path.join(REPO, "venv", "bin", "python3")
-START_SCRIPT = os.path.join(REPO, "start_bot.sh")
 
 
 def _reexec_in_venv() -> None:
@@ -87,84 +89,58 @@ def _install_stubs() -> None:
     os.environ.setdefault("TELEGRAM_TOKEN", "ADMIN_TOKEN")
 
 
-def _find_bot_pid() -> int | None:
-    # The bot has been started both ways across this project's history: via
-    # start_bot.sh (absolute paths: REPO/venv/bin/python3 REPO/bot.py) and
-    # by hand from a `cd`'d shell (relative: venv/bin/python3 bot.py). Match
-    # on the interpreter+script pair regardless of path style, but scope it
-    # to processes whose cwd is actually this repo, so a bot.py belonging to
-    # some other checkout is never mistaken for this one.
-    out = subprocess.run(
-        ["pgrep", "-f", r"venv/bin/python3 .*bot\.py"],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    for pid_str in out.splitlines():
-        pid_str = pid_str.strip()
-        if not pid_str:
-            continue
-        pid = int(pid_str)
-        try:
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-        except OSError:
-            continue
-        if cwd == REPO:
-            return pid
-    return None
+SERVICE_NAME = "secretary-bot.service"
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["sudo", "systemctl", *args], capture_output=True, text=True)
+
+
+def _bot_is_active() -> bool:
+    return _systemctl("is-active", "--quiet", SERVICE_NAME).returncode == 0
+
+
+def _bot_main_pid() -> int | None:
+    r = _systemctl("show", SERVICE_NAME, "--property=MainPID", "--value")
+    pid = r.stdout.strip()
+    return int(pid) if pid.isdigit() and pid != "0" else None
 
 
 def _stop_bot() -> int | None:
-    pid = _find_bot_pid()
+    """Stop the systemd-managed bot. Returns the PID it was running as, or
+    None if it wasn't running. Managed by systemd (secretary-bot.service,
+    Restart=on-failure) rather than a hand-rolled kill+nohup — see
+    docs/commits/ for why: a naive pgrep-based restart here previously
+    caused a real 409 Conflict crash loop (Telegram allows only one
+    getUpdates poller per bot token) when two instances briefly overlapped."""
+    pid = _bot_main_pid()
     if pid is None:
         return None
-    print(f"Stopping bot (pid {pid})...")
-    os.kill(pid, 15)  # SIGTERM
-    for _ in range(20):
-        time.sleep(0.5)
-        if not _pid_alive(pid):
-            break
-    else:
-        print(f"WARNING: pid {pid} did not exit after 10s — sending SIGKILL", file=sys.stderr)
-        try:
-            os.kill(pid, 9)
-        except OSError:
-            pass
-        time.sleep(1)
-    if _pid_alive(pid):
-        print(f"ERROR: pid {pid} still alive, refusing to start a second instance "
-              f"(Telegram allows only one getUpdates poller — a second process "
-              f"causes both to crash with 409 Conflict).", file=sys.stderr)
+    print(f"Stopping bot (pid {pid}, via systemctl)...")
+    r = _systemctl("stop", SERVICE_NAME)
+    if r.returncode != 0:
+        print(f"ERROR: systemctl stop failed: {r.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     return pid
 
 
 def _start_bot() -> None:
-    # Guard against ever ending up with two pollers: if something is still
-    # answering on the bot.py pattern right before we spawn, refuse instead
-    # of risking the 409 Conflict crash loop both instances hit otherwise.
-    existing = _find_bot_pid()
-    if existing is not None:
-        print(f"ERROR: pid {existing} is already running bot.py — not starting "
+    if _bot_is_active():
+        pid = _bot_main_pid()
+        print(f"ERROR: {SERVICE_NAME} is already active (pid {pid}) — not starting "
               f"a second instance.", file=sys.stderr)
         sys.exit(1)
-    print("Restarting bot...")
-    nohup_path = os.path.join(REPO, "nohup.out")
-    with open(nohup_path, "a") as log:
-        subprocess.Popen(
-            ["nohup", START_SCRIPT],
-            cwd=REPO, stdout=log, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, start_new_session=True,
-        )
+    print("Restarting bot (via systemctl)...")
+    r = _systemctl("start", SERVICE_NAME)
+    if r.returncode != 0:
+        print(f"ERROR: systemctl start failed: {r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
     time.sleep(3)
-    pid = _find_bot_pid()
-    print(f"Bot back up (pid {pid})." if pid else "WARNING: bot did not come back up — check nohup.out")
+    if _bot_is_active():
+        print(f"Bot back up (pid {_bot_main_pid()}).")
+    else:
+        print(f"WARNING: {SERVICE_NAME} did not come up — check "
+              f"'journalctl -u {SERVICE_NAME}'", file=sys.stderr)
 
 
 def _with_bot_stopped(fn):

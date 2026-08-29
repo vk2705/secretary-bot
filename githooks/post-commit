@@ -8,11 +8,12 @@
 # CLAUDE.md), so a commit lands here exactly when it's meant to be live,
 # not mid-review on a feature branch.
 #
-# Uses admin.py's own stop/start machinery (not a hand-rolled kill+nohup)
+# Uses admin.py's own stop/start machinery — systemctl against
+# secretary-bot.service (Restart=on-failure), not a hand-rolled kill+nohup —
 # so this hook can never diverge from the one restart path already proven
 # safe against Telegram's single-poller constraint (see admin.py's history:
 # a naive pgrep-based restart here caused a real 409 Conflict crash loop
-# during development).
+# during development, before the move to systemd).
 
 set -euo pipefail
 
@@ -41,6 +42,6 @@ set -a
 set +a
 
 "$REPO/venv/bin/python3" "$REPO/admin.py" restart-bot >&2 || \
-  echo "post-commit: restart failed — check nohup.out and restart manually" >&2
+  echo "post-commit: restart failed — check 'journalctl -u secretary-bot.service' and restart manually" >&2
 
 exit 0
