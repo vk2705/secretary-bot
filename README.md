@@ -42,14 +42,12 @@ export MY_CHAT_ID=123456789           # optional: enables /adminstats
 # Foreground
 export $(grep -v '^#' env | xargs) && python3 bot.py
 
-# Background (production)
-export $(grep -v '^#' env | xargs) && nohup python3 bot.py &
+# Production service
+python3 admin.py restart-bot
 
-# Check running
-pgrep -a python3
-
-# View logs
-tail -f nohup.out
+# Check status and logs
+sudo systemctl status secretary-bot.service
+journalctl -u secretary-bot.service -f
 ```
 
 ---
@@ -58,11 +56,11 @@ tail -f nohup.out
 
 | File | Purpose |
 |---|---|
-| `bot.py` | Everything — ~3500 lines, single-file architecture |
+| `bot.py` | Telegram runtime and application logic (single-file architecture) |
 | `state.json` | Per-user config, tasks, habits, trackers, reminders (gitignored) |
 | `bot_memory.db` | SQLite — unlimited notes and journal entries (gitignored) |
 | `requirements.txt` | Python dependencies |
-| `tests/test_bot.py` | 155-test suite (unit + LLM sanity + NL tool-use) |
+| `tests/` | Bot and MCP unit, integration, LLM sanity, and NL tool-use tests |
 
 ### State storage
 
@@ -310,11 +308,11 @@ pip install pytest pytest-asyncio
 # Load credentials
 export $(grep -v '^#' env | xargs)
 
-# Run all 155 tests (~40s including real API calls)
-python3 -m pytest tests/test_bot.py -v
+# Run all tests (includes real API calls)
+python3 -m pytest tests -v
 
 # Unit tests only (no API calls, <1s)
-python3 -m pytest tests/test_bot.py -k "not sanity and not nl" -v
+python3 -m pytest tests -k "not sanity and not nl" -v
 
 # LLM sanity tests only
 python3 -m pytest tests/test_bot.py -k "sanity" -v
@@ -353,15 +351,15 @@ python3 -m pytest tests/test_bot.py -k "nl" -v
 
 ```
 secretary-bot/
-├── bot.py               # Main bot (~3500 lines)
+├── bot.py               # Main bot runtime
 ├── mcp_server.py        # MCP server exposing bot data to Claude Desktop
 ├── state.json           # User data (gitignored)
 ├── bot_memory.db        # SQLite notes + journal (gitignored)
-├── nohup.out            # Log file (gitignored)
 ├── env                  # Credentials (gitignored)
 ├── requirements.txt     # Python dependencies
 ├── tests/
-│   └── test_bot.py      # 155-test suite
+│   ├── test_bot.py      # Telegram bot tests
+│   └── test_mcp_server.py # MCP and OAuth tests
 ├── PLAN.md              # Feature planning log
 └── README.md            # This file
 ```
@@ -382,15 +380,21 @@ python3 mcp_server.py
 
 claude.ai's web app can't reach a local stdio server, so a second deployment runs `mcp_server.py` in `MCP_TRANSPORT=remote` mode as a long-running service (systemd unit `secretary-mcp.service`), listening on `127.0.0.1:8545`. nginx terminates TLS on port 443 for the public hostname and reverse-proxies to that port (`/etc/nginx/conf.d/mcp-sbot.alteon.help.conf`) — the app itself never binds a public port directly. This box also fronts an unrelated Alteon MCP server the same way, routed by hostname.
 
-Add a custom connector in claude.ai with:
+Before adding the connector, send `/link` to the Telegram bot and complete the
+Google identity-linking flow. Then add this custom connector in claude.ai:
 
 ```
-https://mcp-sbot.alteon.help/mcp?key=<MCP_REMOTE_TOKEN>
+https://mcp-sbot.alteon.help/mcp
 ```
 
-`<MCP_REMOTE_TOKEN>` is the value of `MCP_REMOTE_TOKEN` in `mcp_remote.env` (gitignored — not reproduced here since this file is committed to git). Since claude.ai's connector dialog only takes a URL, the shared secret rides as a `?key=` query param instead of an `Authorization` header; a request with a missing or wrong key gets `403 Forbidden` (deliberately not `401`, which would make the client think this server supports OAuth and attempt a doomed client-registration flow — see the docstring on `_TokenAuthMiddleware` in `mcp_server.py`). All requests are logged to `journalctl -u secretary-mcp.service` (method, path, client, key validity, status — never the token value itself) for debugging connector issues.
+The server implements OAuth 2.1 and uses Google OIDC to verify the identity
+previously linked through Telegram. Access tokens are scoped to that user's
+`chat_id`; remote tools cannot enumerate or address another user.
 
-Config (`mcp_remote.env`): `MCP_REMOTE_TOKEN`, `MCP_REMOTE_DOMAIN` (public hostname, used for the Host-header DNS-rebinding check), `MCP_REMOTE_HOST`/`MCP_REMOTE_PORT` (local bind address, default `127.0.0.1:8545`).
+Config (`mcp_remote.env`): `GOOGLE_OAUTH_CLIENT_ID`,
+`GOOGLE_OAUTH_CLIENT_SECRET`, `MCP_REMOTE_DOMAIN` (public hostname and Host
+validation), and `MCP_REMOTE_HOST`/`MCP_REMOTE_PORT` (local bind, default
+`127.0.0.1:8545`).
 
 ### Tools exposed
 
@@ -401,7 +405,7 @@ Config (`mcp_remote.env`): `MCP_REMOTE_TOKEN`, `MCP_REMOTE_DOMAIN` (public hostn
 ## Security Notes
 
 - `env` and `state.json` are gitignored — never committed
-- User API keys stored in `state.json` in plaintext — secure your server
+- User API keys are Fernet-encrypted in SQLite; configure a persistent `MASTER_KEY`
 - `/setapikey` auto-deletes the message after saving to avoid key exposure in chat
 - Rate limiting prevents abuse of the bot owner's API key
 - If `GROQ_API_KEY` is set, keyless users use Groq's free tier — bot owner's OpenAI key is never consumed for them

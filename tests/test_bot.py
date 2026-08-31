@@ -201,6 +201,27 @@ class TestTaskHelpers:
         line = bot._format_task_line("Simple task", 3)
         assert line == "3. Simple task"
 
+    @pytest.mark.parametrize(
+        ("handler", "args"),
+        [
+            (bot.remove_task, ["0"]),
+            (bot.done_task, ["0"]),
+            (bot.prioritize_task, ["0"]),
+            (bot.duedate_cmd, ["0", "2026-09-01"]),
+            (bot.extend_cmd, ["0", "7"]),
+            (bot.swap_cmd, ["0", "1"]),
+        ],
+    )
+    def test_direct_task_commands_reject_zero(self, handler, args):
+        cid = 119
+        bot.state["users"][str(cid)] = fresh_user(tasks=["First", "Last"])
+        update = _debug_update(cid)
+
+        run(handler(update, _debug_context(args)))
+
+        assert bot.state["users"][str(cid)]["tasks"] == ["First", "Last"]
+        update.message.reply_text.assert_awaited_once()
+
 
 class TestGetUser:
     def setup_method(self):
@@ -2029,7 +2050,7 @@ class TestDebugFire:
         assert "Ship the report" in kwargs["text"]
         update.message.reply_text.assert_awaited_once()
 
-    def test_debug_fire_deadline_alert_annual_reminder(self):
+    def test_deadline_alert_does_not_duplicate_annual_reminder(self):
         cid = 9002
         bot.state["users"][str(cid)] = fresh_user()
         today_mmdd = date.today().strftime("%m-%d")
@@ -2043,9 +2064,9 @@ class TestDebugFire:
             update = _debug_update(cid)
             context = _debug_context(["fire", "deadline_alert"])
             run(bot.debug_cmd(update, context))
-        context.bot.send_message.assert_awaited_once()
-        _, kwargs = context.bot.send_message.call_args
-        assert "Anniversary" in kwargs["text"]
+        context.bot.send_message.assert_not_awaited()
+        args, _ = update.message.reply_text.call_args
+        assert "nothing due" in args[0]
 
     def test_debug_owner_gate_non_owner_rejected(self):
         """Non-owner chat_id gets 'Admin only.' and no send_message."""
@@ -2636,7 +2657,8 @@ class TestDebugFire:
         with as_owner(cid):
             update = _debug_update(cid)
             context = _debug_context(["fire", "reminder", "2"])
-            run(bot.debug_cmd(update, context))
+            with patch.object(bot, "chat", AsyncMock(return_value="Second")):
+                run(bot.debug_cmd(update, context))
         context.bot.send_message.assert_awaited_once()
         _, kwargs = context.bot.send_message.call_args
         assert "Second" in kwargs["text"]
@@ -2703,10 +2725,7 @@ class TestDebugFire:
             assert key in text
         context.bot.send_message.assert_not_awaited()
 
-    def test_debug_fire_annual_reminder_via_deadline_alert_unchanged(self):
-        """Firing an annual reminder's parent behaviour through deadline_alert
-        still matches the annual entry by its %m-%d date (unchanged from
-        01-01), now routed through the DEBUG_JOBS registry."""
+    def test_debug_fire_deadline_alert_does_not_duplicate_annual_reminder(self):
         cid = 9107
         bot.state["users"][str(cid)] = fresh_user()
         today_mmdd = date.today().strftime("%m-%d")
@@ -2720,12 +2739,10 @@ class TestDebugFire:
             update = _debug_update(cid)
             context = _debug_context(["fire", "deadline_alert"])
             run(bot.debug_cmd(update, context))
-        context.bot.send_message.assert_awaited_once()
-        _, kwargs = context.bot.send_message.call_args
-        assert "Anniversary" in kwargs["text"]
+        context.bot.send_message.assert_not_awaited()
         update.message.reply_text.assert_awaited_once()
         text = update.message.reply_text.call_args[0][0]
-        assert "✅" in text
+        assert "nothing due" in text
 
 
 class TestDebugOwnerGate:
@@ -3275,6 +3292,22 @@ class TestDebugClock:
         assert "debug_clock" not in payload
         assert "debug_clock_expires" not in payload
 
+    def test_export_preserves_complete_reminder_schema(self):
+        cid = 9813
+        fire_at = (bot.datetime.utcnow() + bot.timedelta(hours=1)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(reminders=[{
+            "id": "once-1", "time": "in 60 minutes", "message": "Call mum",
+            "once": True, "fire_at": fire_at, "reason": "Her birthday",
+        }])
+        update = _debug_update(cid)
+
+        run(bot.export_data(update, MagicMock()))
+
+        _, kwargs = update.message.reply_document.call_args
+        kwargs["document"].seek(0)
+        exported = json.loads(kwargs["document"].read().decode("utf-8"))
+        assert exported["reminders"][0] == bot.state["users"][str(cid)]["reminders"][0]
+
     def test_debug_clock_non_owner_rejected_before_parse_or_store(self):
         cid = 9812
         with as_owner(999999):
@@ -3431,7 +3464,7 @@ class TestDebugClockAmbient:
         assert result == "not sunday"
         context.bot.send_message.assert_not_awaited()
 
-    def test_debug_clock_ambient_deadline_alert_runner_matches_annual_reminder_months_away(self):
+    def test_debug_clock_ambient_deadline_alert_does_not_duplicate_annual_reminder(self):
         cid = 9912
         bot.state["users"][str(cid)] = fresh_user()
         bot.state["users"][str(cid)]["reminders"] = [
@@ -3441,10 +3474,8 @@ class TestDebugClockAmbient:
         self._with_clock(cid, "2027-11-25T09:00:00")
         context = _debug_context([])
         result = run(bot._run_deadline_alert(context, cid))
-        assert result is None
-        context.bot.send_message.assert_awaited_once()
-        _, kwargs = context.bot.send_message.call_args
-        assert "Anniversary" in kwargs["text"]
+        assert result == "nothing due"
+        context.bot.send_message.assert_not_awaited()
 
     def test_debug_clock_ambient_deadline_alert_runner_reports_overdue_by_simulated_week(self):
         cid = 9913
@@ -4110,23 +4141,52 @@ class TestOneShotReminderSurvivesRestart:
         assert reminders[0]["once"] is True
         assert reminders[0]["fire_at"], "one-shot must carry an absolute fire_at to be re-armed"
 
-    def test_relative_delay_still_not_persisted(self):
-        # delay_minutes reminders are deliberately fire-and-forget; only the
-        # clock-time form needed persisting.
+    def test_relative_delay_is_persisted(self):
         uid = 7302
         bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
         run(bot._execute_tool(uid, "add_reminder", {"message": "tea", "delay_minutes": 10}))
-        assert bot.state["users"][str(uid)]["reminders"] == []
+        reminders = bot.state["users"][str(uid)]["reminders"]
+        assert len(reminders) == 1
+        assert reminders[0]["once"] is True
+        assert reminders[0]["fire_at"]
 
-    def test_expired_one_shot_is_dropped_not_fired_late(self):
+    def test_expired_one_shot_is_rearmed_for_immediate_delivery(self):
         uid = 7303
         past = (bot.datetime.utcnow() - bot.timedelta(hours=3)).isoformat()
         bot.state["users"][str(uid)] = fresh_user(
             reminders=[{"id": "old", "time": "01:00", "message": "stale",
                         "once": True, "fire_at": past}])
         bot.schedule_user_reminder(bot._app, uid, bot.state["users"][str(uid)]["reminders"][0])
-        assert bot.state["users"][str(uid)]["reminders"] == [], \
-            "a one-shot whose moment passed while down must be dropped, not fired late"
+        assert len(bot.state["users"][str(uid)]["reminders"]) == 1
+        _, kwargs = bot._app.job_queue.run_once.call_args
+        assert kwargs["when"] == 1
+
+    def test_direct_once_command_is_persisted(self):
+        uid = 7305
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        update = _debug_update(uid)
+        context = _debug_context(["once", "30m", "drink", "water"])
+
+        run(bot.remind_cmd(update, context))
+
+        reminders = bot.state["users"][str(uid)]["reminders"]
+        assert len(reminders) == 1
+        assert reminders[0]["message"] == "drink water"
+        assert reminders[0]["fire_at"]
+
+    def test_annual_reminder_uses_its_configured_time(self):
+        uid = 7306
+        bot.state["users"][str(uid)] = fresh_user(timezone="UTC", timezone_confirmed=True)
+        reminder = {
+            "id": "annual", "time": "17:30", "message": "Anniversary",
+            "once": False, "annual": True, "date": "08-31",
+        }
+
+        bot.schedule_user_reminder(bot._app, uid, reminder)
+
+        _, kwargs = bot._app.job_queue.run_daily.call_args
+        assert kwargs["time"].hour == 17
+        assert kwargs["time"].minute == 30
 
     def test_daily_reminder_still_uses_run_daily(self):
         uid = 7304
@@ -4212,6 +4272,19 @@ class TestSanitizeImport:
         assert len(clean["reminders"]) == 1
         assert clean["reminders"][0]["date"] == "03-14"
 
+    def test_one_shot_reminder_requires_and_preserves_fire_at(self):
+        future = (bot.datetime.utcnow() + bot.timedelta(hours=1)).isoformat()
+        clean, skipped = bot._sanitize_import({"reminders": [
+            {"time": "in 60 minutes", "message": "valid", "once": True,
+             "fire_at": future, "reason": "important"},
+            {"time": "in 10 minutes", "message": "missing", "once": True},
+        ]})
+
+        assert len(clean["reminders"]) == 1
+        assert clean["reminders"][0]["fire_at"] == future
+        assert clean["reminders"][0]["reason"] == "important"
+        assert skipped
+
     def test_unknown_timezone_dropped(self):
         clean, skipped = bot._sanitize_import({"timezone": "Mars/Olympus"})
         assert "timezone" not in clean
@@ -4244,6 +4317,56 @@ class TestSanitizeImport:
             if key in clean:
                 user[key] = clean[key]
         assert isinstance(bot.build_system_prompt(user, uid), str)
+
+
+class TestReviewRemediations:
+    def setup_method(self):
+        bot.state = {"users": {}}
+
+    def test_reset_deletes_durable_personal_data_but_keeps_timezone(self):
+        cid = 7601
+        bot.state["users"][str(cid)] = fresh_user(
+            timezone="Europe/London", timezone_confirmed=True,
+        )
+        bot.db_set_pref(str(cid), "timezone", "Europe/London")
+        bot.db_set_pref(str(cid), "timezone_confirmed", "1")
+        bot.db_add_note(str(cid), "private note", auto=False)
+        bot.db_add_journal(str(cid), "private journal", auto=False)
+        bot.db_add_profile_memory(str(cid), "private fact")
+        bot.db_add_episodic_memory(str(cid), "private event")
+
+        run(bot.reset_cmd(_debug_update(cid), _reset_context()))
+
+        assert bot.db_get_notes(str(cid)) == []
+        assert bot.db_get_journal(str(cid)) == []
+        assert bot.db_get_profile_memory(str(cid)) == []
+        assert bot.db_get_episodic_memory(str(cid)) == []
+        assert bot.db_get_pref(str(cid), "timezone") == "Europe/London"
+        assert bot.db_get_pref(str(cid), "timezone_confirmed") == "1"
+
+    def test_limit_command_reads_sqlite_rate_log(self):
+        cid = 7602
+        bot.state["users"][str(cid)] = fresh_user()
+        assert bot.is_rate_limited(cid) is False
+        assert bot.is_rate_limited(cid) is False
+        update = _debug_update(cid)
+
+        run(bot.limit_cmd(update, _debug_context([])))
+
+        args, _ = update.message.reply_text.call_args
+        assert "2/30" in args[0]
+        assert "28 messages remaining" in args[0]
+
+    def test_subscribe_requires_confirmed_timezone(self):
+        cid = 7603
+        bot.state["users"][str(cid)] = fresh_user(timezone_confirmed=False)
+        update = _debug_update(cid)
+        context = _debug_context([])
+
+        run(bot.subscribe(update, context))
+
+        assert bot.state["users"][str(cid)]["checkin_enabled"] is False
+        update.message.reply_text.assert_awaited_once_with(bot._TZ_NOT_CONFIRMED_MSG)
 
 
 class TestEmptyModelReplyNeverSent:
@@ -4283,15 +4406,17 @@ class TestSnoozeTokenPersistence:
 
     def test_token_round_trips_through_sqlite(self):
         bot.db_save_snooze("tok1", 42, "drink water", "staying hydrated")
-        assert bot.db_take_snooze("tok1") == {"message": "drink water", "reason": "staying hydrated"}
+        assert bot.db_take_snooze("tok1", 123) is None
+        assert bot.db_take_snooze("tok1", 42) == {"message": "drink water", "reason": "staying hydrated"}
 
     def test_token_is_single_use(self):
         bot.db_save_snooze("tok2", 42, "msg", None)
-        bot.db_take_snooze("tok2")
-        assert bot.db_take_snooze("tok2") is None
+        assert bot.db_take_snooze("tok2", 999) is None
+        assert bot.db_take_snooze("tok2", 42) == {"message": "msg", "reason": None}
+        assert bot.db_take_snooze("tok2", 42) is None
 
     def test_unknown_token_returns_none(self):
-        assert bot.db_take_snooze("never-existed") is None
+        assert bot.db_take_snooze("never-existed", 123) is None
 
     def test_reminder_run_stores_a_collision_free_token(self):
         # uuid4 hex: no underscores (the callback splits on "_") and no wrap.
@@ -4335,32 +4460,12 @@ class TestRemindRemoveIndexGuard:
         assert [r["id"] for r in remaining] == ["b"]
 
 
-class TestAnnualReminderNotScheduledDaily:
-    """Two of the three timezone-change call sites guarded against scheduling
-    an annual reminder as a daily job; handle_location did not, so sharing a
-    location turned a once-a-year reminder into a daily one."""
-
-    def test_every_reschedule_site_guards_on_annual(self):
-        """Scans every function in bot.py rather than a hard-coded list, so a
-        future call site added without the guard is caught too — that is
-        exactly how handle_location came to be the one site that missed it."""
+class TestAnnualReminderScheduling:
+    def test_scheduler_guards_annual_delivery_by_date(self):
         import inspect
-        unguarded = []
-        for name, fn in vars(bot).items():
-            if not inspect.isfunction(fn) or fn.__module__ != "bot":
-                continue
-            if name in ("schedule_user_reminder", "_drop_reminder"):
-                continue  # the scheduler itself; annual-ness is decided by callers
-            try:
-                src = inspect.getsource(fn)
-            except OSError:
-                continue
-            if "schedule_user_reminder(" in src and "annual" not in src:
-                unguarded.append(name)
-        assert not unguarded, (
-            f"these reschedule reminders without an annual guard, so annual "
-            f"reminders would fire daily: {unguarded}"
-        )
+        source = inspect.getsource(bot.schedule_user_reminder)
+        assert 'if reminder.get("annual")' in source
+        assert 'strftime("%m-%d") == _reminder.get("date")' in source
 
 
 class TestGlobalErrorHandler:

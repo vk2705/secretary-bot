@@ -68,6 +68,8 @@ os.environ.setdefault("OPENAI_API_KEY", "TEST_KEY")
 # session-wide throwaway file, never production — _fresh_db() still gives
 # each test its own file on top of this for isolation between tests.
 _session_state = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+_session_state.write(b'{"users": {}}')
+_session_state.flush()
 _session_state.close()
 _session_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _session_db.close()
@@ -299,6 +301,9 @@ class TestSecretaryOAuthProvider:
         assert pending["client_id"] == client.client_id
 
     def test_exchange_authorization_code_mints_tokens_bound_to_subject(self):
+        mcp_server._auth_code_save(
+            "code-xyz", "client-1", "chat-42", ["secretary"], "chal", "https://x/cb", True, None
+        )
         auth_code = AuthorizationCode(
             code="code-xyz", scopes=["secretary"], expires_at=time.time() + 60,
             client_id="client-1", code_challenge="chal", redirect_uri="https://x/cb",
@@ -326,6 +331,9 @@ class TestSecretaryOAuthProvider:
         run(self.provider.exchange_authorization_code(client, loaded))
         # exchanging deletes it — a second load must fail
         assert run(self.provider.load_authorization_code(client, "one-shot")) is None
+        with pytest.raises(mcp_server.TokenError) as error:
+            run(self.provider.exchange_authorization_code(client, loaded))
+        assert error.value.error == "invalid_grant"
 
     def test_load_authorization_code_rejects_wrong_client(self):
         mcp_server._auth_code_save(
@@ -335,6 +343,9 @@ class TestSecretaryOAuthProvider:
         assert run(self.provider.load_authorization_code(other_client, "code-a")) is None
 
     def test_refresh_token_rotates_on_use(self):
+        mcp_server._auth_code_save(
+            "code-r", "client-1", "chat-7", ["secretary"], "chal", "https://x/cb", True, None
+        )
         auth_code = AuthorizationCode(
             code="code-r", scopes=["secretary"], expires_at=time.time() + 60,
             client_id="client-1", code_challenge="chal", redirect_uri="https://x/cb",
@@ -351,6 +362,9 @@ class TestSecretaryOAuthProvider:
         # new tokens resolve to the same subject
         access = run(self.provider.load_access_token(second.access_token))
         assert access.subject == "chat-7"
+        with pytest.raises(mcp_server.TokenError) as error:
+            run(self.provider.exchange_refresh_token(client, old_refresh, ["secretary"]))
+        assert error.value.error == "invalid_grant"
 
     def test_load_access_token_rejects_expired(self):
         mcp_server._token_save("access", "stale", "client-1", "chat-1", ["secretary"], time.time() - 10)

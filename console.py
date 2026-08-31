@@ -34,6 +34,7 @@ import ast
 import asyncio
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import types
@@ -43,6 +44,7 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SANDBOX = os.path.join(tempfile.gettempdir(), "secretary-bot-console")
 DEFAULT_CHAT_ID = 999001
 VENV_PYTHON = os.path.join(REPO, "venv", "bin", "python3")
+SANDBOX_MARKER = ".secretary-bot-sandbox"
 
 
 def _reexec_in_venv() -> None:
@@ -226,15 +228,29 @@ def _discover_commands(bot) -> dict:
 # ─────────────────────── sandbox ───────────────────────
 
 def _prepare_sandbox(path: str, keep: bool, seed_from_live: bool) -> None:
+    if os.path.islink(path):
+        raise RuntimeError(f"Refusing to use a symlink as a sandbox: {path}")
     if not keep and os.path.isdir(path):
+        marker = os.path.join(path, SANDBOX_MARKER)
+        if os.path.abspath(path) != os.path.abspath(DEFAULT_SANDBOX) and not os.path.isfile(marker):
+            raise RuntimeError(f"Refusing to delete unmarked sandbox directory: {path}")
         shutil.rmtree(path)
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    marker = os.path.join(path, SANDBOX_MARKER)
+    with open(marker, "a", encoding="utf-8"):
+        pass
 
     if seed_from_live:
-        for fname in ("state.json", "bot_memory.db"):
-            src, dst = os.path.join(REPO, fname), os.path.join(path, fname)
-            if os.path.exists(src) and not os.path.exists(dst):
-                shutil.copy2(src, dst)
+        state_src = os.path.join(REPO, "state.json")
+        state_dst = os.path.join(path, "state.json")
+        if os.path.exists(state_src) and not os.path.exists(state_dst):
+            shutil.copy2(state_src, state_dst)
+        db_src = os.path.join(REPO, "bot_memory.db")
+        db_dst = os.path.join(path, "bot_memory.db")
+        if os.path.exists(db_src) and not os.path.exists(db_dst):
+            with sqlite3.connect(db_src) as source, sqlite3.connect(db_dst) as target:
+                source.backup(target)
 
 
 META = """Console meta-commands:
@@ -276,6 +292,8 @@ def main() -> int:
     # load_state() at import time, at the module's very bottom.
     state_path = os.path.join(args.sandbox, "state.json")
     db_path = os.path.join(args.sandbox, "bot_memory.db")
+    os.environ["BOT_STATE_FILE"] = state_path
+    os.environ["BOT_DB_FILE"] = db_path
 
     import bot  # noqa: E402  (after stubs + env)
 

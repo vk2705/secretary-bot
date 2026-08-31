@@ -18,6 +18,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import tempfile
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -257,6 +258,16 @@ def _auth_code_delete(code: str) -> None:
         con.execute("DELETE FROM mcp_auth_codes WHERE code=?", (code,))
 
 
+def _auth_code_consume(code: str, client_id: str) -> bool:
+    with _db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        cursor = con.execute(
+            "DELETE FROM mcp_auth_codes WHERE code=? AND client_id=? AND expires_at>=?",
+            (code, client_id, time.time()),
+        )
+    return cursor.rowcount == 1
+
+
 def _token_save(kind: str, token: str, client_id: str, chat_id: str, scopes: list[str], expires_at: float | None) -> None:
     with _db() as con:
         con.execute(
@@ -277,6 +288,16 @@ def _token_load(kind: str, token: str) -> dict | None:
 def _token_delete(kind: str, token: str) -> None:
     with _db() as con:
         con.execute("DELETE FROM mcp_tokens WHERE token_hash=? AND kind=?", (_hash_token(token), kind))
+
+
+def _refresh_token_consume(token: str, client_id: str) -> bool:
+    with _db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        cursor = con.execute(
+            "DELETE FROM mcp_tokens WHERE token_hash=? AND kind='refresh' AND client_id=?",
+            (_hash_token(token), client_id),
+        )
+    return cursor.rowcount == 1
 
 
 class SecretaryOAuthProvider(OAuthAuthorizationServerProvider):
@@ -316,7 +337,8 @@ class SecretaryOAuthProvider(OAuthAuthorizationServerProvider):
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        _auth_code_delete(authorization_code.code)  # single-use
+        if not _auth_code_consume(authorization_code.code, client.client_id):
+            raise TokenError("invalid_grant", "Authorization code is expired or already used")
         access_token = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
         expires_in = 3600
@@ -341,7 +363,8 @@ class SecretaryOAuthProvider(OAuthAuthorizationServerProvider):
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        _token_delete("refresh", refresh_token.token)  # rotate on every use
+        if not _refresh_token_consume(refresh_token.token, client.client_id):
+            raise TokenError("invalid_grant", "Refresh token is expired or already used")
         new_access = secrets.token_urlsafe(32)
         new_refresh = secrets.token_urlsafe(32)
         expires_in = 3600
@@ -494,8 +517,18 @@ def _load() -> dict:
 
 
 def _save(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    file_descriptor, temporary = tempfile.mkstemp(
+        dir=STATE_FILE.parent, prefix=".state-mcp-", suffix=".tmp"
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary_path.replace(STATE_FILE)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _user(state: dict, chat_id: str) -> dict | None:

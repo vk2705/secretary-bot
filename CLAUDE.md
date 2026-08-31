@@ -39,10 +39,10 @@ secretary-bot.service` before starting it again.
 
 ```bash
 # All tests
-export $(grep -v '^#' env | xargs) && python -m pytest tests/test_bot.py -v
+export $(grep -v '^#' env | xargs) && python -m pytest tests -v
 
 # Unit tests only (no API calls)
-python -m pytest tests/test_bot.py -v -k "not sanity and not nl"
+python -m pytest tests -v -k "not sanity and not nl"
 
 # LLM sanity check (one real API call)
 export $(grep -v '^#' env | xargs) && python -m pytest tests/test_bot.py -v -k sanity
@@ -134,7 +134,7 @@ fresh clone**: `git config core.hooksPath githooks`.
 
 ## `backup.sh` — hourly data backup
 
-Copies `state.json` + `bot_memory.db` into a **separate, private** GitHub
+Snapshots `state.json` + `bot_memory.db` into a **separate, private** GitHub
 repo (`vk2705/secretary-bot-backups`, cloned at
 `/home/ec2-user/secretary-bot-backups`) and commits + pushes if anything
 changed. Deliberately a different repo from this one — those two files hold
@@ -146,10 +146,10 @@ a missed run catches up after downtime) → `secretary-bot-backup.service` →
 `backup.sh`. Follows the same systemd pattern as `secretary-mcp.service`
 rather than cron, which isn't installed on this host. Check with
 `systemctl status secretary-bot-backup.timer` / `journalctl -u
-secretary-bot-backup.service`. No bot stop/restart needed for backups —
-`save_state()`'s atomic tempfile+`os.replace()` write means any read of
-`state.json` mid-write is always a complete, consistent version, never a
-torn one.
+secretary-bot-backup.service`. No bot stop/restart is needed. `state.json` is
+copied from an atomic on-disk version, while `bot_memory.db` is captured through
+SQLite's online backup API and verified with `PRAGMA integrity_check`, including
+committed WAL data.
 
 Restore: `git show <commit>:state.json > state.json` (and `bot_memory.db`
 the same way) from inside the backup repo, after stopping the bot — see

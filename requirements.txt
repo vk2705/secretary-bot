@@ -1,8 +1,10 @@
 python-telegram-bot[job-queue]>=21.6
 openai>=1.0.0
 tzdata
-mcp>=1.0.0
+mcp>=1.25.0,<2.0.0
 timezonefinder>=6.0.0
 cryptography>=42.0.0
 httpx>=0.28.0
 PyJWT>=2.13.0
+starlette>=0.46.0
+uvicorn>=0.34.0

@@ -12,7 +12,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 
 - **Tech stack**: Python, single-file `bot.py`, `python-telegram-bot` with APScheduler, hybrid storage across `state.json` and SQLite — new work should follow the existing patterns rather than introduce a parallel architecture.
 - **Cost**: keyless users run on Groq's free tier under 30 AI calls/hour/user. Periodic per-user synthesis for the model of the user is a new and different cost shape, and must be designed with that in mind.
-- **Deployment**: the bot runs under `nohup` with no process supervisor; only the MCP server has a systemd unit. Anything requiring reliable background execution inherits this fragility.
+- **Deployment**: the bot and MCP server run as separate systemd services; hourly backups run through a systemd timer.
 - **Scale**: one user today. Do not engineer for more.
 - **Working style**: ideas are discussed and agreed before any code is written.
 - **Privacy**: the bot holds a personal journal and a behavioural model of a real person. Live secrets and user data (`env`, `mcp_remote.env`, `state.json`, `bot_memory.db`) are gitignored and must never enter planning artifacts. Data-at-rest hardening (encryption of journal/observations, stronger key handling) is explicitly deferred — accepted as proportionate to a single-user personal server for this milestone, to be revisited if the user base grows.
@@ -32,7 +32,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 ## Frameworks
 
 - `python-telegram-bot` 21.6+ - Telegram bot with job queue for scheduled tasks
-- `mcp` 1.0.0+ - Model Context Protocol server for Claude integration
+- `mcp` 1.25.0–1.x - Model Context Protocol server for Claude integration
 - `openai` 1.0.0+ - OpenAI AsyncOpenAI client for LLM calls with function calling support; also used for Groq API via compatible endpoint
 - `pytest` - Test runner (referenced in README and test file)
 - `pytest-asyncio` - Async test support (referenced in README)
@@ -45,14 +45,14 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - `cryptography` 42.0.0+ - Fernet symmetric encryption for user API keys stored in SQLite
 - `tzdata` - IANA timezone database for zoneinfo module
 - `timezonefinder` 6.0.0+ - GPS coordinate → IANA timezone conversion (location-based timezone auto-detection)
-- `mcp` 1.0.0+ - Model Context Protocol server library (FastMCP) for Claude Desktop/Code/claude.ai integration
+- `mcp` 1.25.0–1.x - Model Context Protocol server library (FastMCP) for Claude Desktop/Code/claude.ai integration
 
 ## Configuration
 
 - `TELEGRAM_TOKEN` - Telegram bot token (required)
 - `OPENAI_API_KEY` - OpenAI API key for fallback LLM (required)
 - `GROQ_API_KEY` - Groq API key for free-tier LLM (optional; if set, keyless users use Groq instead of OpenAI)
-- `MASTER_KEY` - Fernet encryption key for API keys stored in SQLite (optional; auto-generated ephemeral if unset, printed to stderr)
+- `MASTER_KEY` - Fernet encryption key for API keys stored in SQLite (optional; auto-generated ephemerally if unset, never logged)
 - `MY_CHAT_ID` - Single user's chat_id for one-time state.json migration (optional)
 - `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` - Google OAuth credentials backing the remote MCP server's own Authorization Server (Milestone B; required for remote mode — replaced the old `MCP_REMOTE_TOKEN` shared-secret `?key=` auth)
 - `MCP_REMOTE_DOMAIN` - Public hostname for Host-header DNS-rebinding check (required for remote mode)
@@ -62,7 +62,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - `BOT_STATE_FILE` - Override `state.json` path (default: relative to `mcp_server.py`)
 - `BOT_DB_FILE` - Override `bot_memory.db` path (default: relative to `mcp_server.py`)
 - No build configuration; single-file architecture
-- Deployment: `nohup python3 bot.py &` (background) or systemd service for MCP server
+- Deployment: systemd services for both the bot and MCP server
 
 ## Platform Requirements
 
@@ -289,7 +289,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - Triggers: `python3 mcp_server.py` (stdio) or via `MCP_TRANSPORT=remote` env var (HTTP)
 - Responsibilities: Expose tools, authenticate if remote, serve reads/writes
 - Location: `tests/test_bot.py:1-600+`
-- Triggers: `pytest tests/test_bot.py -v`
+- Triggers: `pytest tests -v`
 - Responsibilities: Unit tests, LLM sanity checks, tool-use verification
 
 ## Architectural Constraints
@@ -299,7 +299,7 @@ Today it serves one user (the author). It may serve more later, but it is not be
 - **Circular imports:** None detected. Imports are layered: external libs → module-level setup → state load → function definitions.
 - **In-memory jobs only:** All APScheduler jobs are created at startup via `restore_all_jobs()` from state.json and recreated after every restart. Job metadata is not persisted — only state.json user config is. `job_log` SQLite table tracks fire times for recovery (e.g., if a job was supposed to run while bot was down, it's caught up on restart).
 - **Rate limiting persistence:** Backed by SQLite `rate_log` table, survives restarts. Checked before every LLM call.
-- **Encryption key lifecycle:** `MASTER_KEY` env var (optional) decrypts API keys at runtime. If not set, a temporary key is generated and printed to stderr — plaintext API keys stored during the session become unreadable after restart.
+- **Encryption key lifecycle:** `MASTER_KEY` decrypts API keys at runtime. If absent, a temporary in-memory key is generated and warned about without logging the key; keys stored in that process become unreadable after restart.
 
 ## Anti-Patterns
 

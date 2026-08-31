@@ -139,8 +139,9 @@ def _start_bot() -> None:
     if _bot_is_active():
         print(f"Bot back up (pid {_bot_main_pid()}).")
     else:
-        print(f"WARNING: {SERVICE_NAME} did not come up — check "
+        print(f"ERROR: {SERVICE_NAME} did not come up — check "
               f"'journalctl -u {SERVICE_NAME}'", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def _with_bot_stopped(fn):

@@ -38,8 +38,8 @@ MY_CHAT_ID = os.environ.get("MY_CHAT_ID")
 # Fallback model when no Groq key and using bot owner's OpenAI key
 DEFAULT_MODEL = "gpt-4o-mini"
 
-STATE_FILE = "state.json"
-DB_FILE = "bot_memory.db"
+STATE_FILE = os.environ.get("BOT_STATE_FILE", "state.json")
+DB_FILE = os.environ.get("BOT_DB_FILE", "bot_memory.db")
 MAX_HISTORY = 20
 
 # Encryption master key — generate once with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -53,13 +53,11 @@ def _get_fernet() -> Fernet:
     if _fernet:
         return _fernet
     if not MASTER_KEY:
-        # Auto-generate for single-node dev; loudly warn that it won't survive restart
+        # Auto-generate for single-node dev; loudly warn that it won't survive restart.
         generated = Fernet.generate_key().decode()
-        # Print the key to stderr only (never into the persistent log file)
-        print(f"MASTER_KEY={generated}", file=sys.stderr, flush=True)
         logger.warning(
-            "MASTER_KEY not set in env — generated a temporary key (printed to stderr). "
-            "API keys will be unreadable after restart until you add MASTER_KEY to your env file."
+            "MASTER_KEY not set in env — generated a temporary in-memory key. "
+            "API keys stored in this process will be unreadable after restart."
         )
         MASTER_KEY = generated
     try:
@@ -454,15 +452,19 @@ def db_save_snooze(token: str, chat_id: int, message: str, reason: str | None) -
         )
 
 
-def db_take_snooze(token: str) -> dict | None:
+def db_take_snooze(token: str, chat_id: int) -> dict | None:
     """Pop a snooze payload by token (single-use, like the in-memory cache)."""
     with _db() as con:
         row = con.execute(
-            "SELECT message, reason FROM snooze_tokens WHERE token=?", (token,)
+            "SELECT message, reason FROM snooze_tokens WHERE token=? AND chat_id=?",
+            (token, str(chat_id)),
         ).fetchone()
         if row is None:
             return None
-        con.execute("DELETE FROM snooze_tokens WHERE token=?", (token,))
+        con.execute(
+            "DELETE FROM snooze_tokens WHERE token=? AND chat_id=?",
+            (token, str(chat_id)),
+        )
     return {"message": row["message"], "reason": row["reason"]}
 
 
@@ -766,6 +768,35 @@ def is_rate_limited(chat_id: int) -> bool:
             return True
         con.execute("INSERT INTO rate_log(chat_id,ts) VALUES(?,?)", (key, now))
     return False
+
+
+def rate_limit_status(chat_id: int) -> tuple[int, int]:
+    """Return calls used and remaining in the current rolling window."""
+    key = str(chat_id)
+    cutoff = time.time() - RATE_WINDOW
+    with _db() as con:
+        con.execute("DELETE FROM rate_log WHERE chat_id=? AND ts < ?", (key, cutoff))
+        used = con.execute(
+            "SELECT count(*) FROM rate_log WHERE chat_id=?", (key,)
+        ).fetchone()[0]
+    return used, max(0, RATE_LIMIT - used)
+
+
+def db_reset_user_data(chat_id: int) -> None:
+    """Delete durable user data while retaining API key and timezone settings."""
+    key = str(chat_id)
+    tables = (
+        "notes", "journal", "rate_log", "profile_memory", "episodic_memory",
+        "job_log", "reminder_log", "snooze_tokens", "mcp_link_codes",
+        "mcp_identity", "mcp_auth_codes", "mcp_tokens",
+    )
+    with _db() as con:
+        for table in tables:
+            con.execute(f"DELETE FROM {table} WHERE chat_id=?", (key,))
+        con.execute(
+            "DELETE FROM user_prefs WHERE chat_id=? AND key NOT IN ('timezone', 'timezone_confirmed')",
+            (key,),
+        )
 
 
 # ─────────────────────── date helpers ───────────────────────
@@ -1326,8 +1357,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             schedule_user_checkins(_app, chat_id)
             schedule_user_alerts(_app, chat_id)
             for reminder in list(user.get("reminders", [])):
-                if not reminder.get("annual"):
-                    schedule_user_reminder(_app, chat_id, reminder)
+                schedule_user_reminder(_app, chat_id, reminder)
         # Build friendly label
         try:
             _tz = ZoneInfo(tz_str)
@@ -1557,11 +1587,10 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 return {"error": "delay_minutes must be a positive integer"}
             if not _app:
                 return {"error": "Scheduler not available"}
-            db_log_reminder(chat_id, None, message, reason, "once", None)
-            async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message, _reason=reason):
-                await _run_reminder(ctx, _cid, {"message": _msg, "reason": _reason}, simulate=False)
-            _app.job_queue.run_once(_once_job, when=delay_minutes * 60,
-                                    name=f"once_{chat_id}_{uuid.uuid4()}")
+            _persist_one_shot_reminder(
+                _app, chat_id, user, message, reason,
+                delay_minutes * 60, f"in {delay_minutes} minutes",
+            )
             return {"success": True, "once_in_minutes": delay_minutes, "message": message}
         # ── absolute time ──
         gate = _timezone_gate(user)
@@ -1584,15 +1613,9 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             # Persisted (unlike the delay_minutes branch above) so restore_all_jobs
             # can re-arm it: a one-shot scheduled for tonight used to vanish on any
             # restart between now and then, silently, after the bot had confirmed it.
-            reminder = {
-                "id": str(uuid.uuid4()), "time": time_str, "message": message,
-                "once": True, "reason": reason,
-                "fire_at": (datetime.utcnow() + timedelta(seconds=delay)).isoformat(),
-            }
-            user.setdefault("reminders", []).append(reminder)
-            save_state(state)
-            db_log_reminder(chat_id, reminder["id"], message, reason, "once", time_str)
-            schedule_user_reminder(_app, chat_id, reminder)
+            _persist_one_shot_reminder(
+                _app, chat_id, user, message, reason, delay, time_str,
+            )
             return {"success": True, "once_at": time_str, "message": message}
         # ── daily recurring ──
         reminder = {"id": str(uuid.uuid4()), "time": time_str, "message": message, "once": False, "reason": reason}
@@ -2078,6 +2101,14 @@ def _task_due(task) -> str | None:
     return task.get("due") if isinstance(task, dict) else None
 
 
+def _task_index(tasks: list, raw_number: str) -> int:
+    """Convert a user-facing 1-based task number to a validated index."""
+    number = int(raw_number)
+    if not 1 <= number <= len(tasks):
+        raise IndexError
+    return number - 1
+
+
 def _task_tags(task) -> list:
     return re.findall(r"#(\w+)", _task_text(task).lower())
 
@@ -2410,6 +2441,8 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
             # actually reached for, which is where the duplicate cost is.
             round_tools = TOOLS if _round == 0 else _tools_for_round(called_tools)
             try:
+                if is_rate_limited(chat_id):
+                    return "⚠️ AI call limit reached. Try again later."
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -2422,6 +2455,8 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
                 # Model may not support tools (e.g. custom model); retry without
                 err_str = str(tool_err).lower()
                 if any(w in err_str for w in ("tool", "function", "unsupported")):
+                    if is_rate_limited(chat_id):
+                        return "⚠️ AI call limit reached. Try again later."
                     response = await client.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -2445,7 +2480,10 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
                     args = {}
                 called_tools.add(tc.function.name)
                 result = await _execute_tool(chat_id, tc.function.name, args)
-                logger.info("Tool %s(%s) → %s", tc.function.name, args, result)
+                logger.info(
+                    "Tool %s completed (%s)", tc.function.name,
+                    "error" if "error" in result else "success",
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -2667,6 +2705,30 @@ def _drop_reminder(chat_id: int, reminder_id: str) -> None:
         db_mark_reminder_removed(chat_id, reminder_id)
 
 
+def _persist_one_shot_reminder(
+    app: Application,
+    chat_id: int,
+    user: dict,
+    message: str,
+    reason: str | None,
+    delay_seconds: float,
+    time_label: str,
+) -> dict:
+    reminder = {
+        "id": str(uuid.uuid4()),
+        "time": time_label,
+        "message": message,
+        "once": True,
+        "reason": reason,
+        "fire_at": (datetime.utcnow() + timedelta(seconds=delay_seconds)).isoformat(),
+    }
+    user.setdefault("reminders", []).append(reminder)
+    save_state(state)
+    db_log_reminder(chat_id, reminder["id"], message, reason, "once", time_label)
+    schedule_user_reminder(app, chat_id, reminder)
+    return reminder
+
+
 def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> None:
     user = get_user(chat_id)
     job_name = f"reminder_{chat_id}_{reminder['id']}"
@@ -2684,18 +2746,39 @@ def schedule_user_reminder(app: Application, chat_id: int, reminder: dict) -> No
         except ValueError:
             return
         if delay <= 0:
-            # Its moment passed while the bot was down — drop it rather than
-            # firing a stale "remind me at 23:00" the next morning.
-            _drop_reminder(chat_id, reminder["id"])
-            return
+            delay = 1
 
-        async def _once_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _reminder=reminder):
-            try:
-                await _run_reminder(context, _cid, _reminder, simulate=False)
-            finally:
+        async def _once_wrapper(
+            context: ContextTypes.DEFAULT_TYPE,
+            _cid=chat_id,
+            _reminder=reminder,
+            _app=app,
+        ):
+            result = await _run_reminder(context, _cid, _reminder, simulate=False)
+            if result is None:
                 _drop_reminder(_cid, _reminder["id"])
+            else:
+                _reminder["fire_at"] = (
+                    datetime.utcnow() + timedelta(minutes=30)
+                ).isoformat()
+                save_state(state)
+                schedule_user_reminder(_app, _cid, _reminder)
 
         app.job_queue.run_once(_once_wrapper, when=delay, name=job_name)
+        return
+
+    if reminder.get("annual"):
+        t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
+
+        async def _annual_wrapper(
+            context: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _reminder=reminder
+        ):
+            current = get_user(_cid)
+            tz = ZoneInfo(current.get("timezone", "UTC"))
+            if datetime.now(tz).strftime("%m-%d") == _reminder.get("date"):
+                await _run_reminder(context, _cid, _reminder, simulate=False)
+
+        app.job_queue.run_daily(_annual_wrapper, time=t, name=job_name)
         return
 
     t = _parse_local_time(reminder["time"], user.get("timezone", "UTC"))
@@ -2758,20 +2841,6 @@ async def _run_deadline_alert(
             sent = True
         except Exception as e:
             logger.error("Deadline alert failed for %s: %s", chat_id, e)
-
-    # Fire annual reminders whose MM-DD matches today
-    today_mmdd = today.strftime("%m-%d")
-    for r in u.get("reminders", []):
-        if r.get("annual") and r.get("date") == today_mmdd:
-            attempted = True
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"📅 Annual reminder: {r['message']}"
-                )
-                sent = True
-            except Exception as e:
-                logger.error("Annual reminder failed for %s: %s", chat_id, e)
 
     if sent:
         return None
@@ -2984,14 +3053,8 @@ def restore_all_jobs(app: Application) -> None:
         cid = int(cid_str)
         schedule_user_checkins(app, cid)
         schedule_user_alerts(app, cid)
-        # list() because schedule_user_reminder can drop an expired one-shot
-        # from this same list while we're iterating it.
         for reminder in list(user.get("reminders", [])):
-            # Annual reminders fire via the deadline-alert job's date check, not
-            # as their own daily job — scheduling them here would make them fire
-            # every day instead of once a year.
-            if not reminder.get("annual"):
-                schedule_user_reminder(app, cid, reminder)
+            schedule_user_reminder(app, cid, reminder)
 
         # Missed check-in catch-up
         if not user.get("checkin_enabled"):
@@ -3307,7 +3370,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     try:
-        idx = int(context.args[0]) - 1
+        idx = _task_index(user["tasks"], context.args[0])
         removed = user["tasks"].pop(idx)
         save_state(state)
         await update.message.reply_text(f"Removed: {_task_text(removed)}")
@@ -3321,7 +3384,7 @@ async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /donetask <number>  (use /tasks to see numbers)")
         return
     try:
-        idx = int(context.args[0]) - 1
+        idx = _task_index(user["tasks"], context.args[0])
         task = user["tasks"][idx]
         recur = task.get("recur") if isinstance(task, dict) else None
 
@@ -3420,6 +3483,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (T-1-15) -- unlike timezone, which is deliberately preserved above.
     db_delete_pref(str(chat_id), "debug_clock")
     db_delete_pref(str(chat_id), "debug_clock_expires")
+    db_reset_user_data(chat_id)
     # Cancel all scheduled jobs
     schedule_user_checkins(context.application, chat_id)
     schedule_user_alerts(context.application, chat_id)
@@ -3437,7 +3501,7 @@ async def prioritize_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /prioritize <number>  (moves task to top)")
         return
     try:
-        idx = int(context.args[0]) - 1
+        idx = _task_index(user["tasks"], context.args[0])
         task = user["tasks"].pop(idx)
         user["tasks"].insert(0, task)
         save_state(state)
@@ -3539,7 +3603,7 @@ async def duedate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /duedate <number> YYYY-MM-DD\nUse 'none' to clear the due date.")
         return
     try:
-        idx = int(context.args[0]) - 1
+        idx = _task_index(user["tasks"], context.args[0])
         date_str = context.args[1].lower()
         task = user["tasks"][idx]
         if date_str == "none":
@@ -3568,7 +3632,7 @@ async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /extend <task number> <days>\nExample: /extend 2 7")
         return
     try:
-        idx = int(context.args[0]) - 1
+        idx = _task_index(user["tasks"], context.args[0])
         days_n = int(context.args[1])
         task = user["tasks"][idx]
         current_due = _task_due(task)
@@ -3598,8 +3662,9 @@ async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /swap <n> <m>  — swap positions of two tasks")
         return
     try:
-        i, j = int(context.args[0]) - 1, int(context.args[1]) - 1
         tasks = user["tasks"]
+        i = _task_index(tasks, context.args[0])
+        j = _task_index(tasks, context.args[1])
         tasks[i], tasks[j] = tasks[j], tasks[i]
         save_state(state)
         await update.message.reply_text(
@@ -3613,9 +3678,6 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ask AI to suggest new tasks or habits based on user profile."""
     chat_id = update.effective_chat.id
     user = get_user(chat_id)
-    if is_rate_limited(chat_id):
-        await update.message.reply_text("Rate limit reached. Try again later.")
-        return
     ctx = user.get("context", "")
     tasks_str = _tasks_for_prompt(user["tasks"])
     habits = ", ".join(user.get("habits", {}).keys()) or "none"
@@ -3643,9 +3705,6 @@ async def reflect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deep personal reflection: patterns, what's working, what isn't."""
     chat_id = update.effective_chat.id
     user = get_user(chat_id)
-    if is_rate_limited(chat_id):
-        await update.message.reply_text("Rate limit reached. Try again later.")
-        return
     streak = _get_streak(user)
     habits = user.get("habits", {})
     habit_lines = []
@@ -3848,11 +3907,7 @@ async def unmute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current rate limit status."""
-    key = str(update.effective_chat.id)
-    now = time.monotonic()
-    recent = [t for t in _rate_log[key] if now - t < RATE_WINDOW]
-    used = len(recent)
-    remaining = max(0, RATE_LIMIT - used)
+    used, remaining = rate_limit_status(update.effective_chat.id)
     bar = "█" * min(used, RATE_LIMIT) + "░" * max(0, RATE_LIMIT - used)
     await update.message.reply_text(
         f"📊 Rate limit: {used}/{RATE_LIMIT} used this hour\n"
@@ -3883,6 +3938,9 @@ async def show_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     tz = user.get("timezone", "UTC")
+    if not user.get("timezone_confirmed"):
+        await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
+        return
 
     # Optional: /subscribe HH:MM HH:MM sets check-in times in one step
     if len(context.args) >= 2:
@@ -3940,10 +3998,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_checkins(context.application, chat_id)
     schedule_user_alerts(context.application, chat_id)
     for reminder in list(user.get("reminders", [])):
-        # Annual reminders fire via the deadline-alert date check; scheduling
-        # one here would turn a once-a-year reminder into a daily one.
-        if not reminder.get("annual"):
-            schedule_user_reminder(context.application, chat_id, reminder)
+        schedule_user_reminder(context.application, chat_id, reminder)
     await update.message.reply_text(f"📍 Timezone set to {tz_str} from your location.")
 
 
@@ -3984,8 +4039,7 @@ async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
     for reminder in list(user.get("reminders", [])):
-        if not reminder.get("annual"):
-            schedule_user_reminder(context.application, update.effective_chat.id, reminder)
+        schedule_user_reminder(context.application, update.effective_chat.id, reminder)
     # Show user-friendly offset for Etc/GMT zones (POSIX sign is inverted)
     display = tz_str
     import re as _re2
@@ -4145,18 +4199,10 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Invalid time spec. Use: 30m, 2h, or HH:MM")
             return
 
-        reminder_id = str(uuid.uuid4())
-        job_name = f"once_{update.effective_chat.id}_{reminder_id}"
         chat_id = update.effective_chat.id
-        db_log_reminder(chat_id, reminder_id, message, None, "once", spec)
-
-        async def _once_job(ctx: ContextTypes.DEFAULT_TYPE, _cid=chat_id, _msg=message):
-            try:
-                await ctx.bot.send_message(chat_id=_cid, text=f"⏰ Reminder: {_msg}")
-            except Exception as e:
-                logger.error("One-time reminder failed: %s", e)
-
-        context.application.job_queue.run_once(_once_job, when=delay, name=job_name)
+        _persist_one_shot_reminder(
+            context.application, chat_id, user, message, None, delay, spec,
+        )
         mins = int(delay // 60)
         await update.message.reply_text(
             f"⏰ One-time reminder set in {mins} min: {message}"
@@ -4218,6 +4264,7 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.setdefault("reminders", []).append(reminder)
         save_state(state)
         db_log_reminder(update.effective_chat.id, reminder["id"], message, None, "annual", time_str)
+        schedule_user_reminder(context.application, update.effective_chat.id, reminder)
         tz = user.get("timezone", "UTC")
         await update.message.reply_text(
             f"📅 Annual reminder set: every {date_str} at {time_str} ({tz}) — {message}"
@@ -4446,7 +4493,7 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "tasks": user["tasks"],
         "context": user["context"],
         "timezone": user["timezone"],
-        "reminders": [{"time": r["time"], "message": r["message"]} for r in user.get("reminders", [])],
+        "reminders": [dict(r) for r in user.get("reminders", [])],
         "trackers": user["trackers"],
         "habits": user.get("habits", {}),
         "journal": [{"ts": r["ts"], "entry": r["entry"]} for r in db_get_journal(str(update.effective_chat.id))],
@@ -5083,15 +5130,26 @@ def _sanitize_import(imported: dict) -> tuple[dict, list[str]]:
             reminders, bad = [], 0
             for r in raw:
                 if not isinstance(r, dict) or not isinstance(r.get("time"), str) \
-                        or not _HHMM_RE.match(r["time"]) or not isinstance(r.get("message"), str):
+                        or not isinstance(r.get("message"), str):
+                    bad += 1
+                    continue
+                once = bool(r.get("once", False))
+                if not once and not _HHMM_RE.match(r["time"]):
                     bad += 1
                     continue
                 rem = {
                     "id": r["id"] if isinstance(r.get("id"), str) and r.get("id") else str(uuid.uuid4()),
                     "time": r["time"],
                     "message": r["message"],
-                    "once": bool(r.get("once", False)),
+                    "once": once,
                 }
+                if rem["once"]:
+                    try:
+                        datetime.fromisoformat(r["fire_at"])
+                    except (KeyError, TypeError, ValueError):
+                        bad += 1
+                        continue
+                    rem["fire_at"] = r["fire_at"]
                 if isinstance(r.get("reason"), str):
                     rem["reason"] = r["reason"]
                 # An annual reminder needs a valid MM-DD or the deadline-alert
@@ -5165,11 +5223,16 @@ async def handle_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_add_note(cid, text, auto=False)
         counts["notes"] = len(clean["notes"])
     if "reminders" in clean:
+        for old in list(user.get("reminders", [])):
+            job_name = f"reminder_{chat_id}_{old.get('id', '')}"
+            for job in context.application.job_queue.get_jobs_by_name(job_name):
+                job.schedule_removal()
+            if old.get("id"):
+                db_mark_reminder_removed(chat_id, old["id"])
         user["reminders"] = clean["reminders"]
         counts["reminders"] = len(user["reminders"])
         for reminder in list(user["reminders"]):
-            if not reminder.get("annual"):
-                schedule_user_reminder(context.application, chat_id, reminder)
+            schedule_user_reminder(context.application, chat_id, reminder)
 
     save_state(state)
     summary = "  " + "\n  ".join(f"{k}: {v}" for k, v in counts.items())
@@ -5338,7 +5401,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # before the switch to a uuid4 hex (which contains no underscores).
         minutes = int(parts[-1])
         token = "_".join(parts[1:-1])
-        snoozed = db_take_snooze(token) or _snooze_cache.pop(token, None)
+        snoozed = db_take_snooze(token, chat_id)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -5381,11 +5444,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if is_rate_limited(chat_id):
-        await update.message.reply_text(
-            "You've reached the hourly limit (30 messages). Please wait a bit before sending more."
-        )
-        return
     reply = await chat(chat_id, update.message.text)
     await update.message.reply_text(reply)
     await _check_milestones(chat_id, context.application)
