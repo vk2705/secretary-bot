@@ -1074,6 +1074,36 @@ class TestNewExecuteTools:
         result = run(bot._execute_tool(20, "remove_task", {"task_number": 1}))
         assert "error" in result
 
+    def test_remove_all_tasks(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["tasks"] = ["Task A", "Task B", "Task C"]
+        result = run(bot._execute_tool(20, "remove_task", {"all": True}))
+        assert result == {
+            "success": True,
+            "removed_count": 3,
+            "removed": ["Task A", "Task B", "Task C"],
+        }
+        assert bot.state["users"]["20"]["tasks"] == []
+
+    def test_add_and_get_conditional_task(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "add_task", {
+            "text": "Go to the park",
+            "due_date": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }))
+        assert result["success"] is True
+        assert bot.state["users"]["20"]["tasks"] == [{
+            "text": "Go to the park",
+            "due": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }]
+        tasks = run(bot._execute_tool(20, "get_tasks", {}))
+        assert tasks["tasks"][0]["condition"] == "I wake up early tomorrow"
+        assert bot._format_task_line(
+            bot.state["users"]["20"]["tasks"][0], 1,
+        ).startswith("1. Go to the park [if: I wake up early tomorrow]")
+
     # ── get_trackers ─────────────────────────────────────────────────────────
 
     def test_get_trackers_empty(self):
@@ -1196,6 +1226,17 @@ class TestNewExecuteTools:
         bot.state["users"]["20"] = fresh_user()
         result = run(bot._execute_tool(20, "remove_habit", {"name": "nonexistent"}))
         assert "error" in result
+
+    def test_remove_all_habits(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["habits"] = {
+            "meditation": {"completions": []},
+            "running": {"completions": []},
+        }
+        result = run(bot._execute_tool(20, "remove_habit", {"all": True}))
+        assert result["success"] is True
+        assert result["removed_count"] == 2
+        assert bot.state["users"]["20"]["habits"] == {}
 
     # ── get_notes / add_note ─────────────────────────────────────────────────
 
@@ -2333,6 +2374,80 @@ class TestDebugFire:
         result = run(bot._run_idle_nudge(context, cid))
         assert result is None
         context.bot.send_message.assert_awaited_once()
+
+    def test_reengagement_fires_after_fourteen_days_without_scheduled_contact(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        cid = 9044
+        old_day = (date.today() - timedelta(days=14)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(
+            activity_days=[old_day], timezone="UTC",
+        )
+        context = _debug_context([])
+        daytime = datetime.now(ZoneInfo("UTC")).replace(hour=12)
+        with (
+            patch.object(bot, "_now", return_value=daytime),
+            patch.object(bot, "chat", AsyncMock(return_value="What would you like to achieve?")) as mock_chat,
+        ):
+            result = run(bot._run_reengagement(context, cid))
+        assert result is None
+        mock_chat.assert_awaited_once()
+        assert mock_chat.await_args.kwargs == {
+            "touch_activity": False,
+            "store_history": False,
+        }
+        context.bot.send_message.assert_awaited_once_with(
+            chat_id=cid, text="What would you like to achieve?",
+        )
+
+    @pytest.mark.parametrize("scheduled", ["checkins", "reminder"])
+    def test_reengagement_skips_users_with_scheduled_contact(self, scheduled):
+        cid = 9045
+        old_day = (date.today() - timedelta(days=30)).isoformat()
+        user = fresh_user(activity_days=[old_day])
+        if scheduled == "checkins":
+            user["checkin_enabled"] = True
+        else:
+            user["reminders"] = [{"id": "r1", "time": "12:00", "message": "Call"}]
+        bot.state["users"][str(cid)] = user
+        context = _debug_context([])
+        result = run(bot._run_reengagement(context, cid))
+        assert result == "scheduled contact exists"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_reengagement_does_not_repeat_within_fourteen_days(self):
+        from datetime import datetime
+
+        cid = 9046
+        old_day = (date.today() - timedelta(days=30)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(activity_days=[old_day])
+        context = _debug_context([])
+        with patch.object(bot, "db_last_job_fired", return_value=datetime.utcnow().isoformat()):
+            result = run(bot._run_reengagement(context, cid))
+        assert result == "recent reengagement"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_any_inbound_message_resets_reengagement_inactivity(self):
+        cid = 9047
+        bot.state["users"][str(cid)] = fresh_user(
+            activity_days=[(date.today() - timedelta(days=30)).isoformat()],
+        )
+        update = _debug_update(cid)
+        run(bot.track_user_activity(update, _debug_context([])))
+        assert date.today().isoformat() in bot.state["users"][str(cid)]["activity_days"]
+
+    def test_restore_registers_one_global_reengagement_scan(self):
+        bot.state = {"users": {}}
+        app = MagicMock()
+        app.job_queue.get_jobs_by_name.return_value = []
+        bot.restore_all_jobs(app)
+        app.job_queue.run_repeating.assert_called_once_with(
+            bot._run_reengagement_scan,
+            interval=3600,
+            first=60,
+            name="reengagement_scan",
+        )
 
     def test_debug_fire_weekly_digest_not_sunday_reason(self):
         cid = 9050
@@ -4318,6 +4433,19 @@ class TestSanitizeImport:
                 user[key] = clean[key]
         assert isinstance(bot.build_system_prompt(user, uid), str)
 
+    def test_conditional_task_survives_import_sanitization(self):
+        clean, skipped = bot._sanitize_import({"tasks": [{
+            "text": "Go to the park",
+            "due": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }]})
+        assert skipped == []
+        assert clean["tasks"] == [{
+            "text": "Go to the park",
+            "due": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }]
+
 
 class TestReviewRemediations:
     def setup_method(self):
@@ -4397,6 +4525,42 @@ class TestEmptyModelReplyNeverSent:
         assert reply.strip(), "reply must never be empty — Telegram rejects empty messages"
         stored = bot.state["users"][str(uid)]["history"][-1]
         assert stored["role"] == "assistant" and stored["content"].strip()
+
+
+class TestCreditExhaustionFallback:
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = None
+
+    def test_user_key_quota_exhaustion_retries_with_free_default(self):
+        uid = 7604
+        bot.state["users"][str(uid)] = fresh_user()
+        bot.state["users"][str(uid)]["llm"]["api_key"] = "sk_user"
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=Exception("insufficient_quota: credits exhausted")
+        )
+        fallback_message = MagicMock(tool_calls=None, content="Fallback reply")
+        fallback_response = MagicMock()
+        fallback_response.choices = [MagicMock(message=fallback_message)]
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create = AsyncMock(return_value=fallback_response)
+
+        with (
+            patch.object(bot, "GROQ_API_KEY", "gsk_bot"),
+            patch.object(bot, "get_llm_client", return_value=primary_client),
+            patch.object(bot, "get_model", return_value="gpt-user"),
+            patch.object(bot, "AsyncOpenAI", return_value=fallback_client) as mock_openai,
+            patch.object(bot, "is_rate_limited", return_value=False),
+        ):
+            reply = run(bot.chat(uid, "hello"))
+
+        assert reply == "Fallback reply"
+        mock_openai.assert_called_once_with(
+            api_key="gsk_bot", base_url=bot.GROQ_BASE_URL,
+        )
+        assert fallback_client.chat.completions.create.await_args.kwargs["model"] == bot.GROQ_DEFAULT_MODEL
 
 
 class TestSnoozeTokenPersistence:

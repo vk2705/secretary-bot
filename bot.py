@@ -70,11 +70,12 @@ def _get_fernet() -> Fernet:
 # Rate limiting: max AI calls per hour per user (backed by SQLite)
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
+REENGAGEMENT_DAYS = 14
 # Per-tracker retention cap, enforced on write (log_tracker) and on /import.
 TRACKER_LOG_CAP = 5000
-# /debug prompt sends the prompt inline up to this length, as a document above it
-# (Telegram's own message cap is 4096; this leaves room for delivery overhead).
-DEBUG_PROMPT_INLINE_MAX = 4000
+# /debug prompt sends the prompt verbatim with no wrapper, so the full Telegram
+# message limit is available before it must switch to document delivery.
+DEBUG_PROMPT_INLINE_MAX = 4096
 # Legacy in-memory snooze store. Superseded by the snooze_tokens SQLite table
 # (which survives restarts); kept only so a button delivered before that switch
 # still resolves. Nothing writes to it any more.
@@ -986,7 +987,8 @@ TOOLS = [
             "description": (
                 "Add a new task. Refused if it looks like a near-duplicate of an existing task "
                 "— edit that one instead, or retry with confirm_duplicate=true if the user "
-                "really wants both."
+                "really wants both. For an if/then plan, put the action in text and the "
+                "triggering if-clause in condition."
             ),
             "parameters": {
                 "type": "object",
@@ -995,6 +997,13 @@ TOOLS = [
                     "due_date": {
                         "type": "string",
                         "description": "Optional due date in YYYY-MM-DD format.",
+                    },
+                    "condition": {
+                        "type": "string",
+                        "description": (
+                            "Optional condition that must be true before doing the task, without "
+                            "the word 'if' (e.g. 'I wake up early tomorrow')."
+                        ),
                     },
                     "confirm_duplicate": {
                         "type": "boolean",
@@ -1192,13 +1201,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "remove_task",
-            "description": "Permanently delete a task from the list without archiving it.",
+            "description": (
+                "Permanently delete tasks without archiving them. For 'remove/cancel all tasks', "
+                "call once with all=true; otherwise pass one task_number."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_number": {"type": "integer", "description": "1-based task number."},
+                    "all": {"type": "boolean", "description": "Delete every task."},
                 },
-                "required": ["task_number"],
+                "required": [],
             },
         },
     },
@@ -1250,13 +1263,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "remove_habit",
-            "description": "Delete a habit permanently.",
+            "description": (
+                "Delete habits permanently. For 'remove/cancel all habits', call once with "
+                "all=true; otherwise pass one habit name."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Habit name to delete."},
+                    "all": {"type": "boolean", "description": "Delete every habit."},
                 },
-                "required": ["name"],
+                "required": [],
             },
         },
     },
@@ -1465,7 +1482,12 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         return {
             "count": len(tasks),
             "tasks": [
-                {"number": i + 1, "text": _task_text(t), "due": _task_due(t)}
+                {
+                    "number": i + 1,
+                    "text": _task_text(t),
+                    "due": _task_due(t),
+                    "condition": _task_condition(t),
+                }
                 for i, t in enumerate(tasks)
             ],
         }
@@ -1483,7 +1505,14 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 due = raw_due
             except ValueError:
                 due_error = f"due_date '{raw_due}' is invalid (use YYYY-MM-DD); task added without due date."
-        task = {"text": text, "due": due} if due else text
+        condition = (args.get("condition") or "").strip()
+        task = {"text": text}
+        if due:
+            task["due"] = due
+        if condition:
+            task["condition"] = condition
+        if len(task) == 1:
+            task = text
         similar = _find_similar(text, [_task_text(t) for t in user.get("tasks", [])])
         # Refuse rather than create-then-complain — see add_reminder's note: a
         # clarification can arrive as several calls in one turn, by which point
@@ -1501,7 +1530,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             }
         user["tasks"].append(task)
         save_state(state)
-        result = {"success": True, "task": text, "due": due}
+        result = {"success": True, "task": text, "due": due, "condition": condition or None}
         if due_error:
             result["warning"] = due_error
         return result
@@ -1763,8 +1792,13 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         }
 
     if name == "remove_task":
-        n = int(args.get("task_number", 0))
         tasks = user.get("tasks", [])
+        if args.get("all") is True:
+            removed = [_task_text(task) for task in tasks]
+            tasks.clear()
+            save_state(state)
+            return {"success": True, "removed_count": len(removed), "removed": removed}
+        n = int(args.get("task_number", 0))
         if n < 1 or n > len(tasks):
             return {"error": f"Task {n} not found. There are {len(tasks)} tasks."}
         removed = _task_text(tasks.pop(n - 1))
@@ -1828,8 +1862,13 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         return {"success": True, "name": hname, "streak": _habit_streak(completions, user=user)}
 
     if name == "remove_habit":
-        hname = (args.get("name") or "").lower().strip()
         habits = user.get("habits", {})
+        if args.get("all") is True:
+            removed = list(habits)
+            habits.clear()
+            save_state(state)
+            return {"success": True, "removed_count": len(removed), "removed": removed}
+        hname = (args.get("name") or "").lower().strip()
         if hname not in habits:
             return {"error": f"Habit '{hname}' not found.", "available": list(habits.keys())}
         del habits[hname]
@@ -2101,6 +2140,10 @@ def _task_due(task) -> str | None:
     return task.get("due") if isinstance(task, dict) else None
 
 
+def _task_condition(task) -> str | None:
+    return task.get("condition") if isinstance(task, dict) else None
+
+
 def _task_index(tasks: list, raw_number: str) -> int:
     """Convert a user-facing 1-based task number to a validated index."""
     number = int(raw_number)
@@ -2116,8 +2159,10 @@ def _task_tags(task) -> list:
 def _format_task_line(task, idx: int, user=None) -> str:
     text = _task_text(task)
     due = _task_due(task)
+    condition = _task_condition(task)
+    condition_badge = f" [if: {condition}]" if condition else ""
     if not due:
-        return f"{idx}. {text}"
+        return f"{idx}. {text}{condition_badge}"
     try:
         due_date = date.fromisoformat(due)
         days_left = (due_date - _today(user=user)).days
@@ -2131,7 +2176,7 @@ def _format_task_line(task, idx: int, user=None) -> str:
             badge = f" (due {due})"
     except ValueError:
         badge = f" (due {due})"
-    return f"{idx}. {text}{badge}"
+    return f"{idx}. {text}{condition_badge}{badge}"
 
 
 def _tasks_for_prompt(tasks: list) -> str:
@@ -2141,7 +2186,13 @@ def _tasks_for_prompt(tasks: list) -> str:
     for t in tasks:
         text = _task_text(t)
         due = _task_due(t)
-        parts.append(f"{text} [due {due}]" if due else text)
+        condition = _task_condition(t)
+        details = []
+        if condition:
+            details.append(f"if: {condition}")
+        if due:
+            details.append(f"due {due}")
+        parts.append(f"{text} [{'; '.join(details)}]" if details else text)
     return ", ".join(parts)
 
 
@@ -2168,6 +2219,19 @@ def get_model(user: dict, chat_id: int = 0) -> str:
     if GROQ_API_KEY:
         return user_model or GROQ_DEFAULT_MODEL
     return user_model or DEFAULT_MODEL
+
+
+def _is_credit_exhaustion(error: Exception) -> bool:
+    """Return whether a provider rejected a request for exhausted credits."""
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "insufficient_quota",
+        "exceeded your current quota",
+        "quota exceeded",
+        "credit balance",
+        "credits exhausted",
+        "billing quota",
+    ))
 
 
 def build_system_prompt(user: dict, chat_id: int = 0) -> str:
@@ -2329,6 +2393,9 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "8. Use your tools proactively. When a user says they want to do something, "
         "need a reminder, or mentions a goal, call the relevant tool immediately "
         "(add_task, add_reminder, log_tracker, create_tracker, etc.) without asking for confirmation first.\n"
+        "Never claim that tasks, habits, reminders, or other stored data changed unless the "
+        "corresponding tool returned success. Use all=true when the user asks to remove every "
+        "task or every habit.\n"
         "9. If a user asks to track something new (steps, sleep, mood, etc.) and it doesn't exist yet, "
         "call create_tracker first, then log_tracker to log the initial value if provided.\n"
         "10. When asked what you can do or how to use you, explain concisely: tasks, trackers, "
@@ -2411,7 +2478,13 @@ def _tools_for_round(called: set[str]) -> list:
 
 # ─────────────────────── chat ───────────────────────
 
-async def chat(chat_id: int, user_message: str, system: str = None, touch_activity: bool = True) -> str:
+async def chat(
+    chat_id: int,
+    user_message: str,
+    system: str = None,
+    touch_activity: bool = True,
+    store_history: bool = True,
+) -> str:
     user = get_user(chat_id)
     if touch_activity:
         # Only genuine user-initiated turns count toward the activity streak and
@@ -2423,6 +2496,26 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
     system = system or build_system_prompt(user, chat_id)
     client = get_llm_client(user, chat_id)
     model = get_model(user, chat_id)
+    user_key = db_get_key(chat_id) or user["llm"].get("api_key")
+    can_use_free_fallback = bool(
+        user_key and GROQ_API_KEY and user_key != GROQ_API_KEY
+    )
+    used_free_fallback = False
+
+    async def create_completion(**kwargs):
+        nonlocal client, model, used_free_fallback
+        try:
+            return await client.chat.completions.create(model=model, **kwargs)
+        except Exception as error:
+            if not can_use_free_fallback or used_free_fallback or not _is_credit_exhaustion(error):
+                raise
+            logger.warning(
+                "User LLM credits exhausted for %s; retrying with free default", chat_id,
+            )
+            client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+            model = GROQ_DEFAULT_MODEL
+            used_free_fallback = True
+            return await client.chat.completions.create(model=model, **kwargs)
 
     # Build the full message list (history + new user message)
     messages = (
@@ -2443,8 +2536,7 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
             try:
                 if is_rate_limited(chat_id):
                     return "⚠️ AI call limit reached. Try again later."
-                response = await client.chat.completions.create(
-                    model=model,
+                response = await create_completion(
                     messages=messages,
                     max_tokens=600,
                     temperature=0.7,
@@ -2457,8 +2549,7 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
                 if any(w in err_str for w in ("tool", "function", "unsupported")):
                     if is_rate_limited(chat_id):
                         return "⚠️ AI call limit reached. Try again later."
-                    response = await client.chat.completions.create(
-                        model=model,
+                    response = await create_completion(
                         messages=messages,
                         max_tokens=600,
                         temperature=0.7,
@@ -2511,12 +2602,13 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
         logger.warning("Empty model reply for %s; substituting fallback text", chat_id)
         reply = "⚠️ I didn't manage to put that into words. Could you say it again?"
 
-    # Store only the user turn and final text reply in history
-    user["history"].append({"role": "user", "content": user_message})
-    user["history"].append({"role": "assistant", "content": reply})
-    if len(user["history"]) > MAX_HISTORY:
-        user["history"] = user["history"][-MAX_HISTORY:]
-    save_state(state)
+    if store_history:
+        # Store only the user turn and final text reply in history.
+        user["history"].append({"role": "user", "content": user_message})
+        user["history"].append({"role": "assistant", "content": reply})
+        if len(user["history"]) > MAX_HISTORY:
+            user["history"] = user["history"][-MAX_HISTORY:]
+        save_state(state)
     return reply
 
 
@@ -2923,6 +3015,65 @@ async def _run_idle_nudge(
     return None
 
 
+async def _run_reengagement(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> str | None:
+    """Invite a dormant, unscheduled user to choose a fresh goal."""
+    user = get_user(chat_id)
+    if user.get("checkin_enabled") or user.get("reminders"):
+        return "scheduled contact exists"
+    if _is_quiet_now(user) or _is_muted(user):
+        return "quiet hours or muted"
+
+    activity_days = sorted(user.get("activity_days", []))
+    if not activity_days:
+        return "no activity history"
+    try:
+        timezone = ZoneInfo(user.get("timezone", "UTC"))
+    except (ZoneInfoNotFoundError, KeyError):
+        timezone = ZoneInfo("UTC")
+    local_now = _now(timezone)
+    try:
+        inactive_days = (local_now.date() - date.fromisoformat(activity_days[-1])).days
+    except ValueError:
+        return "invalid activity history"
+    if inactive_days < REENGAGEMENT_DAYS:
+        return "recent activity"
+
+    last_sent = db_last_job_fired(str(chat_id), "reengagement")
+    if last_sent:
+        try:
+            if (datetime.utcnow() - datetime.fromisoformat(last_sent)).days < REENGAGEMENT_DAYS:
+                return "recent reengagement"
+        except ValueError:
+            pass
+
+    if not 10 <= local_now.hour < 20:
+        return "outside daytime"
+
+    prompt = (
+        "Reconnect with the user after a quiet period. In the language they normally use, "
+        "write one warm, natural message with no guilt, productivity lecture, or generic "
+        "encouragement. Ask what they would most like to achieve now and how you could help "
+        "them make it happen. Keep it to at most two short sentences and one question."
+    )
+    reply = await chat(
+        chat_id, prompt, touch_activity=False, store_history=False,
+    )
+    await context.bot.send_message(chat_id=chat_id, text=reply)
+    db_log_job(str(chat_id), "reengagement")
+    return None
+
+
+async def _run_reengagement_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check all known users; individual eligibility prevents unwanted sends."""
+    for chat_id in list(state.get("users", {})):
+        try:
+            await _run_reengagement(context, int(chat_id))
+        except Exception as error:
+            logger.error("Re-engagement failed for %s: %s", chat_id, error)
+
+
 async def _run_weekly_digest(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
 ) -> str | None:
@@ -3094,6 +3245,15 @@ def restore_all_jobs(app: Application) -> None:
                         save_state(state)
                         db_log_job(str(_cid), f"checkin_{_label}")
                     app.job_queue.run_once(_catchup, when=10)
+
+    for job in app.job_queue.get_jobs_by_name("reengagement_scan"):
+        job.schedule_removal()
+    app.job_queue.run_repeating(
+        _run_reengagement_scan,
+        interval=3600,
+        first=60,
+        name="reengagement_scan",
+    )
 
 # ─────────────────────── tracker helpers ───────────────────────
 
@@ -5000,7 +5160,7 @@ def _sanitize_import(imported: dict) -> tuple[dict, list[str]]:
     if not isinstance(imported, dict):
         return clean, ["file is not a JSON object"]
 
-    # tasks: list of plain strings or {"text": str, "due": ISO date, "recur": ...}
+    # tasks: list of plain strings or task dictionaries with validated optional fields
     if "tasks" in imported:
         raw = imported["tasks"]
         if isinstance(raw, list):
@@ -5020,6 +5180,9 @@ def _sanitize_import(imported: dict) -> tuple[dict, list[str]]:
                             continue
                     if t.get("recur") in ("daily", "weekly", "monthly"):
                         task["recur"] = t["recur"]
+                    condition = t.get("condition")
+                    if isinstance(condition, str) and condition.strip():
+                        task["condition"] = condition.strip()
                     tasks.append(task)
                 else:
                     bad += 1
@@ -5392,6 +5555,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.from_user.id
+    user = get_user(chat_id)
+    _touch_activity(user)
+    save_state(state)
 
     # ── snooze button from reminder ──
     if query.data.startswith("snooze_"):
@@ -5449,6 +5615,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _check_milestones(chat_id, context.application)
 
 
+async def track_user_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record every inbound Telegram message, including command-only use."""
+    if update.effective_chat is None:
+        return
+    user = get_user(update.effective_chat.id)
+    _touch_activity(user)
+    save_state(state)
+
+
 # ─────────────────────── main ───────────────────────
 
 async def _post_init(app) -> None:
@@ -5485,6 +5660,7 @@ async def _post_init(app) -> None:
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
 
+    app.add_handler(MessageHandler(filters.ALL, track_user_activity), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("tasks", show_tasks))
