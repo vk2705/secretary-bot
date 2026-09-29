@@ -2234,6 +2234,7 @@ class TestDebugFire:
         pytest.param("_run_idle_nudge", {}, id="idle_nudge"),
         pytest.param("_run_weekly_digest", {}, id="weekly_digest"),
         pytest.param("_run_deadline_alert", {}, id="deadline_alert"),
+        pytest.param("_run_procrastination_nudge", {}, id="procrastination_nudge"),
     ])
     @pytest.mark.parametrize("guard_attr,expected_reason", [
         pytest.param("_is_quiet_now", "quiet hours", id="quiet_hours"),
@@ -2333,6 +2334,94 @@ class TestDebugFire:
         result = run(bot._run_idle_nudge(context, cid))
         assert result is None
         context.bot.send_message.assert_awaited_once()
+
+    def test_debug_fire_procrastination_nudge_no_tasks(self):
+        cid = 9044
+        bot.state["users"][str(cid)] = fresh_user()
+        context = _debug_context([])
+        result = run(bot._run_procrastination_nudge(context, cid))
+        assert result == "no tasks"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_debug_fire_procrastination_nudge_increments_without_firing(self):
+        """Below STALE_TASK_THRESHOLD_DAYS, the streak still advances but no
+        conversation is started."""
+        cid = 9045
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=[{"text": "Learn Japanese", "stale_streak": 1}]
+        )
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="x")) as mock_chat:
+            result = run(bot._run_procrastination_nudge(context, cid))
+        assert result == "nothing stuck"
+        mock_chat.assert_not_called()
+        context.bot.send_message.assert_not_awaited()
+        assert bot.state["users"][str(cid)]["tasks"][0]["stale_streak"] == 2
+
+    def test_debug_fire_procrastination_nudge_fires_at_threshold(self):
+        cid = 9046
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=[{"text": "Learn Japanese", "stale_streak": 2}]
+        )
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="What's the smallest step?")) as mock_chat:
+            result = run(bot._run_procrastination_nudge(context, cid))
+        assert result is None
+        mock_chat.assert_awaited_once()
+        args, kwargs = mock_chat.call_args
+        assert "Learn Japanese" in args[1]
+        assert kwargs.get("touch_activity") is False
+        context.bot.send_message.assert_awaited_once()
+        assert bot.state["users"][str(cid)]["tasks"][0]["stale_streak"] == 3
+
+    def test_debug_fire_procrastination_nudge_does_not_refire_between_multiples(self):
+        cid = 9047
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=[{"text": "Learn Japanese", "stale_streak": 3}]
+        )
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="x")) as mock_chat:
+            result = run(bot._run_procrastination_nudge(context, cid))
+        assert result == "nothing stuck"
+        mock_chat.assert_not_called()
+
+    def test_debug_fire_procrastination_nudge_refires_at_next_multiple(self):
+        cid = 9048
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=[{"text": "Learn Japanese", "stale_streak": 5}]
+        )
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="x")) as mock_chat:
+            result = run(bot._run_procrastination_nudge(context, cid))
+        assert result is None
+        mock_chat.assert_awaited_once()
+
+    def test_debug_fire_procrastination_nudge_converts_string_task_to_dict(self):
+        cid = 9049
+        bot.state["users"][str(cid)] = fresh_user(tasks=["Do a thing"])
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="x")):
+            result = run(bot._run_procrastination_nudge(context, cid))
+        assert result == "nothing stuck"
+        task = bot.state["users"][str(cid)]["tasks"][0]
+        assert isinstance(task, dict)
+        assert task["text"] == "Do a thing"
+        assert task["stale_streak"] == 1
+
+    def test_debug_fire_procrastination_nudge_picks_worst_task(self):
+        cid = 9052
+        bot.state["users"][str(cid)] = fresh_user(
+            tasks=[
+                {"text": "Minor task", "stale_streak": 0},
+                {"text": "Feared task", "stale_streak": 2},
+            ]
+        )
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="x")) as mock_chat:
+            run(bot._run_procrastination_nudge(context, cid))
+        args, _ = mock_chat.call_args
+        assert "Feared task" in args[1]
+        assert "Minor task" not in args[1]
 
     def test_debug_fire_weekly_digest_not_sunday_reason(self):
         cid = 9050
@@ -2583,25 +2672,26 @@ class TestDebugFire:
 
     # ── 01-03 Task 2: DEBUG_JOBS registry + full /debug fire dispatch ──────
 
-    def test_debug_jobs_registry_has_exactly_six_fixed_names(self):
+    def test_debug_jobs_registry_has_exactly_seven_fixed_names(self):
         """A rename of any registry key must fail this test loudly rather
         than pass silently."""
         assert set(bot.DEBUG_JOBS.keys()) == {
             "checkin_morning", "checkin_evening", "deadline_alert",
             "habit_reminder", "idle_nudge", "weekly_digest",
+            "procrastination_nudge",
         }
 
     @pytest.mark.parametrize("job_name", [
         "checkin_morning", "checkin_evening", "deadline_alert",
-        "habit_reminder", "idle_nudge", "weekly_digest",
+        "habit_reminder", "idle_nudge", "weekly_digest", "procrastination_nudge",
     ])
     def test_debug_fire_each_registry_job_dispatches_and_confirms(self, job_name):
-        """Each of the six fixed job names dispatches through debug_cmd to
+        """Each of the seven fixed job names dispatches through debug_cmd to
         its runner and the owner receives a confirmation when it fires."""
         cid = 9100
         bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
         bot.state["users"][str(cid)]["tasks"] = [
-            {"text": "Ship it", "due": date.today().isoformat()}
+            {"text": "Ship it", "due": date.today().isoformat(), "stale_streak": 2}
         ]
         bot.state["users"][str(cid)]["habits"] = {
             "meditation": {"completions": [], "created": date.today().isoformat()}

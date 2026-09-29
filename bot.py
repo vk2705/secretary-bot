@@ -42,6 +42,11 @@ STATE_FILE = os.environ.get("BOT_STATE_FILE", "state.json")
 DB_FILE = os.environ.get("BOT_DB_FILE", "bot_memory.db")
 MAX_HISTORY = 20
 
+# A task nudges the user about procrastination once its stale_streak (days in
+# a row left untouched) first reaches this, then again every further multiple
+# of it — see `_run_procrastination_nudge`.
+STALE_TASK_THRESHOLD_DAYS = 3
+
 # Encryption master key — generate once with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Then add MASTER_KEY=<value> to your env file.
 MASTER_KEY = os.environ.get("MASTER_KEY", "")
@@ -2101,6 +2106,10 @@ def _task_due(task) -> str | None:
     return task.get("due") if isinstance(task, dict) else None
 
 
+def _task_stale_streak(task) -> int:
+    return task.get("stale_streak", 0) if isinstance(task, dict) else 0
+
+
 def _task_index(tasks: list, raw_number: str) -> int:
     """Convert a user-facing 1-based task number to a validated index."""
     number = int(raw_number)
@@ -2800,9 +2809,9 @@ async def _run_deadline_alert(
     annual reminder matched today ("nothing due"), or when something was due
     but every send attempt raised ("send failed" -- WR-01); None once it sent
     at least one message — the same suppression-reason contract as the other
-    five runners (_run_checkin, _run_habit_reminder, _run_idle_nudge,
-    _run_weekly_digest, _run_reminder). See `_run_checkin`'s docstring for
-    what `simulate` controls (CR-01)."""
+    six runners (_run_checkin, _run_habit_reminder, _run_idle_nudge,
+    _run_weekly_digest, _run_reminder, _run_procrastination_nudge). See
+    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
     u = get_user(chat_id)
     if _is_quiet_now(u, simulate=simulate):
         return "quiet hours"
@@ -2985,6 +2994,70 @@ async def _run_weekly_digest(
     return None
 
 
+async def _run_procrastination_nudge(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
+) -> str | None:
+    """At 09:30, bump every open task's stale_streak by one day, then — if the
+    most stuck task's streak has just reached a multiple of
+    STALE_TASK_THRESHOLD_DAYS — start an LLM-driven conversation asking for
+    the smallest possible next step and gently exploring what's making it
+    hard to start. Shared by the scheduled job (via schedule_user_alerts's
+    thin wrapper) and `/debug fire procrastination_nudge` so the two paths
+    can never diverge. The streak resets only via `complete_task` (a
+    non-recurring task disappears entirely; a recurring one is replaced by a
+    fresh dict) — never on a due-date change or reordering, since pushing a
+    deadline out or shuffling the list is often part of the avoidance
+    pattern, not evidence against it. Returns a short reason string when
+    quiet hours or mute suppress the nudge, when there are no open tasks,
+    when nothing has crossed the threshold this cycle, or when the send
+    itself raised ("send failed" -- WR-01); None once it sent one. See
+    `_run_checkin`'s docstring for what `simulate` controls (CR-01)."""
+    u = get_user(chat_id)
+    if _is_quiet_now(u, simulate=simulate):
+        return "quiet hours"
+    if _is_muted(u, simulate=simulate):
+        return "muted"
+    tasks = u.get("tasks", [])
+    if not tasks:
+        return "no tasks"
+
+    streaks = []
+    for i, task in enumerate(tasks):
+        streak = _task_stale_streak(task) + 1
+        if isinstance(task, dict):
+            task["stale_streak"] = streak
+        else:
+            tasks[i] = {"text": task, "stale_streak": streak}
+        streaks.append(streak)
+    save_state(state)
+
+    worst = max(streaks)
+    if worst < STALE_TASK_THRESHOLD_DAYS or worst % STALE_TASK_THRESHOLD_DAYS != 0:
+        return "nothing stuck"
+    stuck_task = _task_text(tasks[streaks.index(worst)])
+
+    try:
+        prompt = (
+            f"The task '{stuck_task}' has sat untouched for {worst} days in a row — "
+            "the user keeps not making progress on it. Treat this as a sign the task "
+            "matters and is triggering avoidance, not laziness. Bring it up warmly, "
+            "without lecturing or guilt-tripping. Ask what the smallest possible next "
+            "physical action would be — something tiny enough to take under two "
+            "minutes (e.g. 'open the textbook to page one', not 'study Japanese'). If "
+            "it feels natural, also curiously explore what's making it hard to start — "
+            "is there a fear underneath it? If the user reveals something meaningful "
+            "about why they're avoiding it, save it with save_memory (profile if it's "
+            "a lasting pattern, episodic if it's more situational) so you can "
+            "recognize it next time this task or one like it comes up."
+        )
+        reply = await chat(chat_id, prompt, touch_activity=False)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+    except Exception as e:
+        logger.error("Procrastination nudge failed for %s: %s", chat_id, e)
+        return "send failed"
+    return None
+
+
 def schedule_user_alerts(app: Application, chat_id: int) -> None:
     """Schedule daily deadline alert (09:00) and habit reminder (20:00) jobs."""
     user = get_user(chat_id)
@@ -2994,6 +3067,7 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     for job_name in [
         f"deadline_alert_{chat_id}", f"habit_reminder_{chat_id}",
         f"idle_nudge_{chat_id}", f"weekly_digest_{chat_id}",
+        f"procrastination_nudge_{chat_id}",
     ]:
         for job in app.job_queue.get_jobs_by_name(job_name):
             job.schedule_removal()
@@ -3039,6 +3113,16 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
         _weekly_digest_wrapper,
         time=_parse_local_time("10:00", tz_str),
         name=f"weekly_digest_{chat_id}",
+    )
+
+    # ── procrastination check at 09:30 — surfaces the most stuck task ──
+    async def _procrastination_nudge_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
+        await _run_procrastination_nudge(context, _cid, simulate=False)
+
+    app.job_queue.run_daily(
+        _procrastination_nudge_wrapper,
+        time=_parse_local_time("09:30", tz_str),
+        name=f"procrastination_nudge_{chat_id}",
     )
 
 
@@ -4565,6 +4649,7 @@ DEBUG_JOBS = {
     "habit_reminder": _run_habit_reminder,
     "idle_nudge": _run_idle_nudge,
     "weekly_digest": _run_weekly_digest,
+    "procrastination_nudge": _run_procrastination_nudge,
 }
 
 
