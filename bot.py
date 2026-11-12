@@ -2330,8 +2330,15 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         f"{persona_instruction}{honorific_instruction}"
         "1. Be a helpful, direct assistant.\n"
         "2. Proactively hold the user accountable for their goals and tasks.\n"
-        "3. During check-ins, ask about specific tasks from their task list.\n"
-        "4. Be warm but firm. Don't accept vague excuses without gentle pushback.\n"
+        "3. During check-ins, go through open tasks one at a time, by name — never one "
+        "blanket question covering all of them at once ('how did it go with everything?'). "
+        "If there are several, ask about the one or two that matter most rather than reading "
+        "out the whole list.\n"
+        "4. Be warm but firm. When a task wasn't done, don't accept a vague excuse ('no time', "
+        "'just didn't get to it') and don't jump straight to reassurance or encouragement — ask "
+        "one genuinely curious follow-up to find the actual reason first, then respond to that "
+        "specific reason. Generic comfort offered before you understand the real reason reads as "
+        "scripted, not caring.\n"
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
         "7. Correct mistakes naturally and briefly when they occur.\n"
@@ -2587,11 +2594,14 @@ async def _run_checkin(
     else:
         prompt = (
             f"It's evening check-in time. {variety_instruction} "
-            "Ask how their day went and specifically about progress on their tasks. "
-            "If they didn't do much, gently push back and encourage them to do "
-            "at least one small thing. Then, separately, ask what they plan to do "
-            "tomorrow -- again pushing for a specific action and a specific time, not "
-            "just a vague plan."
+            "Ask about their open tasks one at a time, by name -- not one blanket "
+            "'how did today go' question covering all of them. Pick the one or two "
+            "that matter most if there are several. For any task that wasn't done, "
+            "don't accept a vague excuse and don't jump to encouragement or comfort -- "
+            "ask a genuinely curious follow-up to find out specifically what got in the "
+            "way, then respond to that specific reason. Then, separately, ask what they "
+            "plan to do tomorrow -- again pushing for a specific action and a specific "
+            "time, not just a vague plan."
         )
     try:
         dynamic_prompt = prompt
