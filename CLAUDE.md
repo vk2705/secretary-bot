@@ -191,6 +191,8 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
   "timezone": "UTC",
   "timezone_confirmed": false,
   "checkin_times": {"morning": "08:00", "evening": "21:00"},
+  "notifications": {"morning": true, "evening": true, "deadlines": true, "habits": true, "idle": true, "weekly": true, "procrastination": true},
+  "relationship": {"pressure": "balanced", "verbosity": "concise", "proactivity": "proactive", "tone": "serious"},
   "quiet_hours": {"start": null, "end": null},
   "reminders": [{"id": "uuid4", "time": "HH:MM", "message": "...", "once": false}],
   "trackers": {"weight": {"unit": "kg", "log": [{"ts": "ISO8601", "value": 85.5}]}},
@@ -209,7 +211,11 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 
 `pending_checkin` holds `"morning"`/`"evening"`/`null` — set to the check-in label whenever a proactive check-in fires, cleared whenever the user genuinely engages (any `chat()` call with `touch_activity=True`, the default). Used to (a) tell the model when a check-in went unanswered so it can acknowledge the silence instead of repeating the same prompt, and (b) keep `activity_days`/streak honest — see below.
 
-`get_user(chat_id)` forward-fills any missing keys using `_new_user()` defaults, so new fields are automatically backward-compatible.
+`notifications` switches individual proactive channels on/off *underneath* the `checkin_enabled` master switch: `schedule_user_checkins`/`schedule_user_alerts` skip a disabled channel's job, and `restore_all_jobs`' missed-check-in catch-up skips a disabled morning/evening too. Changed via `/notifications <type> on|off`. Enabling one channel while unsubscribed turns on the master switch **and only that channel** (the rest default to on, so flipping the master alone would enable all six). `/subscribe` resets every channel to on; the `set_checkins` tool, when enabling, turns morning/evening back on.
+
+`relationship` is the user's communication style, set via `/style <field> <value>` or the `set_relationship_style` tool. `build_system_prompt()` injects it as a "Style" line that explicitly overrides the numbered default rules #2 (accountability), #4 (pushback) and #5 (concise) where they conflict. `tone` shades the `persona` voice (default Jeeves) rather than replacing it.
+
+`get_user(chat_id)` forward-fills any missing keys using `_new_user()` defaults (including the nested `llm`, `notifications`, `relationship` dicts), so new fields are automatically backward-compatible. It does **not** rewrite `history`: internal prompts that older code stored as user turns are left to age out of the `MAX_HISTORY` window naturally, rather than being stripped on load (which would have wiped most users' entire recent history at once).
 
 **Timezone confirmation gate (PLAN.md #61):** `timezone_confirmed` distinguishes "the user explicitly told us their timezone" from "still sitting on the `UTC` default nobody chose." `_timezone_gate(user)` returns a tool-error dict (fed back to the LLM, which asks the user for their timezone and retries) whenever it's `False` and something is about to be scheduled at an absolute clock time — applied to the `add_reminder` tool's absolute-time branches and `set_checkins` when enabling, plus the equivalent direct checks in `/remind add|once|annual`, `/setcheckin`, and `/quiethours`. It deliberately does **not** gate relative delays (`add_reminder`'s `delay_minutes`, or `/remind once 30m`), which don't depend on timezone at all. `build_system_prompt()`'s `tz_section` states the confirmation status explicitly so the model asks proactively instead of only discovering it via a tool error.
 
@@ -218,7 +224,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 | Function | Purpose |
 |---|---|
 | `get_user(chat_id)` | Init or load user; forward-fills missing keys |
-| `chat(chat_id, msg, touch_activity=True)` | Tool-call loop (up to 5 rounds) → final text reply; stores exchange in history. `touch_activity=False` (used by proactive/automated sends — check-ins, weekly digest, missed-checkin catch-up, reminder fires) skips marking the day active and skips clearing `pending_checkin`, so a bot-initiated nudge is never counted as the user having responded |
+| `chat(chat_id, msg, touch_activity=True, store_history=True)` | Tool-call loop (up to 5 rounds) → final text reply; stores exchange in history unless `store_history=False` (used by every bot-initiated/internal prompt — check-ins, reminders, digest, catch-up, re-engagement, `/journal`, `/insights`, `/weekly`, `/suggest`, `/reflect`, `/checkin`, `/compress` — so internal prompts never pollute history). `touch_activity=False` (used by proactive/automated sends — check-ins, weekly digest, missed-checkin catch-up, reminder fires) skips marking the day active and skips clearing `pending_checkin`, so a bot-initiated nudge is never counted as the user having responded |
 | `build_system_prompt(user)` | Injects context, tracker readings, habits, task deadlines, profile/episodic memory |
 | `get_llm_client(user)` | Returns `AsyncOpenAI` with user or bot key; Groq auto-detected by `gsk_` prefix |
 | `get_model(user)` | User model → Groq default → OpenAI default |
@@ -226,6 +232,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 | `schedule_user_checkins(app, cid)` | Creates/removes per-user morning+evening daily jobs |
 | `schedule_user_alerts(app, cid)` | Deadline alert (09:00), habit reminder (20:00), idle nudge (11:00) |
 | `schedule_user_reminder(app, cid, reminder)` | Per-reminder daily/one-shot job |
+| `_remember_bot_message(user, text)` | Appends a bot-initiated message (check-in, reminder, catch-up, re-engagement, button follow-up question) to history as an assistant turn only — so a free-text reply reaches the model together with the question it answers, without the internal prompt |
 | `restore_all_jobs(app)` | Called on startup — recreates all jobs from state; catches up missed jobs via `job_log` |
 | `_check_milestones(chat_id, app)` | Sends congratulation messages for streak/task-count milestones |
 
@@ -246,6 +253,7 @@ If not set, a temporary key is printed to stderr and API keys are unreadable aft
 | `add_habit` / `complete_habit` / `remove_habit` / `get_habits` | Habit management |
 | `get_notes` / `add_note` / `remove_note` | Quick notes scratchpad (remove by 1-based number from `get_notes`) |
 | `set_today_focus` | Set daily intention |
+| `set_relationship_style` | Save pressure / verbosity / proactivity / tone (only changed fields) |
 | `search` | Cross-search tasks, notes, journal |
 | `get_streak` | Activity streak |
 
@@ -259,11 +267,14 @@ If the model doesn't support tools (custom model endpoint), `chat()` retries wit
 
 ### Scheduled jobs per subscribed user (all timezone-aware, quiet-hours-aware)
 
+Each row except user/annual reminders is also gated by its `notifications` channel (morning, evening, deadlines, habits, idle, weekly, procrastination).
+
 | Job | Time | Trigger |
 |---|---|---|
 | Morning check-in | `checkin_times.morning` local | `subscribe` / `settimezone` / `setcheckin` |
 | Evening check-in | `checkin_times.evening` local | same |
 | Deadline alert | 09:00 local | same |
+| Procrastination nudge | 09:30 local | same (only fires once a task's `stale_streak` hits a multiple of 3 days) |
 | Habit reminder | 20:00 local | same |
 | Idle nudge | 11:00 local | same (only fires if inactive 3+ days) |
 | Weekly digest | Sunday 10:00 local | same |
@@ -276,9 +287,12 @@ Jobs are **in-memory only** — `restore_all_jobs()` recreates them from state o
 
 `/addtracker weight kg` creates the `/weight` command. A `MessageHandler(filters.COMMAND, handle_custom_command)` is registered **last** after all named `CommandHandler`s — it catches anything else and routes to the matching user tracker. Subcommands: `<value>`, `stats`, `history [n]`, `chart [n]`.
 
-### Reminder snooze button
+### Reminder and check-in buttons
 
-Reminder messages (daily, one-time, and delay-based) include a single "🔁 Snooze 30 min" `InlineKeyboardButton`. Tapping it calls `handle_callback` (registered via `CallbackQueryHandler`), which re-fires the same reminder through `_run_reminder` after the delay. Check-in messages are plain text with no buttons — users respond in natural language.
+All taps go through `handle_callback` (registered via `CallbackQueryHandler`), which clears the buttons after a tap.
+
+- **Reminders** (daily, one-time, delay-based): "✅ Done" (`remdone_<token>`), "🔁 30 min" (`snooze_<token>_30` — re-fires the reminder through `_run_reminder` after the delay), "○ Skip today" (`remskip_<token>`). The token is a one-shot row in SQLite (`db_save_snooze`/`db_take_snooze`), so any of the three consumes it. Done/Skip only record a "Reminder outcome: …" user turn in history — no counter or log changes.
+- **Scheduled check-ins**: "✅ Done" / "➗ Partly" / "○ Not started" / "✎ Change plan" (`checkin_*`). A tap clears `pending_checkin`, records "Check-in outcome: …" in history, and sends one follow-up question. "Not started" instead offers Reschedule / Make smaller / Drop it (`plan_*`), each of which only asks a question — the actual change happens when the model acts on the user's typed answer. Every follow-up question is stored via `_remember_bot_message` so that answer has context. Users can still just reply in free text instead of tapping.
 
 ### Registration order in `main()`
 
@@ -314,6 +328,8 @@ Handlers are registered in this order (important for precedence):
 /unmute         Undo mute
 /subscribe      Enable all daily jobs
 /unsubscribe    Disable all daily jobs
+/notifications  Show or toggle one channel: morning|evening|deadlines|habits|idle|weekly|procrastination|all on|off
+/style          Show or set pressure|verbosity|proactivity|tone
 /checkin        Manual check-in with dashboard
 /remind         add|annual|once|list|remove
 /note           Save a quick note
@@ -352,7 +368,7 @@ Handlers are registered in this order (important for precedence):
 
 ## Key constraints
 
-- Check-in prompts are injected into history as user messages (not system), so they appear in conversation context. Known quirk.
+- Bot-initiated messages go into history as assistant turns only (`_remember_bot_message`); their internal prompts are never stored.
 - `MAX_HISTORY = 20` per user; tracker logs are capped at 5000 entries.
 - Rate limit: 30 AI calls/hour/user — backed by SQLite `rate_log`, persists across restarts.
 - APScheduler jobs are in-memory — all jobs recreated from state on every restart via `restore_all_jobs()`.

@@ -24,7 +24,7 @@ import os
 import sys
 import types
 from copy import deepcopy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -245,6 +245,29 @@ class TestGetUser:
         assert "reminders" in u
         assert "llm" in u
 
+    def test_forward_fill_relationship_defaults(self):
+        bot.state["users"]["78"] = fresh_user()
+        del bot.state["users"]["78"]["relationship"]
+        user = bot.get_user(78)
+        assert user["relationship"] == {
+            "pressure": "balanced",
+            "verbosity": "concise",
+            "proactivity": "proactive",
+            "tone": "serious",
+        }
+
+    def test_get_user_leaves_legacy_history_untouched(self):
+        """Old internal check-in prompts age out of the 20-message window on
+        their own; stripping them on load wiped whole histories on live data."""
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "Hi."},
+            {"role": "user", "content": "It's morning check-in time. Internal prompt"},
+            {"role": "assistant", "content": "Automated check-in"},
+        ]
+        bot.state["users"]["79"] = fresh_user(history=list(history))
+        assert bot.get_user(79)["history"] == history
+
 
 class TestGetLlmClient:
     def setup_method(self):
@@ -310,6 +333,19 @@ class TestBuildSystemPrompt:
         u["context"] = "I am a software engineer"
         prompt = bot.build_system_prompt(u)
         assert "software engineer" in prompt
+
+    def test_enforces_relationship_style_and_evidence_only_praise(self):
+        user = fresh_user(relationship={
+            "pressure": "gentle",
+            "verbosity": "conversational",
+            "proactivity": "responsive",
+            "tone": "playful",
+        })
+        prompt = bot.build_system_prompt(user)
+        assert "Pressure: gentle" in prompt
+        assert "Proactivity: responsive" in prompt
+        assert "Never use generic praise" in prompt
+        assert "Ask at most one question" in prompt
 
     def test_language_instruction_injected(self):
         u = fresh_user()
@@ -1074,6 +1110,36 @@ class TestNewExecuteTools:
         result = run(bot._execute_tool(20, "remove_task", {"task_number": 1}))
         assert "error" in result
 
+    def test_remove_all_tasks(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["tasks"] = ["Task A", "Task B", "Task C"]
+        result = run(bot._execute_tool(20, "remove_task", {"all": True}))
+        assert result == {
+            "success": True,
+            "removed_count": 3,
+            "removed": ["Task A", "Task B", "Task C"],
+        }
+        assert bot.state["users"]["20"]["tasks"] == []
+
+    def test_add_and_get_conditional_task(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "add_task", {
+            "text": "Go to the park",
+            "due_date": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }))
+        assert result["success"] is True
+        assert bot.state["users"]["20"]["tasks"] == [{
+            "text": "Go to the park",
+            "due": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }]
+        tasks = run(bot._execute_tool(20, "get_tasks", {}))
+        assert tasks["tasks"][0]["condition"] == "I wake up early tomorrow"
+        assert bot._format_task_line(
+            bot.state["users"]["20"]["tasks"][0], 1,
+        ).startswith("1. Go to the park [if: I wake up early tomorrow]")
+
     # ── get_trackers ─────────────────────────────────────────────────────────
 
     def test_get_trackers_empty(self):
@@ -1196,6 +1262,29 @@ class TestNewExecuteTools:
         bot.state["users"]["20"] = fresh_user()
         result = run(bot._execute_tool(20, "remove_habit", {"name": "nonexistent"}))
         assert "error" in result
+
+    def test_set_relationship_style_tool_updates_selected_fields(self):
+        bot.state["users"]["20"] = fresh_user()
+        result = run(bot._execute_tool(20, "set_relationship_style", {
+            "pressure": "demanding",
+            "tone": "playful",
+        }))
+        assert result["success"] is True
+        style = bot.state["users"]["20"]["relationship"]
+        assert style["pressure"] == "demanding"
+        assert style["tone"] == "playful"
+        assert style["verbosity"] == "concise"
+
+    def test_remove_all_habits(self):
+        bot.state["users"]["20"] = fresh_user()
+        bot.state["users"]["20"]["habits"] = {
+            "meditation": {"completions": []},
+            "running": {"completions": []},
+        }
+        result = run(bot._execute_tool(20, "remove_habit", {"all": True}))
+        assert result["success"] is True
+        assert result["removed_count"] == 2
+        assert bot.state["users"]["20"]["habits"] == {}
 
     # ── get_notes / add_note ─────────────────────────────────────────────────
 
@@ -1967,6 +2056,15 @@ def _debug_context(args):
     return context
 
 
+def _callback_update(chat_id, data):
+    update = MagicMock()
+    update.callback_query.from_user.id = chat_id
+    update.callback_query.data = data
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_reply_markup = AsyncMock()
+    return update
+
+
 class as_owner:
     """Context manager: sets bot.MY_CHAT_ID to str(chat_id) for the duration of
     the `with` block and restores the previous value on exit."""
@@ -2215,9 +2313,8 @@ class TestDebugFire:
         prompt = args[1]
         assert "did not reply" in prompt
 
-    def test_debug_fire_checkin_sends_plain_text_and_logs_job(self):
-        """Check-ins are plain text with no buttons (buttons underscored the
-        mechanical feel) -- users respond in natural language instead."""
+    def test_debug_fire_checkin_sends_outcome_buttons_and_logs_job(self):
+        """Check-ins offer low-friction outcomes and still log delivery."""
         cid = 9014
         bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
         context = _debug_context([])
@@ -2225,7 +2322,7 @@ class TestDebugFire:
             run(bot._run_checkin(context, cid, "morning"))
         context.bot.send_message.assert_awaited_once()
         _, kwargs = context.bot.send_message.call_args
-        assert kwargs.get("reply_markup") is None
+        assert kwargs.get("reply_markup") is not None
         assert bot.db_last_job_fired(str(cid), "checkin_morning") is not None
 
     @pytest.mark.parametrize("runner_name,call_kwargs", [
@@ -2422,6 +2519,154 @@ class TestDebugFire:
         args, _ = mock_chat.call_args
         assert "Feared task" in args[1]
         assert "Minor task" not in args[1]
+
+    def test_reengagement_fires_after_fourteen_days_without_scheduled_contact(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        cid = 9044
+        old_day = (date.today() - timedelta(days=14)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(
+            activity_days=[old_day], timezone="UTC",
+        )
+        context = _debug_context([])
+        daytime = datetime.now(ZoneInfo("UTC")).replace(hour=12)
+        with (
+            patch.object(bot, "_now", return_value=daytime),
+            patch.object(bot, "chat", AsyncMock(return_value="What would you like to achieve?")) as mock_chat,
+        ):
+            result = run(bot._run_reengagement(context, cid))
+        assert result is None
+        mock_chat.assert_awaited_once()
+        assert mock_chat.await_args.kwargs == {
+            "touch_activity": False,
+            "store_history": False,
+        }
+        context.bot.send_message.assert_awaited_once_with(
+            chat_id=cid, text="What would you like to achieve?",
+        )
+
+    @pytest.mark.parametrize("scheduled", ["checkins", "reminder"])
+    def test_reengagement_skips_users_with_scheduled_contact(self, scheduled):
+        cid = 9045
+        old_day = (date.today() - timedelta(days=30)).isoformat()
+        user = fresh_user(activity_days=[old_day])
+        if scheduled == "checkins":
+            user["checkin_enabled"] = True
+        else:
+            user["reminders"] = [{"id": "r1", "time": "12:00", "message": "Call"}]
+        bot.state["users"][str(cid)] = user
+        context = _debug_context([])
+        result = run(bot._run_reengagement(context, cid))
+        assert result == "scheduled contact exists"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_reengagement_does_not_repeat_within_fourteen_days(self):
+        from datetime import datetime
+
+        cid = 9046
+        old_day = (date.today() - timedelta(days=30)).isoformat()
+        bot.state["users"][str(cid)] = fresh_user(activity_days=[old_day])
+        context = _debug_context([])
+        with patch.object(bot, "db_last_job_fired", return_value=datetime.utcnow().isoformat()):
+            result = run(bot._run_reengagement(context, cid))
+        assert result == "recent reengagement"
+        context.bot.send_message.assert_not_awaited()
+
+    def test_any_inbound_message_resets_reengagement_inactivity(self):
+        cid = 9047
+        bot.state["users"][str(cid)] = fresh_user(
+            activity_days=[(date.today() - timedelta(days=30)).isoformat()],
+        )
+        update = _debug_update(cid)
+        run(bot.track_user_activity(update, _debug_context([])))
+        assert date.today().isoformat() in bot.state["users"][str(cid)]["activity_days"]
+
+    def test_restore_registers_one_global_reengagement_scan(self):
+        bot.state = {"users": {}}
+        app = MagicMock()
+        app.job_queue.get_jobs_by_name.return_value = []
+        bot.restore_all_jobs(app)
+        app.job_queue.run_repeating.assert_called_once_with(
+            bot._run_reengagement_scan,
+            interval=3600,
+            first=60,
+            name="reengagement_scan",
+        )
+
+    def test_checkin_not_started_offers_recovery_choices(self):
+        cid = 9048
+        bot.state["users"][str(cid)] = fresh_user(pending_checkin="morning")
+        update = _callback_update(cid, "checkin_not_started")
+        context = _debug_context([])
+        run(bot.handle_callback(update, context))
+        assert bot.state["users"][str(cid)]["pending_checkin"] is None
+        assert bot.state["users"][str(cid)]["history"][-2]["content"] == (
+            "Check-in outcome: not started"
+        )
+        _, kwargs = context.bot.send_message.call_args
+        assert kwargs["text"] == "No lecture — what got in the way?"
+        assert kwargs["reply_markup"] is not None
+
+    def test_checkin_done_asks_one_followup(self):
+        cid = 9049
+        bot.state["users"][str(cid)] = fresh_user(pending_checkin="evening")
+        update = _callback_update(cid, "checkin_done")
+        context = _debug_context([])
+        run(bot.handle_callback(update, context))
+        context.bot.send_message.assert_awaited_once_with(
+            chat_id=cid, text="What did you finish?",
+        )
+
+    def test_reminder_done_records_real_outcome(self):
+        cid = 9051
+        bot.state["users"][str(cid)] = fresh_user()
+        update = _callback_update(cid, "remdone_token")
+        context = _debug_context([])
+        with patch.object(
+            bot, "db_take_snooze", return_value={"message": "Push-ups", "reason": None},
+        ):
+            run(bot.handle_callback(update, context))
+        assert bot.state["users"][str(cid)]["history"][-2]["content"] == (
+            "Reminder outcome: done — Push-ups"
+        )
+        context.bot.send_message.assert_awaited_once_with(
+            chat_id=cid, text="Noted — done.",
+        )
+
+    def test_checkin_reply_stored_as_assistant_turn_without_prompt(self):
+        """A free-text answer to a check-in must reach the model alongside the
+        question it answers; the internal prompt must not."""
+        cid = 9052
+        bot.state["users"][str(cid)] = fresh_user(checkin_enabled=True)
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Which task today?")):
+            run(bot._run_checkin(context, cid, "morning"))
+        assert bot.state["users"][str(cid)]["history"] == [
+            {"role": "assistant", "content": "Which task today?"},
+        ]
+
+    def test_reminder_reply_stored_as_assistant_turn(self):
+        cid = 9053
+        bot.state["users"][str(cid)] = fresh_user()
+        reminder = {"id": "r1", "time": "09:00", "message": "Take pills", "once": False}
+        context = _debug_context([])
+        with patch.object(bot, "chat", AsyncMock(return_value="Pills time.")):
+            run(bot._run_reminder(context, cid, reminder, simulate=False))
+        assert bot.state["users"][str(cid)]["history"][-1] == {
+            "role": "assistant", "content": "Pills time.",
+        }
+
+    def test_callback_followup_question_stored_in_history(self):
+        cid = 9054
+        bot.state["users"][str(cid)] = fresh_user(pending_checkin="evening")
+        update = _callback_update(cid, "plan_drop")
+        context = _debug_context([])
+        run(bot.handle_callback(update, context))
+        assert bot.state["users"][str(cid)]["history"][-2:] == [
+            {"role": "user", "content": "Plan decision: drop"},
+            {"role": "assistant", "content": "Which task should I remove?"},
+        ]
 
     def test_debug_fire_weekly_digest_not_sunday_reason(self):
         cid = 9050
@@ -2669,6 +2914,107 @@ class TestDebugFire:
         mock_chat.assert_awaited_once()
         _, kwargs = mock_chat.call_args
         assert kwargs.get("touch_activity") is False
+
+    def test_notification_switches_schedule_only_enabled_channels(self):
+        cid = 9075
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True,
+            notifications={
+                "morning": True, "evening": False, "deadlines": False,
+                "habits": True, "idle": False, "weekly": True,
+                "procrastination": False,
+            },
+        )
+        app = MagicMock()
+        captured = _capture_run_daily_callbacks(app)
+        bot.schedule_user_checkins(app, cid)
+        bot.schedule_user_alerts(app, cid)
+        assert set(captured) == {
+            f"checkin_morning_{cid}",
+            f"habit_reminder_{cid}",
+            f"weekly_digest_{cid}",
+        }
+
+    def test_notifications_command_disables_one_channel(self):
+        cid = 9076
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True, timezone_confirmed=True,
+        )
+        update = _debug_update(cid)
+        context = _debug_context(["morning", "off"])
+        run(bot.notifications_cmd(update, context))
+        assert bot.state["users"][str(cid)]["notifications"]["morning"] is False
+        assert bot.state["users"][str(cid)]["notifications"]["evening"] is True
+        update.message.reply_text.assert_awaited_once_with("morning: off.")
+
+    def test_notifications_on_while_unsubscribed_enables_only_that_channel(self):
+        cid = 9078
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=False, timezone_confirmed=True,
+        )
+        run(bot.notifications_cmd(_debug_update(cid), _debug_context(["weekly", "on"])))
+        user = bot.state["users"][str(cid)]
+        assert user["checkin_enabled"] is True
+        assert [n for n, on in user["notifications"].items() if on] == ["weekly"]
+
+    def test_subscribe_turns_every_channel_back_on(self):
+        cid = 9079
+        bot.state["users"][str(cid)] = fresh_user(
+            timezone_confirmed=True,
+            notifications={
+                "morning": False, "evening": False, "deadlines": False,
+                "habits": False, "idle": False, "weekly": True,
+            },
+        )
+        run(bot.subscribe(_debug_update(cid), _debug_context([])))
+        assert all(bot.state["users"][str(cid)]["notifications"].values())
+
+    def test_set_checkins_tool_reenables_checkin_channels(self):
+        cid = 9080
+        bot.state["users"][str(cid)] = fresh_user(
+            checkin_enabled=True, timezone_confirmed=True,
+            notifications={
+                "morning": False, "evening": False, "deadlines": True,
+                "habits": True, "idle": True, "weekly": True,
+            },
+        )
+        with patch.object(bot, "_app", None):
+            result = run(bot._execute_tool(cid, "set_checkins", {"enabled": True}))
+        assert result["success"] is True
+        notifications = bot.state["users"][str(cid)]["notifications"]
+        assert notifications["morning"] is True and notifications["evening"] is True
+
+    @pytest.mark.parametrize("morning_on,expect_catchup", [
+        pytest.param(True, True, id="enabled"),
+        pytest.param(False, False, id="disabled"),
+    ])
+    def test_restart_catchup_respects_notification_switch(self, morning_on, expect_catchup):
+        cid = 9081
+        if datetime.utcnow().hour == 0 and datetime.utcnow().minute < 35:
+            pytest.skip("30 minutes ago falls on yesterday; no same-day catch-up")
+        missed = (datetime.utcnow() - timedelta(minutes=30)).strftime("%H:%M")
+        far = (datetime.utcnow() + timedelta(hours=6)).strftime("%H:%M")
+        user = fresh_user(
+            checkin_enabled=True, timezone="UTC",
+            checkin_times={"morning": missed, "evening": far},
+            notifications={
+                "morning": morning_on, "evening": True, "deadlines": True,
+                "habits": True, "idle": True, "weekly": True,
+            },
+        )
+        app = MagicMock()
+        with patch.dict(bot.state, {"users": {str(cid): user}}):
+            bot.restore_all_jobs(app)
+        assert app.job_queue.run_once.called is expect_catchup
+
+    def test_style_command_updates_one_dimension(self):
+        cid = 9077
+        bot.state["users"][str(cid)] = fresh_user()
+        update = _debug_update(cid)
+        context = _debug_context(["proactivity", "responsive"])
+        run(bot.style_cmd(update, context))
+        assert bot.state["users"][str(cid)]["relationship"]["proactivity"] == "responsive"
+        update.message.reply_text.assert_awaited_once_with("proactivity: responsive.")
 
     # ── 01-03 Task 2: DEBUG_JOBS registry + full /debug fire dispatch ──────
 
@@ -4408,6 +4754,19 @@ class TestSanitizeImport:
                 user[key] = clean[key]
         assert isinstance(bot.build_system_prompt(user, uid), str)
 
+    def test_conditional_task_survives_import_sanitization(self):
+        clean, skipped = bot._sanitize_import({"tasks": [{
+            "text": "Go to the park",
+            "due": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }]})
+        assert skipped == []
+        assert clean["tasks"] == [{
+            "text": "Go to the park",
+            "due": "2026-09-29",
+            "condition": "I wake up early tomorrow",
+        }]
+
 
 class TestReviewRemediations:
     def setup_method(self):
@@ -4487,6 +4846,42 @@ class TestEmptyModelReplyNeverSent:
         assert reply.strip(), "reply must never be empty — Telegram rejects empty messages"
         stored = bot.state["users"][str(uid)]["history"][-1]
         assert stored["role"] == "assistant" and stored["content"].strip()
+
+
+class TestCreditExhaustionFallback:
+    def setup_method(self):
+        bot.state = {"users": {}}
+        bot._app = None
+
+    def test_user_key_quota_exhaustion_retries_with_free_default(self):
+        uid = 7604
+        bot.state["users"][str(uid)] = fresh_user()
+        bot.state["users"][str(uid)]["llm"]["api_key"] = "sk_user"
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=Exception("insufficient_quota: credits exhausted")
+        )
+        fallback_message = MagicMock(tool_calls=None, content="Fallback reply")
+        fallback_response = MagicMock()
+        fallback_response.choices = [MagicMock(message=fallback_message)]
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create = AsyncMock(return_value=fallback_response)
+
+        with (
+            patch.object(bot, "GROQ_API_KEY", "gsk_bot"),
+            patch.object(bot, "get_llm_client", return_value=primary_client),
+            patch.object(bot, "get_model", return_value="gpt-user"),
+            patch.object(bot, "AsyncOpenAI", return_value=fallback_client) as mock_openai,
+            patch.object(bot, "is_rate_limited", return_value=False),
+        ):
+            reply = run(bot.chat(uid, "hello"))
+
+        assert reply == "Fallback reply"
+        mock_openai.assert_called_once_with(
+            api_key="gsk_bot", base_url=bot.GROQ_BASE_URL,
+        )
+        assert fallback_client.chat.completions.create.await_args.kwargs["model"] == bot.GROQ_DEFAULT_MODEL
 
 
 class TestSnoozeTokenPersistence:

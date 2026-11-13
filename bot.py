@@ -75,11 +75,12 @@ def _get_fernet() -> Fernet:
 # Rate limiting: max AI calls per hour per user (backed by SQLite)
 RATE_LIMIT = 30
 RATE_WINDOW = 3600
+REENGAGEMENT_DAYS = 14
 # Per-tracker retention cap, enforced on write (log_tracker) and on /import.
 TRACKER_LOG_CAP = 5000
-# /debug prompt sends the prompt inline up to this length, as a document above it
-# (Telegram's own message cap is 4096; this leaves room for delivery overhead).
-DEBUG_PROMPT_INLINE_MAX = 4000
+# /debug prompt sends the prompt verbatim with no wrapper, so the full Telegram
+# message limit is available before it must switch to document delivery.
+DEBUG_PROMPT_INLINE_MAX = 4096
 # Legacy in-memory snooze store. Superseded by the snooze_tokens SQLite table
 # (which survives restarts); kept only so a button delivered before that switch
 # still resolves. Nothing writes to it any more.
@@ -624,6 +625,21 @@ def _new_user(**overrides) -> dict:
         "activity_days": [],
         "quiet_hours": {"start": None, "end": None},
         "checkin_times": {"morning": "08:00", "evening": "21:00"},
+        "notifications": {
+            "morning": True,
+            "evening": True,
+            "deadlines": True,
+            "habits": True,
+            "idle": True,
+            "weekly": True,
+            "procrastination": True,
+        },
+        "relationship": {
+            "pressure": "balanced",
+            "verbosity": "concise",
+            "proactivity": "proactive",
+            "tone": "serious",
+        },
         "archived_tasks": [],
         "notes": [],
         "today_focus": {"date": "", "text": ""},
@@ -696,6 +712,10 @@ def get_user(chat_id: int) -> dict:
     # Forward-fill nested llm dict
     for k, v in _new_user()["llm"].items():
         u["llm"].setdefault(k, v)
+    for k, v in _new_user()["notifications"].items():
+        u["notifications"].setdefault(k, v)
+    for k, v in _new_user()["relationship"].items():
+        u["relationship"].setdefault(k, v)
     # Overlay critical prefs from SQLite (survive state.json overwrites)
     db_tz = db_get_pref(key, "timezone")
     if db_tz:
@@ -956,6 +976,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_relationship_style",
+            "description": (
+                "Save how the user wants the bot to communicate. Call when they ask for more "
+                "or less pressure, shorter or more conversational replies, proactive or "
+                "only-requested help, or a playful/serious tone. Pass only changed fields."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pressure": {"type": "string", "enum": ["gentle", "balanced", "demanding"]},
+                    "verbosity": {"type": "string", "enum": ["concise", "conversational"]},
+                    "proactivity": {"type": "string", "enum": ["proactive", "responsive"]},
+                    "tone": {"type": "string", "enum": ["playful", "serious"]},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_honorific",
             "description": (
                 "Save how to address the user. Call this whenever they tell you who they are or "
@@ -991,7 +1032,8 @@ TOOLS = [
             "description": (
                 "Add a new task. Refused if it looks like a near-duplicate of an existing task "
                 "— edit that one instead, or retry with confirm_duplicate=true if the user "
-                "really wants both."
+                "really wants both. For an if/then plan, put the action in text and the "
+                "triggering if-clause in condition."
             ),
             "parameters": {
                 "type": "object",
@@ -1000,6 +1042,13 @@ TOOLS = [
                     "due_date": {
                         "type": "string",
                         "description": "Optional due date in YYYY-MM-DD format.",
+                    },
+                    "condition": {
+                        "type": "string",
+                        "description": (
+                            "Optional condition that must be true before doing the task, without "
+                            "the word 'if' (e.g. 'I wake up early tomorrow')."
+                        ),
                     },
                     "confirm_duplicate": {
                         "type": "boolean",
@@ -1197,13 +1246,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "remove_task",
-            "description": "Permanently delete a task from the list without archiving it.",
+            "description": (
+                "Permanently delete tasks without archiving them. For 'remove/cancel all tasks', "
+                "call once with all=true; otherwise pass one task_number."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_number": {"type": "integer", "description": "1-based task number."},
+                    "all": {"type": "boolean", "description": "Delete every task."},
                 },
-                "required": ["task_number"],
+                "required": [],
             },
         },
     },
@@ -1255,13 +1308,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "remove_habit",
-            "description": "Delete a habit permanently.",
+            "description": (
+                "Delete habits permanently. For 'remove/cancel all habits', call once with "
+                "all=true; otherwise pass one habit name."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Habit name to delete."},
+                    "all": {"type": "boolean", "description": "Delete every habit."},
                 },
-                "required": ["name"],
+                "required": [],
             },
         },
     },
@@ -1413,6 +1470,11 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             times["evening"] = evening
         user["checkin_times"] = times
         user["checkin_enabled"] = enabled
+        if enabled:
+            # Asking for check-ins must actually produce them, even if
+            # /notifications had switched morning/evening off.
+            user["notifications"]["morning"] = True
+            user["notifications"]["evening"] = True
         save_state(state)
         if _app:
             schedule_user_checkins(_app, chat_id)
@@ -1435,6 +1497,26 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         user["persona"] = character
         save_state(state)
         return {"success": True, "persona": character}
+
+    if name == "set_relationship_style":
+        allowed = {
+            "pressure": {"gentle", "balanced", "demanding"},
+            "verbosity": {"concise", "conversational"},
+            "proactivity": {"proactive", "responsive"},
+            "tone": {"playful", "serious"},
+        }
+        changes = {}
+        for field, values in allowed.items():
+            value = (args.get(field) or "").lower().strip()
+            if value:
+                if value not in values:
+                    return {"error": f"Invalid {field}: {value}"}
+                changes[field] = value
+        if not changes:
+            return {"error": "At least one style setting is required"}
+        user["relationship"].update(changes)
+        save_state(state)
+        return {"success": True, "relationship": user["relationship"]}
 
     if name == "set_honorific":
         form = (args.get("form") or "").strip()
@@ -1470,7 +1552,12 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         return {
             "count": len(tasks),
             "tasks": [
-                {"number": i + 1, "text": _task_text(t), "due": _task_due(t)}
+                {
+                    "number": i + 1,
+                    "text": _task_text(t),
+                    "due": _task_due(t),
+                    "condition": _task_condition(t),
+                }
                 for i, t in enumerate(tasks)
             ],
         }
@@ -1488,7 +1575,14 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
                 due = raw_due
             except ValueError:
                 due_error = f"due_date '{raw_due}' is invalid (use YYYY-MM-DD); task added without due date."
-        task = {"text": text, "due": due} if due else text
+        condition = (args.get("condition") or "").strip()
+        task = {"text": text}
+        if due:
+            task["due"] = due
+        if condition:
+            task["condition"] = condition
+        if len(task) == 1:
+            task = text
         similar = _find_similar(text, [_task_text(t) for t in user.get("tasks", [])])
         # Refuse rather than create-then-complain — see add_reminder's note: a
         # clarification can arrive as several calls in one turn, by which point
@@ -1506,7 +1600,7 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
             }
         user["tasks"].append(task)
         save_state(state)
-        result = {"success": True, "task": text, "due": due}
+        result = {"success": True, "task": text, "due": due, "condition": condition or None}
         if due_error:
             result["warning"] = due_error
         return result
@@ -1768,8 +1862,13 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         }
 
     if name == "remove_task":
-        n = int(args.get("task_number", 0))
         tasks = user.get("tasks", [])
+        if args.get("all") is True:
+            removed = [_task_text(task) for task in tasks]
+            tasks.clear()
+            save_state(state)
+            return {"success": True, "removed_count": len(removed), "removed": removed}
+        n = int(args.get("task_number", 0))
         if n < 1 or n > len(tasks):
             return {"error": f"Task {n} not found. There are {len(tasks)} tasks."}
         removed = _task_text(tasks.pop(n - 1))
@@ -1833,8 +1932,13 @@ async def _execute_tool(chat_id: int, name: str, args: dict) -> dict:
         return {"success": True, "name": hname, "streak": _habit_streak(completions, user=user)}
 
     if name == "remove_habit":
-        hname = (args.get("name") or "").lower().strip()
         habits = user.get("habits", {})
+        if args.get("all") is True:
+            removed = list(habits)
+            habits.clear()
+            save_state(state)
+            return {"success": True, "removed_count": len(removed), "removed": removed}
+        hname = (args.get("name") or "").lower().strip()
         if hname not in habits:
             return {"error": f"Habit '{hname}' not found.", "available": list(habits.keys())}
         del habits[hname]
@@ -2110,6 +2214,10 @@ def _task_stale_streak(task) -> int:
     return task.get("stale_streak", 0) if isinstance(task, dict) else 0
 
 
+def _task_condition(task) -> str | None:
+    return task.get("condition") if isinstance(task, dict) else None
+
+
 def _task_index(tasks: list, raw_number: str) -> int:
     """Convert a user-facing 1-based task number to a validated index."""
     number = int(raw_number)
@@ -2125,8 +2233,10 @@ def _task_tags(task) -> list:
 def _format_task_line(task, idx: int, user=None) -> str:
     text = _task_text(task)
     due = _task_due(task)
+    condition = _task_condition(task)
+    condition_badge = f" [if: {condition}]" if condition else ""
     if not due:
-        return f"{idx}. {text}"
+        return f"{idx}. {text}{condition_badge}"
     try:
         due_date = date.fromisoformat(due)
         days_left = (due_date - _today(user=user)).days
@@ -2140,7 +2250,7 @@ def _format_task_line(task, idx: int, user=None) -> str:
             badge = f" (due {due})"
     except ValueError:
         badge = f" (due {due})"
-    return f"{idx}. {text}{badge}"
+    return f"{idx}. {text}{condition_badge}{badge}"
 
 
 def _tasks_for_prompt(tasks: list) -> str:
@@ -2150,7 +2260,13 @@ def _tasks_for_prompt(tasks: list) -> str:
     for t in tasks:
         text = _task_text(t)
         due = _task_due(t)
-        parts.append(f"{text} [due {due}]" if due else text)
+        condition = _task_condition(t)
+        details = []
+        if condition:
+            details.append(f"if: {condition}")
+        if due:
+            details.append(f"due {due}")
+        parts.append(f"{text} [{'; '.join(details)}]" if details else text)
     return ", ".join(parts)
 
 
@@ -2177,6 +2293,19 @@ def get_model(user: dict, chat_id: int = 0) -> str:
     if GROQ_API_KEY:
         return user_model or GROQ_DEFAULT_MODEL
     return user_model or DEFAULT_MODEL
+
+
+def _is_credit_exhaustion(error: Exception) -> bool:
+    """Return whether a provider rejected a request for exhausted credits."""
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "insufficient_quota",
+        "exceeded your current quota",
+        "quota exceeded",
+        "credit balance",
+        "credits exhausted",
+        "billing quota",
+    ))
 
 
 def build_system_prompt(user: dict, chat_id: int = 0) -> str:
@@ -2321,30 +2450,41 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
     else:
         honorific_instruction = ""
 
+    relationship = user["relationship"]
+    # The user's explicit style choices override the numbered defaults below
+    # (e.g. pressure=gentle beats #4's pushback); tone shades the persona's
+    # voice rather than replacing it, so Jeeves stays Jeeves either way.
+    relationship_instruction = (
+        f"Style (the user's own choice — overrides #2, #4 and #5 below where they conflict) — "
+        f"Pressure: {relationship['pressure']} (gentle=no pushback; balanced=one useful "
+        f"challenge; demanding=direct, never guilt); Verbosity: {relationship['verbosity']}; "
+        f"Proactivity: {relationship['proactivity']} (responsive=no unsolicited next steps); "
+        f"Tone: {relationship['tone']} (applied within the persona's voice, not instead of it). "
+        "Never use generic praise/filler; praise only recorded facts. "
+        "Ask at most one question.\n"
+    )
+
     return (
         "You are a personal secretary and accountability coach bot on Telegram.\n\n"
         "Your job:\n"
         "0. Literal requests always win over voice: an exact word, an exact number, an exact "
         "format, a direct factual answer — output exactly that, nothing added, nothing in "
         "character. Persona is for ordinary conversation, never for a literal request.\n"
-        f"{persona_instruction}{honorific_instruction}"
+        f"{persona_instruction}{honorific_instruction}{relationship_instruction}"
         "1. Be a helpful, direct assistant.\n"
         "2. Proactively hold the user accountable for their goals and tasks.\n"
-        "3. During check-ins, go through open tasks one at a time, by name — never one "
-        "blanket question covering all of them at once ('how did it go with everything?'). "
-        "If there are several, ask about the one or two that matter most rather than reading "
-        "out the whole list.\n"
-        "4. Be warm but firm. When a task wasn't done, don't accept a vague excuse ('no time', "
-        "'just didn't get to it') and don't jump straight to reassurance or encouragement — ask "
-        "one genuinely curious follow-up to find the actual reason first, then respond to that "
-        "specific reason. Generic comfort offered before you understand the real reason reads as "
-        "scripted, not caring.\n"
+        "3. During check-ins, ask about open tasks one at a time, by name — not all at once.\n"
+        "4. Be warm but firm. Don't accept a vague excuse — ask why before offering comfort.\n"
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
         "7. Correct mistakes naturally and briefly when they occur.\n"
         "8. Use your tools proactively. When a user says they want to do something, "
         "need a reminder, or mentions a goal, call the relevant tool immediately "
-        "(add_task, add_reminder, log_tracker, create_tracker, etc.) without asking for confirmation first.\n"
+        "(add_task, add_reminder, log_tracker, create_tracker, etc.) without asking for confirmation first. "
+        "Persist named plans with tools; if a follow-up gives their time, create the reminder.\n"
+        "Never claim that tasks, habits, reminders, or other stored data changed unless the "
+        "corresponding tool returned success. Use all=true when the user asks to remove every "
+        "task or every habit.\n"
         "9. If a user asks to track something new (steps, sleep, mood, etc.) and it doesn't exist yet, "
         "call create_tracker first, then log_tracker to log the initial value if provided.\n"
         "10. When asked what you can do or how to use you, explain concisely: tasks, trackers, "
@@ -2393,6 +2533,7 @@ _WRITE_TOOLS = frozenset({
     "add_note", "remove_note",
     "add_journal_entry", "save_memory",
     "set_timezone", "set_checkins", "set_persona", "set_honorific",
+    "set_relationship_style",
     "get_current_time",  # resolving relative dates is a prerequisite for many writes
 })
 
@@ -2427,7 +2568,13 @@ def _tools_for_round(called: set[str]) -> list:
 
 # ─────────────────────── chat ───────────────────────
 
-async def chat(chat_id: int, user_message: str, system: str = None, touch_activity: bool = True) -> str:
+async def chat(
+    chat_id: int,
+    user_message: str,
+    system: str = None,
+    touch_activity: bool = True,
+    store_history: bool = True,
+) -> str:
     user = get_user(chat_id)
     if touch_activity:
         # Only genuine user-initiated turns count toward the activity streak and
@@ -2439,6 +2586,26 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
     system = system or build_system_prompt(user, chat_id)
     client = get_llm_client(user, chat_id)
     model = get_model(user, chat_id)
+    user_key = db_get_key(chat_id) or user["llm"].get("api_key")
+    can_use_free_fallback = bool(
+        user_key and GROQ_API_KEY and user_key != GROQ_API_KEY
+    )
+    used_free_fallback = False
+
+    async def create_completion(**kwargs):
+        nonlocal client, model, used_free_fallback
+        try:
+            return await client.chat.completions.create(model=model, **kwargs)
+        except Exception as error:
+            if not can_use_free_fallback or used_free_fallback or not _is_credit_exhaustion(error):
+                raise
+            logger.warning(
+                "User LLM credits exhausted for %s; retrying with free default", chat_id,
+            )
+            client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+            model = GROQ_DEFAULT_MODEL
+            used_free_fallback = True
+            return await client.chat.completions.create(model=model, **kwargs)
 
     # Build the full message list (history + new user message)
     messages = (
@@ -2459,8 +2626,7 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
             try:
                 if is_rate_limited(chat_id):
                     return "⚠️ AI call limit reached. Try again later."
-                response = await client.chat.completions.create(
-                    model=model,
+                response = await create_completion(
                     messages=messages,
                     max_tokens=600,
                     temperature=0.7,
@@ -2473,8 +2639,7 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
                 if any(w in err_str for w in ("tool", "function", "unsupported")):
                     if is_rate_limited(chat_id):
                         return "⚠️ AI call limit reached. Try again later."
-                    response = await client.chat.completions.create(
-                        model=model,
+                    response = await create_completion(
                         messages=messages,
                         max_tokens=600,
                         temperature=0.7,
@@ -2527,13 +2692,24 @@ async def chat(chat_id: int, user_message: str, system: str = None, touch_activi
         logger.warning("Empty model reply for %s; substituting fallback text", chat_id)
         reply = "⚠️ I didn't manage to put that into words. Could you say it again?"
 
-    # Store only the user turn and final text reply in history
-    user["history"].append({"role": "user", "content": user_message})
-    user["history"].append({"role": "assistant", "content": reply})
+    if store_history:
+        # Store only the user turn and final text reply in history.
+        user["history"].append({"role": "user", "content": user_message})
+        user["history"].append({"role": "assistant", "content": reply})
+        if len(user["history"]) > MAX_HISTORY:
+            user["history"] = user["history"][-MAX_HISTORY:]
+        save_state(state)
+    return reply
+
+
+def _remember_bot_message(user: dict, text: str) -> None:
+    """Store a bot-initiated message as an assistant turn, without the internal
+    prompt that produced it — so a free-text reply ("yes, did it") still has
+    the question it answers in context."""
+    user["history"].append({"role": "assistant", "content": text})
     if len(user["history"]) > MAX_HISTORY:
         user["history"] = user["history"][-MAX_HISTORY:]
     save_state(state)
-    return reply
 
 
 # ─────────────────────── scheduling helpers ───────────────────────
@@ -2586,22 +2762,16 @@ async def _run_checkin(
     if is_morning:
         prompt = (
             f"It's morning check-in time. {variety_instruction} "
-            "Then ask what they plan to work on today from their task list -- pick 1-2 "
-            "specific tasks. Push for a concrete commitment, not a vague intention: get "
-            "them to say what exactly they'll do and roughly when today they'll do it "
-            "(implementation intentions work far better than 'I'll get to it')."
+            "Pick at most two relevant tasks and ask one concise question: which single task "
+            "will they move forward today, and roughly when? Do not ask how they feel or add "
+            "generic encouragement."
         )
     else:
         prompt = (
             f"It's evening check-in time. {variety_instruction} "
-            "Ask about their open tasks one at a time, by name -- not one blanket "
-            "'how did today go' question covering all of them. Pick the one or two "
-            "that matter most if there are several. For any task that wasn't done, "
-            "don't accept a vague excuse and don't jump to encouragement or comfort -- "
-            "ask a genuinely curious follow-up to find out specifically what got in the "
-            "way, then respond to that specific reason. Then, separately, ask what they "
-            "plan to do tomorrow -- again pushing for a specific action and a specific "
-            "time, not just a vague plan."
+            "Reference one concrete commitment or task and ask one concise question about "
+            "what actually happened. Do not ask about tomorrow in the same message. Praise "
+            "only progress that is explicitly recorded; never invent effort or success."
         )
     try:
         dynamic_prompt = prompt
@@ -2628,8 +2798,21 @@ async def _run_checkin(
                 "Briefly acknowledge the silence and vary your wording instead of "
                 "repeating the same question."
             )
-        reply = await chat(chat_id, dynamic_prompt, touch_activity=False)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
+        reply = await chat(
+            chat_id, dynamic_prompt, touch_activity=False, store_history=False,
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Done", callback_data="checkin_done"),
+                InlineKeyboardButton("➗ Partly", callback_data="checkin_partial"),
+            ],
+            [
+                InlineKeyboardButton("○ Not started", callback_data="checkin_not_started"),
+                InlineKeyboardButton("✎ Change plan", callback_data="checkin_change"),
+            ],
+        ])
+        await context.bot.send_message(chat_id=chat_id, text=reply, reply_markup=keyboard)
+        _remember_bot_message(user_now, reply)
         user_now["pending_checkin"] = label
         save_state(state)
         db_log_job(str(chat_id), f"checkin_{'morning' if is_morning else 'evening'}")
@@ -2650,7 +2833,7 @@ def schedule_user_checkins(app: Application, chat_id: int) -> None:
         job_name = f"checkin_{label}_{chat_id}"
         for job in app.job_queue.get_jobs_by_name(job_name):
             job.schedule_removal()
-        if not enabled:
+        if not enabled or not user["notifications"].get(label, True):
             continue
 
         t = _parse_local_time(times.get(label, "08:00" if label == "morning" else "21:00"), tz_str)
@@ -2692,7 +2875,9 @@ async def _run_reminder(
               "don't reuse the same template every time. One to two sentences, "
               "not a lecture."
         )
-        reply = await chat(chat_id, prompt, touch_activity=False)
+        reply = await chat(
+            chat_id, prompt, touch_activity=False, store_history=False,
+        )
         # uuid4, not a truncated monotonic clock: the old token wrapped every
         # ~2.8h, so two reminders that far apart collided and snoozing the older
         # button replayed the newer one's text. Stored in SQLite rather than a
@@ -2701,12 +2886,17 @@ async def _run_reminder(
         # a bot.py commit triggers one.
         token = uuid.uuid4().hex
         db_save_snooze(token, chat_id, msg, reason)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔁 Snooze 30 min", callback_data=f"snooze_{token}_30"),
-        ]])
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Done", callback_data=f"remdone_{token}"),
+                InlineKeyboardButton("🔁 30 min", callback_data=f"snooze_{token}_30"),
+            ],
+            [InlineKeyboardButton("○ Skip today", callback_data=f"remskip_{token}")],
+        ])
         await context.bot.send_message(
             chat_id=chat_id, text=reply, reply_markup=keyboard
         )
+        _remember_bot_message(get_user(chat_id), reply)
     except Exception as e:
         logger.error("Reminder failed for %s: %s", chat_id, e)
         return "send failed"
@@ -2942,6 +3132,69 @@ async def _run_idle_nudge(
     return None
 
 
+async def _run_reengagement(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int
+) -> str | None:
+    """Invite a dormant, unscheduled user to choose a fresh goal."""
+    user = get_user(chat_id)
+    scheduled_notifications = user.get("checkin_enabled") and any(
+        user["notifications"].values()
+    )
+    if scheduled_notifications or user.get("reminders"):
+        return "scheduled contact exists"
+    if _is_quiet_now(user) or _is_muted(user):
+        return "quiet hours or muted"
+
+    activity_days = sorted(user.get("activity_days", []))
+    if not activity_days:
+        return "no activity history"
+    try:
+        timezone = ZoneInfo(user.get("timezone", "UTC"))
+    except (ZoneInfoNotFoundError, KeyError):
+        timezone = ZoneInfo("UTC")
+    local_now = _now(timezone)
+    try:
+        inactive_days = (local_now.date() - date.fromisoformat(activity_days[-1])).days
+    except ValueError:
+        return "invalid activity history"
+    if inactive_days < REENGAGEMENT_DAYS:
+        return "recent activity"
+
+    last_sent = db_last_job_fired(str(chat_id), "reengagement")
+    if last_sent:
+        try:
+            if (datetime.utcnow() - datetime.fromisoformat(last_sent)).days < REENGAGEMENT_DAYS:
+                return "recent reengagement"
+        except ValueError:
+            pass
+
+    if not 10 <= local_now.hour < 20:
+        return "outside daytime"
+
+    prompt = (
+        "Reconnect with the user after a quiet period. In the language they normally use, "
+        "write one warm, natural message with no guilt, productivity lecture, or generic "
+        "encouragement. Ask what they would most like to achieve now and how you could help "
+        "them make it happen. Keep it to at most two short sentences and one question."
+    )
+    reply = await chat(
+        chat_id, prompt, touch_activity=False, store_history=False,
+    )
+    await context.bot.send_message(chat_id=chat_id, text=reply)
+    _remember_bot_message(user, reply)
+    db_log_job(str(chat_id), "reengagement")
+    return None
+
+
+async def _run_reengagement_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check all known users; individual eligibility prevents unwanted sends."""
+    for chat_id in list(state.get("users", {})):
+        try:
+            await _run_reengagement(context, int(chat_id))
+        except Exception as error:
+            logger.error("Re-engagement failed for %s: %s", chat_id, error)
+
+
 async def _run_weekly_digest(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, simulate: bool = True
 ) -> str | None:
@@ -2993,6 +3246,7 @@ async def _run_weekly_digest(
             chat_id, prompt,
             system="You are a supportive weekly accountability coach.",
             touch_activity=False,
+            store_history=False,
         )
         await context.bot.send_message(
             chat_id=chat_id,
@@ -3060,8 +3314,9 @@ async def _run_procrastination_nudge(
             "a lasting pattern, episodic if it's more situational) so you can "
             "recognize it next time this task or one like it comes up."
         )
-        reply = await chat(chat_id, prompt, touch_activity=False)
+        reply = await chat(chat_id, prompt, touch_activity=False, store_history=False)
         await context.bot.send_message(chat_id=chat_id, text=reply)
+        _remember_bot_message(u, reply)
     except Exception as e:
         logger.error("Procrastination nudge failed for %s: %s", chat_id, e)
         return "send failed"
@@ -3085,55 +3340,62 @@ def schedule_user_alerts(app: Application, chat_id: int) -> None:
     if not enabled:
         return
 
+    notifications = user["notifications"]
+
     # ── deadline alert at 09:00 ──
     async def _deadline_alert_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         await _run_deadline_alert(context, _cid, simulate=False)
 
-    app.job_queue.run_daily(
-        _deadline_alert_wrapper,
-        time=_parse_local_time("09:00", tz_str),
-        name=f"deadline_alert_{chat_id}",
-    )
+    if notifications.get("deadlines", True):
+        app.job_queue.run_daily(
+            _deadline_alert_wrapper,
+            time=_parse_local_time("09:00", tz_str),
+            name=f"deadline_alert_{chat_id}",
+        )
 
     # ── habit reminder at 20:00 ──
     async def _habit_reminder_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         await _run_habit_reminder(context, _cid, simulate=False)
 
-    app.job_queue.run_daily(
-        _habit_reminder_wrapper,
-        time=_parse_local_time("20:00", tz_str),
-        name=f"habit_reminder_{chat_id}",
-    )
+    if notifications.get("habits", True):
+        app.job_queue.run_daily(
+            _habit_reminder_wrapper,
+            time=_parse_local_time("20:00", tz_str),
+            name=f"habit_reminder_{chat_id}",
+        )
 
     # ── idle nudge at 11:00 — fires only if user has been inactive 3+ days ──
     async def _idle_nudge_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         await _run_idle_nudge(context, _cid, simulate=False)
 
-    app.job_queue.run_daily(
-        _idle_nudge_wrapper,
-        time=_parse_local_time("11:00", tz_str),
-        name=f"idle_nudge_{chat_id}",
-    )
+    if notifications.get("idle", True):
+        app.job_queue.run_daily(
+            _idle_nudge_wrapper,
+            time=_parse_local_time("11:00", tz_str),
+            name=f"idle_nudge_{chat_id}",
+        )
 
     # ── Weekly digest every Sunday at 10:00 ──
     async def _weekly_digest_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         await _run_weekly_digest(context, _cid, simulate=False)
 
-    app.job_queue.run_daily(
-        _weekly_digest_wrapper,
-        time=_parse_local_time("10:00", tz_str),
-        name=f"weekly_digest_{chat_id}",
-    )
+    if notifications.get("weekly", True):
+        app.job_queue.run_daily(
+            _weekly_digest_wrapper,
+            time=_parse_local_time("10:00", tz_str),
+            name=f"weekly_digest_{chat_id}",
+        )
 
     # ── procrastination check at 09:30 — surfaces the most stuck task ──
     async def _procrastination_nudge_wrapper(context: ContextTypes.DEFAULT_TYPE, _cid=chat_id):
         await _run_procrastination_nudge(context, _cid, simulate=False)
 
-    app.job_queue.run_daily(
-        _procrastination_nudge_wrapper,
-        time=_parse_local_time("09:30", tz_str),
-        name=f"procrastination_nudge_{chat_id}",
-    )
+    if notifications.get("procrastination", True):
+        app.job_queue.run_daily(
+            _procrastination_nudge_wrapper,
+            time=_parse_local_time("09:30", tz_str),
+            name=f"procrastination_nudge_{chat_id}",
+        )
 
 
 def restore_all_jobs(app: Application) -> None:
@@ -3166,6 +3428,8 @@ def restore_all_jobs(app: Application) -> None:
             h, m = (int(x) for x in t_str.split(":"))
             scheduled_today = datetime.now(tz).replace(hour=h, minute=m, second=0, microsecond=0)
             scheduled_utc = scheduled_today.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+            if not user["notifications"].get(label, True):
+                continue
             if scheduled_utc < now_utc and (now_utc - scheduled_utc) < catchup_window:
                 if not last_fired or last_fired[:16] < scheduled_utc.isoformat()[:16]:
                     # Schedule a one-shot catch-up in 10 seconds
@@ -3182,12 +3446,24 @@ def restore_all_jobs(app: Application) -> None:
                             if _label == "morning" else
                             f"Missed evening check-in catch-up: ask briefly how their day went. {catchup_variety}"
                         )
-                        reply = await chat(_cid, prompt, touch_activity=False)
+                        reply = await chat(
+                            _cid, prompt, touch_activity=False, store_history=False,
+                        )
                         await ctx.bot.send_message(chat_id=_cid, text=reply)
+                        _remember_bot_message(u, reply)
                         u["pending_checkin"] = _label
                         save_state(state)
                         db_log_job(str(_cid), f"checkin_{_label}")
                     app.job_queue.run_once(_catchup, when=10)
+
+    for job in app.job_queue.get_jobs_by_name("reengagement_scan"):
+        job.schedule_removal()
+    app.job_queue.run_repeating(
+        _run_reengagement_scan,
+        interval=3600,
+        first=60,
+        name="reengagement_scan",
+    )
 
 # ─────────────────────── tracker helpers ───────────────────────
 
@@ -3292,6 +3568,8 @@ _HELP_TEXT = (
     "  /mystats  /streak\n\n"
     "Check-ins:\n"
     "  /subscribe  /unsubscribe\n"
+    "  /notifications [type on|off]  — choose proactive messages\n"
+    "  /style [setting value]  — pressure, verbosity, proactivity, tone\n"
     "  /setcheckin HH:MM HH:MM  — custom times\n"
     "  /quiethours HH:MM HH:MM  — silence window\n"
     "  /checkin  — manual check-in\n\n"
@@ -3790,7 +4068,8 @@ async def suggest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Thinking of suggestions for you…")
     reply = await chat(
         chat_id, prompt,
-        system="You are a life coach. Give specific, personalised suggestions based on the user's data."
+        system="You are a life coach. Give specific, personalised suggestions based on the user's data.",
+        store_history=False,
     )
     await update.message.reply_text("💡 Suggestions:\n\n" + reply)
 
@@ -3823,7 +4102,8 @@ async def reflect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Reflecting on your progress…")
     reply = await chat(
         chat_id, prompt,
-        system="You are a thoughtful personal coach writing a sincere reflection."
+        system="You are a thoughtful personal coach writing a sincere reflection.",
+        store_history=False,
     )
     await update.message.reply_text("🪞 Reflection:\n\n" + reply)
 
@@ -3870,7 +4150,11 @@ async def compress_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Be factual and concise.\n\n" + history_text
     )
     try:
-        summary = await chat(chat_id, summary_prompt, system="You are a concise summarizer.")
+        summary = await chat(
+            chat_id, summary_prompt,
+            system="You are a concise summarizer.",
+            store_history=False,
+        )
     except Exception:
         await update.message.reply_text("⚠️ Compression failed. Try again.")
         return
@@ -4055,6 +4339,10 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user["checkin_times"] = {"morning": morning_t, "evening": evening_t}
 
     user["checkin_enabled"] = True
+    # /subscribe means "everything on" — including channels an earlier
+    # /notifications call switched off.
+    for name in user["notifications"]:
+        user["notifications"][name] = True
     save_state(state)
     times = user.get("checkin_times", {"morning": "08:00", "evening": "21:00"})
     schedule_user_checkins(context.application, update.effective_chat.id)
@@ -4073,6 +4361,93 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_checkins(context.application, update.effective_chat.id)
     schedule_user_alerts(context.application, update.effective_chat.id)
     await update.message.reply_text("Daily check-ins, deadline alerts, and habit reminders disabled.")
+
+
+async def notifications_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    settings = user["notifications"]
+    aliases = {
+        "morning": "morning", "evening": "evening",
+        "deadlines": "deadlines", "deadline": "deadlines",
+        "habits": "habits", "habit": "habits",
+        "idle": "idle", "weekly": "weekly", "digest": "weekly",
+        "procrastination": "procrastination", "stuck": "procrastination",
+    }
+    if not context.args:
+        lines = [
+            f"{'on' if settings[name] else 'off'} · {name}"
+            for name in (
+                "morning", "evening", "deadlines", "habits", "idle", "weekly",
+                "procrastination",
+            )
+        ]
+        await update.message.reply_text(
+            "Proactive messages:\n" + "\n".join(lines)
+            + "\n\nChange one: /notifications morning off"
+        )
+        return
+    if len(context.args) != 2 or context.args[1].lower() not in ("on", "off"):
+        await update.message.reply_text(
+            "Usage: /notifications morning|evening|deadlines|habits|idle|weekly|procrastination on|off"
+        )
+        return
+    raw_name, raw_value = context.args[0].lower(), context.args[1].lower()
+    if raw_name == "all":
+        names = list(settings)
+    elif raw_name in aliases:
+        names = [aliases[raw_name]]
+    else:
+        await update.message.reply_text("Unknown notification type. Use /notifications to list them.")
+        return
+    enabled = raw_value == "on"
+    if enabled and not user.get("timezone_confirmed"):
+        await update.message.reply_text(_TZ_NOT_CONFIRMED_MSG)
+        return
+    if enabled and not user.get("checkin_enabled"):
+        # Unsubscribed users have every channel defaulting to on; flipping the
+        # master switch alone would turn all six on when they asked for one.
+        for name in settings:
+            settings[name] = False
+        user["checkin_enabled"] = True
+    for name in names:
+        settings[name] = enabled
+    save_state(state)
+    schedule_user_checkins(context.application, update.effective_chat.id)
+    schedule_user_alerts(context.application, update.effective_chat.id)
+    await update.message.reply_text(
+        f"{', '.join(names)}: {'on' if enabled else 'off'}."
+    )
+
+
+async def style_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_chat.id)
+    style = user["relationship"]
+    allowed = {
+        "pressure": {"gentle", "balanced", "demanding"},
+        "verbosity": {"concise", "conversational"},
+        "proactivity": {"proactive", "responsive"},
+        "tone": {"playful", "serious"},
+    }
+    if not context.args:
+        await update.message.reply_text(
+            "Communication style:\n"
+            + "\n".join(f"{name}: {style[name]}" for name in allowed)
+            + "\n\nChange one: /style pressure gentle"
+        )
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: /style pressure|verbosity|proactivity|tone <value>"
+        )
+        return
+    field, value = context.args[0].lower(), context.args[1].lower()
+    if field not in allowed or value not in allowed[field]:
+        choices = ", ".join(sorted(allowed.get(field, set()))) or "unknown setting"
+        await update.message.reply_text(f"Valid values: {choices}.")
+        return
+    style[field] = value
+    save_state(state)
+    await update.message.reply_text(f"{field}: {value}.")
 
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4178,7 +4553,7 @@ async def manual_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ask what's on their mind and how their tasks are going. "
         "Be warm and specific — pick one task or habit to ask about."
     )
-    reply = await chat(chat_id, prompt)
+    reply = await chat(chat_id, prompt, store_history=False)
     if dashboard:
         await update.message.reply_text(dashboard + "\n\n" + reply)
     else:
@@ -4541,7 +4916,7 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry_date = _local_date(datetime.utcnow().isoformat(), user.get("timezone", "UTC"))
 
     prompt = f'The user just wrote this journal entry: "{text}"\nOffer a brief, warm reflection in 2-3 sentences.'
-    reply = await chat(chat_id, prompt)
+    reply = await chat(chat_id, prompt, store_history=False)
     await update.message.reply_text(f"\U0001f4d4 Saved ({entry_date}).\n\n{reply}")
 
 
@@ -4576,7 +4951,7 @@ async def weekly_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n".join(lines)
         + "\n\nNote trends, celebrate wins, and highlight one area to improve. Keep it to 5-7 lines."
     )
-    reply = await chat(update.effective_chat.id, prompt)
+    reply = await chat(update.effective_chat.id, prompt, store_history=False)
     await update.message.reply_text(f"\U0001f4ca Weekly Summary\n\n{reply}")
 
 
@@ -5095,7 +5470,7 @@ def _sanitize_import(imported: dict) -> tuple[dict, list[str]]:
     if not isinstance(imported, dict):
         return clean, ["file is not a JSON object"]
 
-    # tasks: list of plain strings or {"text": str, "due": ISO date, "recur": ...}
+    # tasks: list of plain strings or task dictionaries with validated optional fields
     if "tasks" in imported:
         raw = imported["tasks"]
         if isinstance(raw, list):
@@ -5115,6 +5490,9 @@ def _sanitize_import(imported: dict) -> tuple[dict, list[str]]:
                             continue
                     if t.get("recur") in ("daily", "weekly", "monthly"):
                         task["recur"] = t["recur"]
+                    condition = t.get("condition")
+                    if isinstance(condition, str) and condition.strip():
+                        task["condition"] = condition.strip()
                     tasks.append(task)
                 else:
                     bad += 1
@@ -5477,7 +5855,7 @@ async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Keep it to 8-10 lines."
     )
     await update.message.reply_text("Analyzing your data…")
-    reply = await chat(update.effective_chat.id, prompt)
+    reply = await chat(update.effective_chat.id, prompt, store_history=False)
     await update.message.reply_text(f"🔍 Insights:\n\n{reply}")
 
 
@@ -5487,6 +5865,81 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.from_user.id
+    user = get_user(chat_id)
+    _touch_activity(user)
+    save_state(state)
+
+    async def clear_buttons() -> None:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    def remember_outcome(text: str) -> None:
+        user["history"].append({"role": "user", "content": text})
+        if len(user["history"]) > MAX_HISTORY:
+            user["history"] = user["history"][-MAX_HISTORY:]
+        save_state(state)
+
+    async def ask(text: str, reply_markup=None) -> None:
+        # The follow-up goes into history so the user's typed answer reaches
+        # the model together with the question it answers.
+        if reply_markup is None:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=reply_markup,
+            )
+        _remember_bot_message(user, text)
+
+    if query.data.startswith("checkin_"):
+        outcome = query.data.removeprefix("checkin_")
+        user["pending_checkin"] = None
+        remember_outcome(f"Check-in outcome: {outcome.replace('_', ' ')}")
+        await clear_buttons()
+        if outcome == "done":
+            text = "What did you finish?"
+        elif outcome == "partial":
+            text = "What moved forward, and what is the smallest useful next step?"
+        elif outcome == "not_started":
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("↻ Reschedule", callback_data="plan_reschedule"),
+                InlineKeyboardButton("− Make smaller", callback_data="plan_smaller"),
+                InlineKeyboardButton("× Drop it", callback_data="plan_drop"),
+            ]])
+            await ask("No lecture — what got in the way?", keyboard)
+            return
+        else:
+            text = "What do you want to change the plan to?"
+        await ask(text)
+        return
+
+    if query.data.startswith("plan_"):
+        action = query.data.removeprefix("plan_")
+        remember_outcome(f"Plan decision: {action}")
+        await clear_buttons()
+        prompts = {
+            "reschedule": "When should I reschedule it for?",
+            "smaller": "What is the smallest version you can realistically do?",
+            "drop": "Which task should I remove?",
+        }
+        await ask(prompts[action])
+        return
+
+    if query.data.startswith(("remdone_", "remskip_")):
+        action, token = query.data.split("_", 1)
+        reminder = db_take_snooze(token, chat_id)
+        await clear_buttons()
+        if not reminder:
+            await context.bot.send_message(chat_id=chat_id, text="This reminder has expired.")
+            return
+        outcome = "done" if action == "remdone" else "skipped today"
+        remember_outcome(f"Reminder outcome: {outcome} — {reminder['message']}")
+        # Only the conversation history records this — no counter or log
+        # changes — so the wording claims nothing more than "noted".
+        text = "Noted — done." if action == "remdone" else "Noted — skipping this one."
+        await ask(text)
+        return
 
     # ── snooze button from reminder ──
     if query.data.startswith("snooze_"):
@@ -5497,10 +5950,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         minutes = int(parts[-1])
         token = "_".join(parts[1:-1])
         snoozed = db_take_snooze(token, chat_id)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        await clear_buttons()
         if not snoozed:
             await context.bot.send_message(chat_id=chat_id, text="⚠️ Snooze expired.")
             return
@@ -5544,6 +5994,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _check_milestones(chat_id, context.application)
 
 
+async def track_user_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record every inbound Telegram message, including command-only use."""
+    if update.effective_chat is None:
+        return
+    user = get_user(update.effective_chat.id)
+    _touch_activity(user)
+    save_state(state)
+
+
 # ─────────────────────── main ───────────────────────
 
 async def _post_init(app) -> None:
@@ -5580,6 +6039,7 @@ async def _post_init(app) -> None:
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
 
+    app.add_handler(MessageHandler(filters.ALL, track_user_activity), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("tasks", show_tasks))
@@ -5614,6 +6074,8 @@ def main():
     app.add_handler(CommandHandler("context", show_context))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    app.add_handler(CommandHandler("notifications", notifications_cmd))
+    app.add_handler(CommandHandler("style", style_cmd))
     app.add_handler(CommandHandler("settimezone", set_timezone))
     app.add_handler(CommandHandler("remind", remind_cmd))
     app.add_handler(CommandHandler("addtracker", add_tracker))
