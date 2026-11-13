@@ -47,6 +47,11 @@ MAX_HISTORY = 20
 # of it — see `_run_procrastination_nudge`.
 STALE_TASK_THRESHOLD_DAYS = 3
 
+# Manually bumped: <date of last meaningful change>.<Nth change that day>, so
+# the bot can state a real version instead of inventing one. Bump the date
+# when it changes, bump N when pushing again the same day.
+BOT_VERSION = "2026-11-13.1"
+
 # Encryption master key — generate once with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Then add MASTER_KEY=<value> to your env file.
 MASTER_KEY = os.environ.get("MASTER_KEY", "")
@@ -2477,7 +2482,7 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "4. Be warm but firm. Don't accept a vague excuse — ask why before offering comfort.\n"
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
-        "7. Correct mistakes naturally and briefly. No version number — say so, don't invent one.\n"
+        f"7. Correct mistakes naturally and briefly. Version: {BOT_VERSION} — state if asked.\n"
         "8. Use your tools proactively. When a user says they want to do something, "
         "need a reminder, or mentions a goal, call the relevant tool immediately "
         "(add_task, add_reminder, log_tracker, create_tracker, etc.) without asking for confirmation first. "
