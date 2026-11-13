@@ -2477,7 +2477,7 @@ def build_system_prompt(user: dict, chat_id: int = 0) -> str:
         "4. Be warm but firm. Don't accept a vague excuse — ask why before offering comfort.\n"
         "5. Keep responses concise — this is a chat, not an essay.\n"
         "6. Don't offer hotlines or unsolicited emotional support suggestions.\n"
-        "7. Correct mistakes naturally and briefly when they occur.\n"
+        "7. Correct mistakes naturally and briefly. No version number — say so, don't invent one.\n"
         "8. Use your tools proactively. When a user says they want to do something, "
         "need a reminder, or mentions a goal, call the relevant tool immediately "
         "(add_task, add_reminder, log_tracker, create_tracker, etc.) without asking for confirmation first. "
